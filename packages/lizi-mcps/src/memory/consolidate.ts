@@ -29,6 +29,8 @@ export function registerMemoryConsolidateTool(registry: MemoryToolRegistry, deps
         .array(z.string().min(1))
         .min(1)
         .describe('要删除的源分片 filename 列表 (target 自身会被自动跳过)'),
+      // nested strict: 顶层 call_tool 只对 sources/target 未知键 INVALID_ARGS;
+      // target 内部必须同样拒 sourceSession 等伪造字段, 不能 z.object 默默剥掉。
       target: z.object({
         type: z.enum(['user', 'feedback', 'project', 'reference', 'moment']),
         name: z
@@ -41,7 +43,7 @@ export function registerMemoryConsolidateTool(registry: MemoryToolRegistry, deps
         body: z.string().min(1),
         occurredAt: z.string().max(40).optional(),
         significance: z.enum(['normal', 'high']).optional(),
-      }),
+      }).strict(),
     },
     handler: async ({ sources, target }) =>
       withStore(deps, async (store, scopeKey): Promise<unknown> => {
