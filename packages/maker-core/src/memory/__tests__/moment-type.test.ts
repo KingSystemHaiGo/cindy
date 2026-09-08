@@ -149,6 +149,46 @@ describe('bot scope 的 moment 写入', () => {
     }
   });
 
+  it('bot scope 可将三条 moment 合并成一条 moment, 保留 frontmatter 并删除旧分片', async () => {
+    const { store, db } = createStore(true);
+    const sourceNames = ['old-a', 'old-b', 'old-c'];
+    try {
+      for (const [name, date] of sourceNames.map((name, index) => [name, `2026-09-0${index + 1}`] as const)) {
+        await store.write(momentArgs(name, { occurredAt: date }));
+      }
+
+      const result = await store.consolidate({
+        sources: sourceNames.map((name) => `moment_${name}.md`),
+        target: momentArgs('chapter', {
+          title: '合并后的时刻章节',
+          description: '三条旧时刻的归纳',
+          body: '三条旧时刻已合并为一条章节记忆。',
+          occurredAt: '2026-09-08',
+          significance: 'high',
+          sourceSession: 'session-consolidate',
+        }),
+      });
+
+      expect(result.ok).toBe(true);
+      expect(result.filename).toBe('moment_chapter.md');
+      expect(result.deletedSources).toEqual(
+        expect.arrayContaining(sourceNames.map((name) => `moment_${name}.md`)),
+      );
+
+      const record = await store.read('moment_chapter.md');
+      expect(record.frontmatter.type).toBe('moment');
+      expect(record.frontmatter.occurredAt).toBe('2026-09-08');
+      expect(record.frontmatter.significance).toBe('high');
+      expect(record.frontmatter.sourceSession).toBe('session-consolidate');
+      for (const name of sourceNames) {
+        await expect(store.read(`moment_${name}.md`)).rejects.toMatchObject({ code: 'not-found' });
+      }
+      expect((await store.list()).map((entry) => entry.filename)).toEqual(['moment_chapter.md']);
+    } finally {
+      db.close();
+    }
+  });
+
   it('校验拒绝非法 occurredAt / significance / sourceSession', async () => {
     const { store, db } = createStore(true);
     try {

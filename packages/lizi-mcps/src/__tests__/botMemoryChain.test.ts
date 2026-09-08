@@ -517,6 +517,102 @@ describe('moment 类型严格限定伙伴作用域 (#4124)', () => {
     expect(index).toContain('2026-09-08');
   });
 
+  it('伙伴会话可将三条 moment 合并成一条 moment, 旧分片从存储中删除', async () => {
+    const session = await connectBotSession({
+      agentKind: 'claude-code',
+      sessionId: 'session-moment-consolidate',
+      memoryScopeKey: buildBotMemoryScopeKey(BOT_ID),
+    });
+    const sourceNames = ['moment-fragment-a', 'moment-fragment-b', 'moment-fragment-c'];
+    try {
+      for (const [name, date] of sourceNames.map((name, index) => [name, `2026-09-0${index + 1}`] as const)) {
+        expect(
+          (
+            await modelWritesMemory(session.client, {
+              type: 'moment',
+              name,
+              title: `时刻片段 ${name}`,
+              description: '待合并的时刻片段',
+              body: `时刻片段 ${name} 的内容。`,
+              occurredAt: date,
+            })
+          ).ok,
+        ).toBe(true);
+      }
+
+      const consolidated = parseEnvelope(
+        await session.client.callTool({
+          name: 'call_tool',
+          arguments: {
+            name: 'memory_consolidate',
+            args: {
+              sources: sourceNames.map((name) => `moment_${name}.md`),
+              target: {
+                type: 'moment',
+                name: 'moment-chapter',
+                title: '合并后的时刻章节',
+                description: '三条旧时刻的归纳',
+                body: '三条旧时刻已合并为一条章节记忆。',
+                occurredAt: '2026-09-08',
+                significance: 'high',
+                sourceSession: 'session-moment-consolidate',
+              },
+            },
+          },
+        }),
+      );
+      expect(consolidated.ok).toBe(true);
+      const data = (consolidated as { data: { filename: string; deletedSources: string[] } }).data;
+      expect(data.filename).toBe('moment_moment-chapter.md');
+      expect(data.deletedSources).toEqual(
+        expect.arrayContaining(sourceNames.map((name) => `moment_${name}.md`)),
+      );
+    } finally {
+      await session.cleanup();
+    }
+
+    const records = await botMemoryList(BOT_ID);
+    expect(records.map((record) => record.filename)).toEqual(['moment_moment-chapter.md']);
+    const target = records[0]!;
+    expect(target.frontmatter.occurredAt).toBe('2026-09-08');
+    expect(target.frontmatter.significance).toBe('high');
+    expect(target.frontmatter.sourceSession).toBe('session-moment-consolidate');
+  });
+
+  it('项目会话的 moment consolidate 被 MCP 边界拒绝为 INVALID_PARAMS', async () => {
+    const session = await connectBotSession({
+      agentKind: 'claude-code',
+      sessionId: 'session-moment-consolidate-project',
+    });
+    try {
+      const consolidated = parseEnvelope(
+        await session.client.callTool({
+          name: 'call_tool',
+          arguments: {
+            name: 'memory_consolidate',
+            args: {
+              sources: ['project_old.md'],
+              target: {
+                type: 'moment',
+                name: 'moment-project-target',
+                title: '不属于项目记忆',
+                description: '全局 workdir 不允许 moment',
+                body: '这条必须被拒绝。',
+                occurredAt: '2026-09-08',
+              },
+            },
+          },
+        }),
+      );
+      expect(consolidated.ok).toBe(false);
+      expect((consolidated as { code: string }).code).toBe('INVALID_PARAMS');
+    } finally {
+      await session.cleanup();
+    }
+    const projectStore = await manager.getStore(buildMemoryScopeKey(PROJECT_DIR));
+    expect(await projectStore.list()).toEqual([]);
+  });
+
   it('项目会话 (workdir scope) 写 moment 被确定性拒绝为 INVALID_PARAMS, 分片不落盘', async () => {
     const session = await connectBotSession({
       agentKind: 'claude-code',

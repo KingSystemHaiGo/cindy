@@ -36,7 +36,7 @@ export function registerMemoryWriteTool(registry: MemoryToolRegistry, deps: Memo
       ' (sizeBytes/softLimitBytes, 分片警告另带 hardLimitBytes; 索引警告无硬上限),' +
       ' 按超限幅度决定不动 / 微剪 / memory_consolidate。',
     inputShape: {
-      type: z.enum(['user', 'feedback', 'project', 'reference']),
+      type: z.enum(['user', 'feedback', 'project', 'reference', 'moment']),
       name: z
         .string()
         .min(1)
@@ -67,13 +67,15 @@ export function registerMemoryWriteTool(registry: MemoryToolRegistry, deps: Memo
         .describe('来源 session 引用 (轻量溯源); 一般由系统自动注入, 无需手填'),
     },
     handler: async (args) =>
-      withStore(deps, (store, scopeKey) => {
+      withStore(deps, async (store, scopeKey): Promise<unknown> => {
         // MCP 边界门禁 (#4124): bot-only 类型必须命中 bot scope。store 层也会拒绝
         // (invalid-type → INVALID_PARAMS), 这里先拦一层给出更直接的错误语义。
         if (isBotOnlyMemoryType(args.type) && parseBotMemoryScopeKey(scopeKey) === null) {
-          return buildJsonResult(
-            { ok: false, code: 'INVALID_PARAMS', message: 'moment 仅伙伴(bot)记忆可用; 当前 scope 不是 bot 记忆' },
-            true,
+          return Promise.resolve(
+            buildJsonResult(
+              { ok: false, code: 'INVALID_PARAMS', message: 'moment 仅伙伴(bot)记忆可用; 当前 scope 不是 bot 记忆' },
+              true,
+            ),
           );
         }
         return store.write(args as WriteOptions);

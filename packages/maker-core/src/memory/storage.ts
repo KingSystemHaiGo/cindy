@@ -27,6 +27,7 @@ import matter from 'gray-matter';
 import {
   CURATED_MEMORY_TYPES,
   DEFAULT_MEMORY_CONFIG,
+  MEMORY_TYPES,
   isMemoryType,
   isMemorySignificance,
   MemoryError,
@@ -501,20 +502,23 @@ export class MemoryStorage {
       // 全局 scope 永不渲染 moment —— 这是 Bot Memory 与全局 Maker Memory 的索引隔离
       // (cindy-bots-runtime.md 红线; #4124 maintainer 建议的「有限最近 + 检索提示」)。
       const momentMaxEntries = this.indexOptions?.momentMaxEntries;
-      const momentRecords = momentMaxEntries != null ? (grouped.get('moment') ?? []) : [];
-      if (momentRecords.length > 0) {
-        const momentTs = (r: MemoryRecord): number =>
-          Date.parse(r.frontmatter.occurredAt ?? r.frontmatter.updatedAt) || 0;
-        const sortedMoments = [...momentRecords].sort((a, b) => momentTs(b) - momentTs(a));
-        lines.push('## moment');
-        for (const r of sortedMoments.slice(0, momentMaxEntries)) {
-          const day = (r.frontmatter.occurredAt ?? r.frontmatter.updatedAt).slice(0, 10);
-          lines.push(`- [${r.filename}] ${r.frontmatter.title} — ${r.frontmatter.description}（${day}）`);
+      if (momentMaxEntries != null) {
+        const maxEntries = momentMaxEntries;
+        const momentRecords = grouped.get('moment') ?? [];
+        if (momentRecords.length > 0) {
+          const momentTs = (r: MemoryRecord): number =>
+            Date.parse(r.frontmatter.occurredAt ?? r.frontmatter.updatedAt) || 0;
+          const sortedMoments = [...momentRecords].sort((a, b) => momentTs(b) - momentTs(a));
+          lines.push('## moment');
+          for (const r of sortedMoments.slice(0, maxEntries)) {
+            const day = (r.frontmatter.occurredAt ?? r.frontmatter.updatedAt).slice(0, 10);
+            lines.push(`- [${r.filename}] ${r.frontmatter.title} — ${r.frontmatter.description}（${day}）`);
+          }
+          if (sortedMoments.length > maxEntries) {
+            lines.push(`_(仅显示最近 ${maxEntries} 条时刻; 更早的内容用 memory_search 检索)_`);
+          }
+          lines.push('');
         }
-        if (sortedMoments.length > momentMaxEntries) {
-          lines.push(`_(仅显示最近 ${momentMaxEntries} 条时刻; 更早的内容用 memory_search 检索)_`);
-        }
-        lines.push('');
       }
     }
     const content = lines.join('\n');
@@ -535,7 +539,7 @@ export class MemoryStorage {
 
   private validateOpts(opts: WriteOptions): void {
     if (!isMemoryType(opts.type)) {
-      throw new MemoryError('invalid-type', `type 必须是 user/feedback/project/reference, 收到 "${opts.type}"`);
+      throw new MemoryError('invalid-type', `type 必须是 ${MEMORY_TYPES.join('/')}, 收到 "${opts.type}"`);
     }
     validateSlug(opts.name, this.config.maxSlugLen);
     if (!opts.title || opts.title.length === 0) {
