@@ -260,6 +260,29 @@ describe('Bot settings unified autosave', () => {
     });
   });
 
+  it('keeps trailing spaces while typing style text and trims on blur', async () => {
+    vi.useFakeTimers();
+    renderSettings();
+    const address = screen.getByLabelText('bots.profile.style.addressUserAs') as HTMLInputElement;
+    fireEvent.change(address, { target: { value: 'Chris ' } });
+    expect(address.value).toBe('Chris ');
+    expect(mocks.updateBotProfile).not.toHaveBeenCalled();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1600);
+    });
+    expect(mocks.updateBotProfile).toHaveBeenCalledTimes(1);
+    expect(mocks.updateBotProfile.mock.calls[0]?.[1]).toMatchObject({
+      style: { addressUserAs: 'Chris' },
+    });
+    expect(address.value).toBe('Chris ');
+    fireEvent.blur(address);
+    expect(address.value).toBe('Chris');
+
+    const habits = screen.getByLabelText('bots.profile.style.languageHabits') as HTMLTextAreaElement;
+    fireEvent.change(habits, { target: { value: '先结论\n后解释' } });
+    expect(habits.value).toBe('先结论\n后解释');
+  });
+
   it('clears discrete style fields when the user picks follow-default', async () => {
     vi.useFakeTimers();
     renderSettings({

@@ -41,7 +41,6 @@ export function registerMemoryConsolidateTool(registry: MemoryToolRegistry, deps
         body: z.string().min(1),
         occurredAt: z.string().max(40).optional(),
         significance: z.enum(['normal', 'high']).optional(),
-        sourceSession: z.string().max(120).optional(),
       }),
     },
     handler: async ({ sources, target }) =>
@@ -52,9 +51,11 @@ export function registerMemoryConsolidateTool(registry: MemoryToolRegistry, deps
         if (isBotOnlyMemoryType(target.type) && parseBotMemoryScopeKey(scopeKey) === null) {
           throw new MemoryError('invalid-type', 'moment 仅伙伴(bot)记忆可用; 当前 scope 不是 bot 记忆');
         }
+        // sourceSession 不暴露给模型: 只从当前 session ctx 注入, 缺 ctx 则不带该字段。
+        const sessionId = deps.getSessionContext?.()?.sessionId?.trim();
         return store.consolidate({
           sources,
-          target: { ...target },
+          target: sessionId ? { ...target, sourceSession: sessionId } : { ...target },
         });
       }),
   });

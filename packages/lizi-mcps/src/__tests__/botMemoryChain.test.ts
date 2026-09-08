@@ -613,6 +613,31 @@ describe('moment 类型严格限定伙伴作用域 (#4124)', () => {
         ).toBe(true);
       }
 
+      const forged = await session.client.callTool({
+        name: 'call_tool',
+        arguments: {
+          name: 'memory_consolidate',
+          args: {
+            sources: sourceNames.map((name) => `moment_${name}.md`),
+            target: {
+              type: 'moment',
+              name: 'forged-consolidate',
+              title: '伪造来源',
+              description: '模型试图指定 sourceSession',
+              body: '这条必须被 schema 拒绝。',
+              sourceSession: 'forged-session-id',
+            },
+          },
+        },
+      });
+      const forgedText = (forged as { content: Array<{ type: string; text: string }> }).content.find(
+        (block) => block.type === 'text',
+      )?.text;
+      expect(forgedText).toBeTruthy();
+      const forgedEnvelope = JSON.parse(forgedText!) as { ok: boolean; errorCode?: string };
+      expect(forgedEnvelope.ok).toBe(false);
+      expect(forgedEnvelope.errorCode).toBe('INVALID_ARGS');
+
       const consolidated = parseEnvelope(
         await session.client.callTool({
           name: 'call_tool',
@@ -628,7 +653,6 @@ describe('moment 类型严格限定伙伴作用域 (#4124)', () => {
                 body: '三条旧时刻已合并为一条章节记忆。',
                 occurredAt: '2026-09-08',
                 significance: 'high',
-                sourceSession: 'session-moment-consolidate',
               },
             },
           },

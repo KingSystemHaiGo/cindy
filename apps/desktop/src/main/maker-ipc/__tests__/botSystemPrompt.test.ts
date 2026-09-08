@@ -88,7 +88,11 @@ describe('稳定层:能力必须写进提示词', () => {
       }),
     );
     expect(all).toContain('你记得住事');
-    expect(all).toContain('第一次明确说出一条稳定偏好');
+    expect(all).toContain('写长期记忆必须先过门槛');
+    expect(all).toContain('不要在普通一轮里默认记');
+    expect(all).toContain('重要的「时刻」也走同一道门槛');
+    expect(all).not.toContain('不要等他重复第二次');
+    expect(all).toContain('不能拿来改 SOUL');
     expect(all).toContain('save_bot_skill');
     expect(all).toContain('第一次验证完就');
     expect(all).toContain('开后台任务，也可以给伙伴发消息');

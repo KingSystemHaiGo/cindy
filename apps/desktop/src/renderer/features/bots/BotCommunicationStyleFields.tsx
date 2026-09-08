@@ -2,6 +2,8 @@ import { MessageCircle } from 'lucide-react';
 import type { ReactNode } from 'react';
 
 import { SettingsSegmentedControl } from '@/components/settings/SettingsSegmentedControl';
+import { SettingsTextInput } from '@/components/settings/SettingsTextInput';
+import { Textarea } from '@/components/ui/input';
 import {
   BOT_STYLE_EMOJI_DENSITIES,
   BOT_STYLE_LIMITS,
@@ -15,11 +17,6 @@ import {
 } from '../../../shared/botStyle';
 import { BotSettingsBlock } from './BotSettingsBlock';
 import { useBotTranslation } from './botPronounContext';
-
-const TEXTAREA_CLASS =
-  'mt-1.5 w-full resize-y rounded-lg border border-[var(--border-default)] bg-[var(--surface)] p-3 text-13 leading-6 text-[var(--text-primary)] outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]';
-const INPUT_CLASS =
-  'mt-1.5 h-10 w-full rounded-lg border border-[var(--border-default)] bg-[var(--surface)] px-3 text-13 text-[var(--text-primary)] outline-none placeholder:text-[var(--text-placeholder)] focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]';
 
 const FOLLOW_DEFAULT = 'default' as const;
 
@@ -55,11 +52,14 @@ export function BotCommunicationStyleFields({
   onChange: (next: BotCommunicationStyle | undefined, kind: 'text' | 'instant') => void;
 }) {
   const { t } = useBotTranslation();
-  const style = normalizeBotStyle(value) ?? {};
-  const patch = (
-    next: BotCommunicationStyle,
-    kind: 'text' | 'instant',
-  ) => onChange(normalizeBotStyle(next), kind);
+  // 草稿保持原文:normalizeBotStyle 会 trim,打字时空格/换行不能在 onChange 里吃掉。
+  const style = value ?? {};
+  const patch = (next: BotCommunicationStyle, kind: 'text' | 'instant') => {
+    onChange(kind === 'instant' ? (normalizeBotStyle(next) ?? undefined) : next, kind);
+  };
+  const commitTrimmed = (next: BotCommunicationStyle = style) => {
+    onChange(normalizeBotStyle(next), 'text');
+  };
 
   return (
     <BotSettingsBlock
@@ -95,35 +95,40 @@ export function BotCommunicationStyleFields({
         {style.tone === 'custom' ? (
           <label className="flex min-w-0 flex-col text-12 text-[var(--text-secondary)]">
             {t('bots.profile.style.customTone')}
-            <textarea
+            <Textarea
               aria-label={t('bots.profile.style.customTone')}
               value={style.customTone ?? ''}
               maxLength={BOT_STYLE_LIMITS.customTone}
               rows={3}
-              onChange={(event) => patch({ ...style, customTone: event.target.value }, 'text')}
-              className={TEXTAREA_CLASS}
+              className="mt-1.5"
+              onChange={(text) => patch({ ...style, customTone: text }, 'text')}
+              onBlur={(event) => commitTrimmed({ ...style, customTone: event.currentTarget.value })}
             />
           </label>
         ) : null}
 
         <label className="flex min-w-0 flex-col text-12 text-[var(--text-secondary)]">
           {t('bots.profile.style.addressUserAs')}
-          <input
-            aria-label={t('bots.profile.style.addressUserAs')}
+          <SettingsTextInput
+            ariaLabel={t('bots.profile.style.addressUserAs')}
             value={style.addressUserAs ?? ''}
             maxLength={BOT_STYLE_LIMITS.addressUserAs}
-            onChange={(event) => patch({ ...style, addressUserAs: event.target.value }, 'text')}
-            className={INPUT_CLASS}
+            size="lg"
+            className="mt-1.5 w-full"
+            onChange={(text) => patch({ ...style, addressUserAs: text }, 'text')}
+            onBlur={(event) => commitTrimmed({ ...style, addressUserAs: event.currentTarget.value })}
           />
         </label>
         <label className="flex min-w-0 flex-col text-12 text-[var(--text-secondary)]">
           {t('bots.profile.style.selfName')}
-          <input
-            aria-label={t('bots.profile.style.selfName')}
+          <SettingsTextInput
+            ariaLabel={t('bots.profile.style.selfName')}
             value={style.selfName ?? ''}
             maxLength={BOT_STYLE_LIMITS.selfName}
-            onChange={(event) => patch({ ...style, selfName: event.target.value }, 'text')}
-            className={INPUT_CLASS}
+            size="lg"
+            className="mt-1.5 w-full"
+            onChange={(text) => patch({ ...style, selfName: text }, 'text')}
+            onBlur={(event) => commitTrimmed({ ...style, selfName: event.currentTarget.value })}
           />
         </label>
 
@@ -174,24 +179,26 @@ export function BotCommunicationStyleFields({
 
         <label className="flex min-w-0 flex-col text-12 text-[var(--text-secondary)]">
           {t('bots.profile.style.bannedPhrases')}
-          <textarea
+          <Textarea
             aria-label={t('bots.profile.style.bannedPhrases')}
             value={style.bannedPhrases ?? ''}
             maxLength={BOT_STYLE_LIMITS.bannedPhrases}
             rows={3}
-            onChange={(event) => patch({ ...style, bannedPhrases: event.target.value }, 'text')}
-            className={TEXTAREA_CLASS}
+            className="mt-1.5"
+            onChange={(text) => patch({ ...style, bannedPhrases: text }, 'text')}
+            onBlur={(event) => commitTrimmed({ ...style, bannedPhrases: event.currentTarget.value })}
           />
         </label>
         <label className="flex min-w-0 flex-col text-12 text-[var(--text-secondary)]">
           {t('bots.profile.style.languageHabits')}
-          <textarea
+          <Textarea
             aria-label={t('bots.profile.style.languageHabits')}
             value={style.languageHabits ?? ''}
             maxLength={BOT_STYLE_LIMITS.languageHabits}
             rows={4}
-            onChange={(event) => patch({ ...style, languageHabits: event.target.value }, 'text')}
-            className={TEXTAREA_CLASS}
+            className="mt-1.5"
+            onChange={(text) => patch({ ...style, languageHabits: text }, 'text')}
+            onBlur={(event) => commitTrimmed({ ...style, languageHabits: event.currentTarget.value })}
           />
         </label>
       </div>
