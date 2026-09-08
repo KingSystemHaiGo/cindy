@@ -23,6 +23,7 @@
  */
 
 import type { BotCapabilities } from './botStore';
+import { botStyleEqual, normalizeBotStyle, type BotCommunicationStyle } from '../../../shared/botStyle';
 
 /** 提交给 `updateBotProfile` 的字段集合(与手动保存时的载荷完全一致)。 */
 export interface BotSettingsPayload {
@@ -30,6 +31,8 @@ export interface BotSettingsPayload {
   description: string;
   identitySource: string;
   userContextSource: string;
+  /** 空配置用 null，便 IPC hasOwnProperty 能清掉原值。 */
+  style?: BotCommunicationStyle | null;
   avatar: string;
   avatarColor: string;
   capabilities: BotCapabilities;
@@ -42,6 +45,7 @@ export interface BotSettingsDraft {
   description: string;
   identitySource: string;
   userContextSource: string;
+  style?: BotCommunicationStyle;
   avatar: string;
   avatarColor: string;
   capabilities: BotCapabilities;
@@ -64,6 +68,7 @@ export function normalizeBotSettingsPayload(
     description: draft.description.trim(),
     identitySource: draft.identitySource,
     userContextSource: draft.userContextSource,
+    style: normalizeBotStyle(draft.style) ?? null,
     avatar: draft.avatar,
     avatarColor: draft.avatarColor,
     capabilities: draft.capabilities,
@@ -123,6 +128,7 @@ export function botSettingsPayloadEqual(a: BotSettingsPayload, b: BotSettingsPay
     a.description === b.description &&
     a.identitySource === b.identitySource &&
     a.userContextSource === b.userContextSource &&
+    botStyleEqual(a.style, b.style) &&
     a.avatar === b.avatar &&
     a.avatarColor === b.avatarColor &&
     stringListEqual(a.skills, b.skills) &&

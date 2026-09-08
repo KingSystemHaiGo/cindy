@@ -133,6 +133,7 @@ describe('normalizeBotSettingsPayload', () => {
     // Long-form prompt text is stored verbatim: trimming it would silently edit
     // the user's system prompt.
     expect(result.identitySource).toBe('  kept as typed  ');
+    expect(result.style).toBeNull();
   });
 
   it('produces an equal snapshot for the baseline and the untouched draft', () => {
@@ -176,6 +177,13 @@ describe('botSettingsPayloadEqual', () => {
         payload({ capabilities: capabilities({ mcpServers: ['a'] }) }),
       ),
     ).toBe(false);
+    expect(botSettingsPayloadEqual(base, payload({ style: { tone: 'warm' } }))).toBe(false);
+    expect(
+      botSettingsPayloadEqual(
+        payload({ style: { tone: 'warm', customTone: '  ' } }),
+        payload({ style: { tone: 'warm' } }),
+      ),
+    ).toBe(true);
   });
 
   it('treats a null and an undefined providerId as the same "none"', () => {

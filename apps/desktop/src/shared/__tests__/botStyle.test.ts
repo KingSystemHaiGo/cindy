@@ -1,0 +1,99 @@
+import { describe, expect, it } from 'vitest';
+
+import {
+  BOT_STYLE_LIMITS,
+  buildBotStyleGuidance,
+  botStyleEqual,
+  normalizeBotStyle,
+} from '../botStyle';
+
+describe('normalizeBotStyle', () => {
+  it('returns undefined for empty or dirty values', () => {
+    expect(normalizeBotStyle(undefined)).toBeUndefined();
+    expect(normalizeBotStyle(null)).toBeUndefined();
+    expect(normalizeBotStyle('warm')).toBeUndefined();
+    expect(normalizeBotStyle({ tone: 'mysterious', customTone: '   ' })).toBeUndefined();
+  });
+
+  it('keeps known enums and trims text', () => {
+    expect(
+      normalizeBotStyle({
+        tone: 'warm',
+        customTone: '  像老朋友  ',
+        addressUserAs: ' Chris ',
+        selfName: '小柴',
+        replyLength: 'short',
+        emojiDensity: 'none',
+        bannedPhrases: '  亲爱的  ',
+        languageHabits: '先结论后解释',
+      }),
+    ).toEqual({
+      tone: 'warm',
+      customTone: '像老朋友',
+      addressUserAs: 'Chris',
+      selfName: '小柴',
+      replyLength: 'short',
+      emojiDensity: 'none',
+      bannedPhrases: '亲爱的',
+      languageHabits: '先结论后解释',
+    });
+  });
+
+  it('clips oversized free text instead of rejecting the whole object', () => {
+    const next = normalizeBotStyle({
+      languageHabits: '啊'.repeat(BOT_STYLE_LIMITS.languageHabits + 8),
+    });
+    expect(next?.languageHabits).toHaveLength(BOT_STYLE_LIMITS.languageHabits);
+  });
+});
+
+describe('botStyleEqual', () => {
+  it('treats empty objects and missing style as the same unset value', () => {
+    expect(botStyleEqual(undefined, {})).toBe(true);
+    expect(botStyleEqual(undefined, null)).toBe(true);
+    expect(botStyleEqual({ tone: 'warm' }, { tone: 'warm', customTone: '  ' })).toBe(true);
+    expect(botStyleEqual({ tone: 'warm' }, { tone: 'concise' })).toBe(false);
+  });
+});
+
+describe('buildBotStyleGuidance', () => {
+  it('returns empty when there is nothing concrete to say', () => {
+    expect(buildBotStyleGuidance(undefined)).toBe('');
+    expect(buildBotStyleGuidance({ tone: 'custom' })).toBe('');
+  });
+
+  it('does not override SOUL and tells the bot not to rewrite style', () => {
+    const guidance = buildBotStyleGuidance({
+      tone: 'professional',
+      addressUserAs: 'Chris',
+      selfName: '小满',
+      replyLength: 'medium',
+      emojiDensity: 'sparse',
+      bannedPhrases: '亲爱的\n老板',
+      languageHabits: '先给结论',
+    });
+    expect(guidance).toContain('## 说话习惯');
+    expect(guidance).toContain('不覆盖上面的身份(SOUL)');
+    expect(guidance).toContain('不要自行改写这段风格');
+    expect(guidance).toContain('称呼用户为「Chris」');
+    expect(guidance).toContain('自称「小满」');
+    expect(guidance).toContain('「亲爱的」');
+    expect(guidance).toContain('「老板」');
+    expect(guidance).toContain('先给结论');
+    expect(guidance).toContain('专业、克制');
+  });
+
+  it('uses custom tone text only when tone is custom', () => {
+    const custom = buildBotStyleGuidance({
+      tone: 'custom',
+      customTone: '像编辑部同事,短句,不卖萌',
+    });
+    expect(custom).toContain('像编辑部同事,短句,不卖萌');
+    const warm = buildBotStyleGuidance({
+      tone: 'warm',
+      customTone: '这段不该盖过预设',
+    });
+    expect(warm).toContain('温暖、亲近');
+    expect(warm).not.toContain('这段不该盖过预设');
+  });
+});

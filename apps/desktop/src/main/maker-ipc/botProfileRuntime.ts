@@ -5,6 +5,7 @@ import path from 'node:path';
 
 import type { MakerSessionCreateOpts } from './sessionRequest.js';
 import { buildDefaultBotIdentity } from '../../shared/botProfileDefaults.js';
+import { normalizeBotStyle } from '../../shared/botStyle.js';
 import {
   buildBotContextTier,
   buildBotStableTier,
@@ -845,10 +846,12 @@ export async function hydrateBotProfileRuntime(
       && promptCapabilities.partnerActionsEnabled && deps.listTeammates
       ? await deps.listTeammates({ excludeBotId: row.botId }).catch(() => [])
       : [];
+  const style = normalizeBotStyle(config.style);
   const promptInput: BotSystemPromptInput = {
     displayName: profile.displayName,
     identity,
     capabilities: promptCapabilities,
+    ...(style ? { style } : {}),
     skillIndex: ownSkills.map((item) => ({
       name: item.name,
       ...(item.description ? { description: item.description } : {}),

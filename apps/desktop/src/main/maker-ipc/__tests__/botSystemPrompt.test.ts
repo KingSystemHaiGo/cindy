@@ -222,6 +222,32 @@ describe('伙伴的家', () => {
     expect(buildBotStableTier({ ...base, homeDir: '   ' })).toBe(stable);
   });
 
+  it('沟通风格在稳定层尾部,不进易变层,也不覆盖 SOUL 或 overlay', () => {
+    const prompt = buildBotSystemPrompt({
+      ...base,
+      homeDir: '/data/bots/bot-a',
+      systemPromptOverride: '你只回一个字。',
+      style: {
+        tone: 'professional',
+        addressUserAs: 'Chris',
+        bannedPhrases: '亲爱的',
+      },
+    });
+    expect(prompt.stable).toContain('## 说话习惯');
+    expect(prompt.stable).toContain('称呼用户为「Chris」');
+    expect(prompt.stable).toContain('不覆盖上面的身份(SOUL)');
+    expect(prompt.volatile).not.toContain('说话习惯');
+    expect(prompt.context).toBe('你只回一个字。');
+    expect(prompt.full.indexOf('你是小柴。')).toBeLessThan(prompt.full.indexOf('## 说话习惯'));
+    expect(prompt.full.indexOf('## 说话习惯')).toBeLessThan(prompt.full.indexOf('你只回一个字。'));
+  });
+
+  it('没有风格配置时稳定层一个字都不提', () => {
+    const withEmpty = buildBotStableTier({ ...base, style: { tone: 'custom' } });
+    expect(withEmpty).toBe(buildBotStableTier(base));
+    expect(withEmpty).not.toContain('说话习惯');
+  });
+
   it('overlay 位于上下文层,不会把 Bot Mode 核心协议挤掉', () => {
     const prompt = buildBotSystemPrompt({
       ...base,

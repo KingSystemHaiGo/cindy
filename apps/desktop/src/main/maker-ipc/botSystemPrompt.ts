@@ -20,6 +20,8 @@
  * 挂载 ≠ 能力可用;能力必须写进提示词才算数。
  */
 
+import { buildBotStyleGuidance, type BotCommunicationStyle } from '../../shared/botStyle.js';
+
 /** 伙伴运行时已解析的能力信号(plugin id),等价于 Hermes 的 valid_tool_names。 */
 export interface BotPromptCapabilitySignals {
   /** 已生效的 toolset(内置插件 id):'docs' | 'memory' | 'scheduler' | … */
@@ -67,6 +69,8 @@ export interface BotSystemPromptInput {
    * 远端会话没有本机 userData,这时不给,也就一个字都不提。
    */
   homeDir?: string;
+  /** 结构化沟通风格。注入 stable 层尾部,不覆盖 SOUL;空则一个字都不提。 */
+  style?: BotCommunicationStyle;
 }
 
 /**
@@ -236,6 +240,8 @@ export function buildBotStableTier(input: BotSystemPromptInput): string {
   if (capabilityParts.length > 0) {
     parts.push(['# 你会做什么', ...capabilityParts].join('\n\n'));
   }
+  const styleGuidance = buildBotStyleGuidance(input.style);
+  if (styleGuidance) parts.push(styleGuidance);
   return parts.filter(Boolean).join('\n\n');
 }
 

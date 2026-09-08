@@ -142,6 +142,7 @@ async function syncBotProfileFolder(
   }
 }
 import { buildDefaultBotIdentity } from '../../../shared/botProfileDefaults.js';
+import { normalizeBotStyle } from '../../../shared/botStyle.js';
 import { coordinateBotCanonicalReplacement } from '../../maker-ipc/botCanonicalReplacementCoordinator.js';
 import { searchConversations } from '../conversationSearch.js';
 import {
@@ -330,6 +331,13 @@ function readText(value: unknown, field: string, max = MAX_TEXT, required = fals
  */
 function readBotGender(value: unknown): 'female' | 'male' | undefined {
   return value === 'female' || value === 'male' ? value : undefined;
+}
+
+/**
+ * 沟通风格。与性别同款:住在档案 JSON,投影成顶层字段。脏枚举/空对象一律当没给。
+ */
+function readBotStyle(value: unknown) {
+  return normalizeBotStyle(value);
 }
 
 function parseJson(value: string, fallback: Record<string, unknown> = {}): Record<string, unknown> {
@@ -544,6 +552,7 @@ async function readProfile(
     // 与 userContextSource 同款:存在档案 JSON 里,投影成顶层字段。老档案没有这
     // 个键 → undefined → 界面回落「用名字称呼」,与升级前行为一致。
     ...(readBotGender(config.gender) ? { gender: readBotGender(config.gender) } : {}),
+    ...(readBotStyle(config.style) ? { style: readBotStyle(config.style) } : {}),
     avatar: profile.avatar,
     avatarColor: profile.avatarColor,
     enabled: profile.status === 'active',
@@ -957,6 +966,7 @@ export async function createBotProfile(raw: unknown) {
     : {};
   const userContextSource = readText(body.userContextSource, 'userContextSource', 12000);
   const gender = readBotGender(body.gender);
+  const style = readBotStyle(body.style);
   const templateId = body.templateId;
   if (templateId !== undefined && !isBotTemplatePresetId(templateId)) {
     throwIpcError('INVALID_PARAMS', '未知的伙伴模板');
@@ -983,6 +993,7 @@ export async function createBotProfile(raw: unknown) {
     skills,
     userContextSource,
     ...(gender ? { gender } : {}),
+    ...(style ? { style } : {}),
   });
   // Progress is main-owned; callers can request an invitation, never supply its result.
   delete persistedCapabilities.invitation;
@@ -1338,7 +1349,7 @@ export function registerBotIpc(): void {
     const previous = parseJson(version?.capabilitiesJson ?? '{}');
     const preparation = botInvitationProgress(previous.invitation);
     const retryingPortrait = preparation?.stage === 'avatar' && current.canonicalSessionId;
-    if (preparation && preparation.stage !== 'ready' && !retryingPortrait && (body.name !== undefined || body.description !== undefined || body.identitySource !== undefined)) {
+    if (preparation && preparation.stage !== 'ready' && !retryingPortrait && (body.name !== undefined || body.description !== undefined || body.identitySource !== undefined || Object.prototype.hasOwnProperty.call(body, 'style'))) {
       throwIpcError('PRECONDITION_FAILED', '伙伴正在准备见面，请完成准备后再编辑资料');
     }
     const nextConfig = mergeBotProfileCapabilities({
@@ -1364,6 +1375,12 @@ export function registerBotIpc(): void {
       const nextGender = readBotGender(body.gender);
       if (nextGender) nextConfig.gender = nextGender;
       else delete nextConfig.gender;
+    }
+    // 显式传空/脏值则清掉,没传就保持 merge 带来的原值。
+    if (Object.prototype.hasOwnProperty.call(body, 'style')) {
+      const nextStyle = readBotStyle(body.style);
+      if (nextStyle) nextConfig.style = nextStyle;
+      else delete nextConfig.style;
     }
     const normalizedNextConfig = normalizeBotModelCapabilitiesOrThrow(nextConfig);
     const nextIdentitySource =

@@ -7065,7 +7065,37 @@
       "summary": "Self-introduction",
       "summaryPlaceholder": "For example: a novelist who loves serial fiction, has a dry sense of humor, and is fascinated by what makes characters tick.",
       "avatarSelectionFailed": "Couldn’t read the image. Choose a PNG, JPEG, or WebP image up to 5 MB.",
-      "personality": "Personality & conversation"
+      "personality": "Personality & conversation",
+      "style": {
+        "title": "How they talk",
+        "hint": "Guides tone only. It never overrides personality or identity.",
+        "tone": "Tone",
+        "toneHint": "Pick the closest feel. Use Custom when you need specifics.",
+        "tones": {
+          "warm": "Warm",
+          "professional": "Professional",
+          "playful": "Playful",
+          "concise": "Concise",
+          "custom": "Custom"
+        },
+        "customTone": "Custom tone",
+        "addressUserAs": "What to call the user",
+        "selfName": "What they call themselves",
+        "replyLength": "Reply length",
+        "replyLengths": {
+          "short": "Short",
+          "medium": "Medium",
+          "long": "Long"
+        },
+        "emojiDensity": "Emoji",
+        "emojiDensities": {
+          "none": "None",
+          "sparse": "Sparse",
+          "normal": "Natural"
+        },
+        "bannedPhrases": "Phrases to avoid",
+        "languageHabits": "Other language habits"
+      }
     },
     "nameLabel": "What Should We Call Them?",
     "close": "Close",

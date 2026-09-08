@@ -209,6 +209,13 @@ describe('Bot settings profile consolidation', () => {
     expect(screen.queryByRole('button', { name: 'bots.actions.message' })).toBeNull();
   });
 
+  it('shows structured communication-style controls on the same page', () => {
+    renderSettings();
+    expect(screen.getByTestId('bot-communication-style')).toBeTruthy();
+    expect(screen.getByLabelText('bots.profile.style.tone')).toBeTruthy();
+    expect(screen.getByLabelText('bots.profile.style.replyLength')).toBeTruthy();
+  });
+
   it('keeps archived teammates read-only', () => {
     renderSettings({ status: 'archived' });
     expect(screen.getByTestId('bot-lifecycle-settings')).toBeTruthy();
@@ -237,6 +244,19 @@ describe('Bot settings unified autosave', () => {
       description: 'Own releases',
       identitySource: 'Persistent role',
       userContextSource: 'Call me Chris',
+      style: null,
+    });
+  });
+
+  it('autosaves a discrete tone selection with the rest of the profile', async () => {
+    vi.useFakeTimers();
+    renderSettings();
+    fireEvent.click(screen.getByRole('radio', { name: 'bots.profile.style.tones.warm' }));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(mocks.updateBotProfile.mock.calls[0]?.[1]).toMatchObject({
+      style: { tone: 'warm' },
     });
   });
 

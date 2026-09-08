@@ -236,6 +236,7 @@ describe('bot profile store', () => {
       description: 'Find evidence',
       identitySource: '# SOUL\nResearch carefully.',
       userContextSource: '# USER\nChris',
+      style: { tone: 'concise', selfName: 'Researcher' },
       avatar: '🔎',
       avatarColor: 'blue',
       skills: ['web-research'],
@@ -274,6 +275,7 @@ describe('bot profile store', () => {
         description: 'Find evidence',
         identitySource: '# SOUL\nResearch carefully.',
         userContextSource: '# USER\nChris',
+        style: { tone: 'concise', selfName: 'Researcher' },
         avatar: '🔎',
         avatarColor: 'blue',
         skills: ['web-research'],
@@ -285,6 +287,7 @@ describe('bot profile store', () => {
       expect(create).toHaveBeenCalledWith(expect.objectContaining({
         name: 'Researcher-2',
         identitySource: '# SOUL\nResearch carefully.',
+        style: { tone: 'concise', selfName: 'Researcher' },
         capabilities: expect.objectContaining({ permissions: 'trusted' }),
       }));
     } finally {

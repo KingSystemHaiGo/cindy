@@ -23,6 +23,8 @@ import {
 import { BotCreateMenu } from './BotCreateMenu';
 import { BotAvatar } from './BotAvatar';
 import { BotBasicProfileFields } from './BotBasicProfileFields';
+import { BotCommunicationStyleFields } from './BotCommunicationStyleFields';
+import type { BotCommunicationStyle } from '../../../shared/botStyle';
 import {
   createBotCanonicalSessionWithRetry,
   shouldDeferCanonicalBotSessionNavigation,
@@ -73,6 +75,7 @@ export function BotSettings({
   const [portraitRetryFailed, setPortraitRetryFailed] = useState(false);
   const [identitySource, setIdentitySource] = useState(bot.identitySource ?? '');
   const [userContextSource, setUserContextSource] = useState(bot.userContextSource ?? '');
+  const [style, setStyle] = useState<BotCommunicationStyle | undefined>(bot.style);
   const [avatar, setAvatar] = useState(bot.avatar);
   const [avatarColor, setAvatarColor] = useState(bot.avatarColor);
   const [selectedSkills, setSelectedSkills] = useState<string[]>(bot.skills);
@@ -98,6 +101,7 @@ export function BotSettings({
     setDescription(bot.description);
     setIdentitySource(bot.identitySource ?? '');
     setUserContextSource(bot.userContextSource ?? '');
+    setStyle(bot.style);
     setAvatar(bot.avatar);
     setAvatarColor(bot.avatarColor);
     setSelectedSkills(bot.skills);
@@ -117,6 +121,7 @@ export function BotSettings({
       description,
       identitySource,
       userContextSource,
+      style,
       avatar,
       avatarColor,
       capabilities,
@@ -273,6 +278,14 @@ export function BotSettings({
             className="mt-2 w-full resize-y rounded-lg border border-[var(--border-default)] bg-[var(--surface)] p-3 text-13 leading-6 text-[var(--text-primary)] outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
           />
         </details>
+
+        <BotCommunicationStyleFields
+          value={style}
+          onChange={(next, kind) => {
+            setStyle(next);
+            autosave.onEdit(kind);
+          }}
+        />
 
         <section
           aria-label={t('bots.settingsTabs.model')}
