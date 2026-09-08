@@ -7070,6 +7070,7 @@
         "tone": "語氣",
         "toneHint": "選一個接近的感覺；需要更具體時用自訂。",
         "tones": {
+          "followDefault": "跟隨預設",
           "warm": "溫暖",
           "professional": "專業",
           "playful": "輕鬆",
@@ -7081,12 +7082,14 @@
         "selfName": "怎麼自稱",
         "replyLength": "回覆長短",
         "replyLengths": {
+          "followDefault": "跟隨預設",
           "short": "短",
           "medium": "適中",
           "long": "細"
         },
         "emojiDensity": "emoji",
         "emojiDensities": {
+          "followDefault": "跟隨預設",
           "none": "不用",
           "sparse": "偶爾",
           "normal": "自然"

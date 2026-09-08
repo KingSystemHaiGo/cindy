@@ -567,6 +567,14 @@ export class MemoryStorage {
       if (typeof v !== 'string' || v.length === 0 || v.length > 40 || !isoShape.test(v) || Number.isNaN(Date.parse(v))) {
         throw new MemoryError('invalid-frontmatter', 'occurredAt 必须是 ISO 8601 日期 (e.g. 2026-09-08 或 2026-09-08T12:00:00Z)');
       }
+      // JS Date.parse 会把 2026-02-30 归一化到 3 月; 再按 UTC 日历拒绝月内溢出日。
+      const [yearText, monthText, dayText] = v.slice(0, 10).split('-');
+      const year = Number(yearText);
+      const month = Number(monthText);
+      const day = Number(dayText);
+      if (day > new Date(Date.UTC(year, month, 0)).getUTCDate()) {
+        throw new MemoryError('invalid-frontmatter', 'occurredAt 必须是 ISO 8601 日期 (e.g. 2026-09-08 或 2026-09-08T12:00:00Z)');
+      }
     }
     if (opts.significance !== undefined && !isMemorySignificance(opts.significance)) {
       throw new MemoryError('invalid-frontmatter', 'significance 必须是 normal/high');

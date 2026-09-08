@@ -7070,6 +7070,7 @@
         "tone": "말투",
         "toneHint": "가까운 느낌을 고르세요. 더 구체적으로 적을 때는 직접 입력을 쓰세요.",
         "tones": {
+          "followDefault": "기본값 따르기",
           "warm": "따뜻하게",
           "professional": "단정하게",
           "playful": "가볍게",
@@ -7081,12 +7082,14 @@
         "selfName": "자신을 부르는 말",
         "replyLength": "답변 길이",
         "replyLengths": {
+          "followDefault": "기본값 따르기",
           "short": "짧게",
           "medium": "보통",
           "long": "자세히"
         },
         "emojiDensity": "이모지",
         "emojiDensities": {
+          "followDefault": "기본값 따르기",
           "none": "사용 안 함",
           "sparse": "가끔",
           "normal": "자연스럽게"

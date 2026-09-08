@@ -194,6 +194,14 @@ describe('bot scope 的 moment 写入', () => {
     try {
       await expect(store.write(momentArgs('bad-date', { occurredAt: 'not-a-date' })))
         .rejects.toMatchObject({ code: 'invalid-frontmatter' });
+      await expect(store.write(momentArgs('feb-30', { occurredAt: '2026-02-30' })))
+        .rejects.toMatchObject({ code: 'invalid-frontmatter' });
+      await expect(store.write(momentArgs('feb-29-nonleap', { occurredAt: '2026-02-29' })))
+        .rejects.toMatchObject({ code: 'invalid-frontmatter' });
+      await expect(store.write(momentArgs('sep-31', { occurredAt: '2026-09-31' })))
+        .rejects.toMatchObject({ code: 'invalid-frontmatter' });
+      const leap = await store.write(momentArgs('leap-day', { occurredAt: '2024-02-29' }));
+      expect(leap.ok).toBe(true);
       await expect(store.write(momentArgs('bad-sig', { significance: 'mega' })))
         .rejects.toMatchObject({ code: 'invalid-frontmatter' });
       await expect(store.write(momentArgs('bad-session', { sourceSession: 'a\nb' })))

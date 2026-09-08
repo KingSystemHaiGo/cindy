@@ -7072,6 +7072,7 @@
         "tone": "Tone",
         "toneHint": "Pick the closest feel. Use Custom when you need specifics.",
         "tones": {
+          "followDefault": "Follow default",
           "warm": "Warm",
           "professional": "Professional",
           "playful": "Playful",
@@ -7083,12 +7084,14 @@
         "selfName": "What they call themselves",
         "replyLength": "Reply length",
         "replyLengths": {
+          "followDefault": "Follow default",
           "short": "Short",
           "medium": "Medium",
           "long": "Long"
         },
         "emojiDensity": "Emoji",
         "emojiDensities": {
+          "followDefault": "Follow default",
           "none": "None",
           "sparse": "Sparse",
           "normal": "Natural"

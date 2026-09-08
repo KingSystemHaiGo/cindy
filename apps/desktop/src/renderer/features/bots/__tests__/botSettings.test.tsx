@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { BotCapabilities, BotProfile } from '../botStore';
 
@@ -258,6 +258,33 @@ describe('Bot settings unified autosave', () => {
     expect(mocks.updateBotProfile.mock.calls[0]?.[1]).toMatchObject({
       style: { tone: 'warm' },
     });
+  });
+
+  it('clears discrete style fields when the user picks follow-default', async () => {
+    vi.useFakeTimers();
+    renderSettings({
+      style: { tone: 'warm', replyLength: 'short', emojiDensity: 'sparse' },
+    });
+    fireEvent.click(
+      within(screen.getByRole('radiogroup', { name: 'bots.profile.style.tone' })).getByRole('radio', {
+        name: 'bots.profile.style.tones.followDefault',
+      }),
+    );
+    fireEvent.click(
+      within(screen.getByRole('radiogroup', { name: 'bots.profile.style.replyLength' })).getByRole('radio', {
+        name: 'bots.profile.style.replyLengths.followDefault',
+      }),
+    );
+    fireEvent.click(
+      within(screen.getByRole('radiogroup', { name: 'bots.profile.style.emojiDensity' })).getByRole('radio', {
+        name: 'bots.profile.style.emojiDensities.followDefault',
+      }),
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const lastPatch = mocks.updateBotProfile.mock.calls.at(-1)?.[1] as { style?: unknown };
+    expect(lastPatch.style).toBeNull();
   });
 
   it('changes the avatar through the host-owned image picker', async () => {

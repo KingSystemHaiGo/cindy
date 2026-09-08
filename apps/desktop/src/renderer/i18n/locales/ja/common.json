@@ -7070,6 +7070,7 @@
         "tone": "トーン",
         "toneHint": "近い雰囲気を選んでください。細かく指定したいときはカスタムを使います。",
         "tones": {
+          "followDefault": "既定に従う",
           "warm": "やさしい",
           "professional": "ていねい",
           "playful": "くだけた",
@@ -7081,12 +7082,14 @@
         "selfName": "自分の呼び方",
         "replyLength": "返信の長さ",
         "replyLengths": {
+          "followDefault": "既定に従う",
           "short": "短め",
           "medium": "ふつう",
           "long": "長め"
         },
         "emojiDensity": "絵文字",
         "emojiDensities": {
+          "followDefault": "既定に従う",
           "none": "使わない",
           "sparse": "ときどき",
           "normal": "自然に"

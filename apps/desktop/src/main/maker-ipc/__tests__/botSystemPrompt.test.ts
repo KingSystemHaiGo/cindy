@@ -246,6 +246,12 @@ describe('伙伴的家', () => {
     const withEmpty = buildBotStableTier({ ...base, style: { tone: 'custom' } });
     expect(withEmpty).toBe(buildBotStableTier(base));
     expect(withEmpty).not.toContain('说话习惯');
+    const followDefault = buildBotStableTier({
+      ...base,
+      style: { tone: undefined, replyLength: undefined, emojiDensity: undefined },
+    });
+    expect(followDefault).toBe(buildBotStableTier(base));
+    expect(followDefault).not.toContain('说话习惯');
   });
 
   it('overlay 位于上下文层,不会把 Bot Mode 核心协议挤掉', () => {

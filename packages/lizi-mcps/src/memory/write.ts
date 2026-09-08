@@ -65,11 +65,6 @@ export function registerMemoryWriteTool(registry: MemoryToolRegistry, deps: Memo
         .enum(['normal', 'high'])
         .optional()
         .describe('moment 专用: 重要程度; high = 重大想法/里程碑/明确强调'),
-      sourceSession: z
-        .string()
-        .max(120)
-        .optional()
-        .describe('来源 session 引用 (轻量溯源); 一般由系统自动注入, 无需手填'),
     },
     handler: async (args) =>
       withStore(deps, async (store, scopeKey): Promise<unknown> => {
@@ -79,7 +74,12 @@ export function registerMemoryWriteTool(registry: MemoryToolRegistry, deps: Memo
         if (isBotOnlyMemoryType(args.type) && parseBotMemoryScopeKey(scopeKey) === null) {
           throw new MemoryError('invalid-type', 'moment 仅伙伴(bot)记忆可用; 当前 scope 不是 bot 记忆');
         }
-        return store.write(args as WriteOptions);
+        // sourceSession 不暴露给模型: 只从当前 session ctx 注入, 缺 ctx 则不带该字段。
+        const sessionId = deps.getSessionContext?.()?.sessionId?.trim();
+        const opts: WriteOptions = sessionId
+          ? { ...args, sourceSession: sessionId }
+          : { ...args };
+        return store.write(opts);
       }),
   });
 }

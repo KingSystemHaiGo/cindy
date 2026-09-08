@@ -509,12 +509,85 @@ describe('moment 类型严格限定伙伴作用域 (#4124)', () => {
     expect(moment?.frontmatter.type).toBe('moment');
     expect(moment?.frontmatter.occurredAt).toBe('2026-09-08');
     expect(moment?.frontmatter.significance).toBe('high');
+    expect(moment?.frontmatter.sourceSession).toBe('session-moment-1');
 
     // 可: 下一次会话注入的 MEMORY.md 快照里有独立的 moment 分区。
     const index = await readMemoryIndex(buildBotMemoryScopeKey(BOT_ID));
     expect(index).toContain('## moment');
     expect(index).toContain('first-deep-dive');
     expect(index).toContain('2026-09-08');
+  });
+
+  it('memory_write 从 session ctx 注入 sourceSession, 模型伪造字段被 schema 拒绝', async () => {
+    const session = await connectBotSession({
+      agentKind: 'claude-code',
+      sessionId: 'session-moment-auth',
+      memoryScopeKey: buildBotMemoryScopeKey(BOT_ID),
+    });
+    try {
+      const forged = await session.client.callTool({
+        name: 'call_tool',
+        arguments: {
+          name: 'memory_write',
+          args: {
+            type: 'moment',
+            name: 'forged-source',
+            title: '伪造来源',
+            description: '模型试图指定 sourceSession',
+            body: '这条必须被 schema 拒绝。',
+            sourceSession: 'forged-session-id',
+          },
+        },
+      });
+      const forgedText = (forged as { content: Array<{ type: string; text: string }> }).content.find(
+        (block) => block.type === 'text',
+      )?.text;
+      expect(forgedText).toBeTruthy();
+      const forgedEnvelope = JSON.parse(forgedText!) as { ok: boolean; errorCode?: string };
+      expect(forgedEnvelope.ok).toBe(false);
+      expect(forgedEnvelope.errorCode).toBe('INVALID_ARGS');
+
+      const written = await modelWritesMemory(session.client, {
+        type: 'moment',
+        name: 'injected-source',
+        title: '注入来源',
+        description: '系统注入 sourceSession',
+        body: '这条应带上当前 session。',
+      });
+      expect(written.ok).toBe(true);
+    } finally {
+      await session.cleanup();
+    }
+
+    const records = await botMemoryList(BOT_ID);
+    expect(records.map((record) => record.slug)).not.toContain('forged-source');
+    expect(records.find((record) => record.slug === 'injected-source')?.frontmatter.sourceSession).toBe(
+      'session-moment-auth',
+    );
+  });
+
+  it('session ctx 没有 sessionId 时 moment 不写 sourceSession', async () => {
+    const session = await connectBotSession({
+      agentKind: 'claude-code',
+      memoryScopeKey: buildBotMemoryScopeKey(BOT_ID),
+    });
+    try {
+      expect(
+        (
+          await modelWritesMemory(session.client, {
+            type: 'moment',
+            name: 'no-session-id',
+            title: '没有 session',
+            description: '缺 ctx sessionId 时不落 sourceSession',
+            body: '这条不应带 sourceSession。',
+          })
+        ).ok,
+      ).toBe(true);
+    } finally {
+      await session.cleanup();
+    }
+    const moment = (await botMemoryList(BOT_ID)).find((record) => record.slug === 'no-session-id');
+    expect(moment?.frontmatter.sourceSession).toBeUndefined();
   });
 
   it('伙伴会话可将三条 moment 合并成一条 moment, 旧分片从存储中删除', async () => {

@@ -184,6 +184,12 @@ describe('botSettingsPayloadEqual', () => {
         payload({ style: { tone: 'warm' } }),
       ),
     ).toBe(true);
+    expect(
+      botSettingsPayloadEqual(
+        payload({ style: { tone: undefined, replyLength: undefined, emojiDensity: undefined } }),
+        payload({ style: null }),
+      ),
+    ).toBe(true);
   });
 
   it('treats a null and an undefined providerId as the same "none"', () => {

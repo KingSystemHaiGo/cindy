@@ -21,6 +21,12 @@ const TEXTAREA_CLASS =
 const INPUT_CLASS =
   'mt-1.5 h-10 w-full rounded-lg border border-[var(--border-default)] bg-[var(--surface)] px-3 text-13 text-[var(--text-primary)] outline-none placeholder:text-[var(--text-placeholder)] focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]';
 
+const FOLLOW_DEFAULT = 'default' as const;
+
+type ToneControl = BotStyleTone | typeof FOLLOW_DEFAULT;
+type ReplyLengthControl = BotStyleReplyLength | typeof FOLLOW_DEFAULT;
+type EmojiDensityControl = BotStyleEmojiDensity | typeof FOLLOW_DEFAULT;
+
 function StyleRow({
   label,
   hint,
@@ -64,14 +70,26 @@ export function BotCommunicationStyleFields({
     >
       <div className="flex flex-col gap-4">
         <StyleRow label={t('bots.profile.style.tone')} hint={t('bots.profile.style.toneHint')}>
-          <SettingsSegmentedControl<BotStyleTone>
+          <SettingsSegmentedControl<ToneControl>
             aria-label={t('bots.profile.style.tone')}
-            value={style.tone ?? null}
-            onValueChange={(tone) => patch({ ...style, tone }, 'instant')}
-            options={BOT_STYLE_TONES.map((tone) => ({
-              value: tone,
-              label: t(`bots.profile.style.tones.${tone}`),
-            }))}
+            value={style.tone ?? FOLLOW_DEFAULT}
+            onValueChange={(tone) => {
+              if (tone === FOLLOW_DEFAULT) {
+                const next = { ...style };
+                delete next.tone;
+                delete next.customTone;
+                patch(next, 'instant');
+                return;
+              }
+              patch({ ...style, tone }, 'instant');
+            }}
+            options={[
+              { value: FOLLOW_DEFAULT, label: t('bots.profile.style.tones.followDefault') },
+              ...BOT_STYLE_TONES.map((tone) => ({
+                value: tone,
+                label: t(`bots.profile.style.tones.${tone}`),
+              })),
+            ]}
           />
         </StyleRow>
         {style.tone === 'custom' ? (
@@ -110,25 +128,47 @@ export function BotCommunicationStyleFields({
         </label>
 
         <StyleRow label={t('bots.profile.style.replyLength')}>
-          <SettingsSegmentedControl<BotStyleReplyLength>
+          <SettingsSegmentedControl<ReplyLengthControl>
             aria-label={t('bots.profile.style.replyLength')}
-            value={style.replyLength ?? null}
-            onValueChange={(replyLength) => patch({ ...style, replyLength }, 'instant')}
-            options={BOT_STYLE_REPLY_LENGTHS.map((item) => ({
-              value: item,
-              label: t(`bots.profile.style.replyLengths.${item}`),
-            }))}
+            value={style.replyLength ?? FOLLOW_DEFAULT}
+            onValueChange={(replyLength) => {
+              if (replyLength === FOLLOW_DEFAULT) {
+                const next = { ...style };
+                delete next.replyLength;
+                patch(next, 'instant');
+                return;
+              }
+              patch({ ...style, replyLength }, 'instant');
+            }}
+            options={[
+              { value: FOLLOW_DEFAULT, label: t('bots.profile.style.replyLengths.followDefault') },
+              ...BOT_STYLE_REPLY_LENGTHS.map((item) => ({
+                value: item,
+                label: t(`bots.profile.style.replyLengths.${item}`),
+              })),
+            ]}
           />
         </StyleRow>
         <StyleRow label={t('bots.profile.style.emojiDensity')}>
-          <SettingsSegmentedControl<BotStyleEmojiDensity>
+          <SettingsSegmentedControl<EmojiDensityControl>
             aria-label={t('bots.profile.style.emojiDensity')}
-            value={style.emojiDensity ?? null}
-            onValueChange={(emojiDensity) => patch({ ...style, emojiDensity }, 'instant')}
-            options={BOT_STYLE_EMOJI_DENSITIES.map((item) => ({
-              value: item,
-              label: t(`bots.profile.style.emojiDensities.${item}`),
-            }))}
+            value={style.emojiDensity ?? FOLLOW_DEFAULT}
+            onValueChange={(emojiDensity) => {
+              if (emojiDensity === FOLLOW_DEFAULT) {
+                const next = { ...style };
+                delete next.emojiDensity;
+                patch(next, 'instant');
+                return;
+              }
+              patch({ ...style, emojiDensity }, 'instant');
+            }}
+            options={[
+              { value: FOLLOW_DEFAULT, label: t('bots.profile.style.emojiDensities.followDefault') },
+              ...BOT_STYLE_EMOJI_DENSITIES.map((item) => ({
+                value: item,
+                label: t(`bots.profile.style.emojiDensities.${item}`),
+              })),
+            ]}
           />
         </StyleRow>
 

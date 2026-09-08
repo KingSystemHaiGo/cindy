@@ -7070,6 +7070,7 @@
         "tone": "语气",
         "toneHint": "选一个接近的感觉；需要更具体时用自定义。",
         "tones": {
+          "followDefault": "跟随默认",
           "warm": "温暖",
           "professional": "专业",
           "playful": "轻松",
@@ -7081,12 +7082,14 @@
         "selfName": "怎么自称",
         "replyLength": "回复长短",
         "replyLengths": {
+          "followDefault": "跟随默认",
           "short": "短",
           "medium": "适中",
           "long": "细"
         },
         "emojiDensity": "emoji",
         "emojiDensities": {
+          "followDefault": "跟随默认",
           "none": "不用",
           "sparse": "偶尔",
           "normal": "自然"

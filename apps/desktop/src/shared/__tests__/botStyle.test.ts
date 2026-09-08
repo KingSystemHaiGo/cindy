@@ -60,6 +60,7 @@ describe('buildBotStyleGuidance', () => {
   it('returns empty when there is nothing concrete to say', () => {
     expect(buildBotStyleGuidance(undefined)).toBe('');
     expect(buildBotStyleGuidance({ tone: 'custom' })).toBe('');
+    expect(buildBotStyleGuidance({ tone: undefined, replyLength: undefined, emojiDensity: undefined })).toBe('');
   });
 
   it('does not override SOUL and tells the bot not to rewrite style', () => {
