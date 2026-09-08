@@ -2,7 +2,7 @@
  * 伙伴沟通风格。结构化字段走 bot profile / capabilitiesJson,和性别同款,
  * 不另开一列,也不进 renderer localStorage。
  *
- * 风格块只约束「怎么说」,不覆盖 SOUL.md 身份正本;伙伴自己也不得改写。
+ * 风格块只约束「怎么说」,不覆盖 SOUL.md 身份正本;伙伴自己也不得改写——伙伴没有工具能写 Profile(只有 main-side IPC),提示词也明确禁止改写风格。
  */
 
 export const BOT_STYLE_TONES = [
