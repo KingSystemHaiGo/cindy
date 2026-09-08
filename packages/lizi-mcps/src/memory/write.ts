@@ -16,10 +16,15 @@
 
 import { z } from 'zod';
 
-import { buildJsonResult, withStore } from './_shared.js';
+import { withStore } from './_shared.js';
 import type { MemoryMcpDeps } from '../types.js';
 import type { MemoryToolRegistry } from '../cindy_memoryToolRegistry.js';
-import { isBotOnlyMemoryType, parseBotMemoryScopeKey, type WriteOptions } from '@cindy/maker-core';
+import {
+  isBotOnlyMemoryType,
+  MemoryError,
+  parseBotMemoryScopeKey,
+  type WriteOptions,
+} from '@cindy/maker-core';
 
 export function registerMemoryWriteTool(registry: MemoryToolRegistry, deps: MemoryMcpDeps): void {
   registry.register({
@@ -68,15 +73,11 @@ export function registerMemoryWriteTool(registry: MemoryToolRegistry, deps: Memo
     },
     handler: async (args) =>
       withStore(deps, async (store, scopeKey): Promise<unknown> => {
-        // MCP 边界门禁 (#4124): bot-only 类型必须命中 bot scope。store 层也会拒绝
-        // (invalid-type → INVALID_PARAMS), 这里先拦一层给出更直接的错误语义。
+        // MCP 边界门禁 (#4124): bot-only 类型必须命中 bot scope。throw MemoryError
+        // 让 withStore 走 classifyMemoryError (invalid-type → INVALID_PARAMS),
+        // 与 store 层门禁同一条错误信封, 避免成功包装套一层 isError JSON。
         if (isBotOnlyMemoryType(args.type) && parseBotMemoryScopeKey(scopeKey) === null) {
-          return Promise.resolve(
-            buildJsonResult(
-              { ok: false, code: 'INVALID_PARAMS', message: 'moment 仅伙伴(bot)记忆可用; 当前 scope 不是 bot 记忆' },
-              true,
-            ),
-          );
+          throw new MemoryError('invalid-type', 'moment 仅伙伴(bot)记忆可用; 当前 scope 不是 bot 记忆');
         }
         return store.write(args as WriteOptions);
       }),
