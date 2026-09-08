@@ -16,17 +16,19 @@
 
 import { z } from 'zod';
 
-import { withStore } from './_shared.js';
+import { buildJsonResult, withStore } from './_shared.js';
 import type { MemoryMcpDeps } from '../types.js';
 import type { MemoryToolRegistry } from '../cindy_memoryToolRegistry.js';
-import type { WriteOptions } from '@cindy/maker-core';
+import { isBotOnlyMemoryType, parseBotMemoryScopeKey, type WriteOptions } from '@cindy/maker-core';
 
 export function registerMemoryWriteTool(registry: MemoryToolRegistry, deps: MemoryMcpDeps): void {
   registry.register({
     name: 'memory_write',
     category: 'write',
     description:
-      '写入一条 memory 分片。type 必须是 user/feedback/project/reference 之一; ' +
+      '写入一条 memory 分片。type 必须是 user/feedback/project/reference/moment 之一; ' +
+      'moment 仅伙伴(bot)记忆可用 (写用户的重要想法/重大时刻/说过的关键的话, 不记流水账), ' +
+      '普通 workdir 记忆写 moment 会被拒绝; ' +
       'name 是 filename slug ([a-z0-9_-]{1,64}, 不是显示文本); title 显示标题 (中英均可); ' +
       'description 一行 hook (用作 MEMORY.md 索引行, 无换行, ≤ 200 字符); body 主体内容。' +
       'mode 默认 create (撞名拒绝), 可选 update/append。' +
@@ -49,8 +51,32 @@ export function registerMemoryWriteTool(registry: MemoryToolRegistry, deps: Memo
         .describe('一行 hook, 无换行, 用作 MEMORY.md 索引'),
       body: z.string().min(1),
       mode: z.enum(['create', 'update', 'append']).optional(),
+      occurredAt: z
+        .string()
+        .max(40)
+        .optional()
+        .describe('moment 专用: 事件发生时间 (ISO 8601, e.g. 2026-09-08); 缺省 = 当前时刻'),
+      significance: z
+        .enum(['normal', 'high'])
+        .optional()
+        .describe('moment 专用: 重要程度; high = 重大想法/里程碑/明确强调'),
+      sourceSession: z
+        .string()
+        .max(120)
+        .optional()
+        .describe('来源 session 引用 (轻量溯源); 一般由系统自动注入, 无需手填'),
     },
     handler: async (args) =>
-      withStore(deps, (store) => store.write(args as WriteOptions)),
+      withStore(deps, (store, scopeKey) => {
+        // MCP 边界门禁 (#4124): bot-only 类型必须命中 bot scope。store 层也会拒绝
+        // (invalid-type → INVALID_PARAMS), 这里先拦一层给出更直接的错误语义。
+        if (isBotOnlyMemoryType(args.type) && parseBotMemoryScopeKey(scopeKey) === null) {
+          return buildJsonResult(
+            { ok: false, code: 'INVALID_PARAMS', message: 'moment 仅伙伴(bot)记忆可用; 当前 scope 不是 bot 记忆' },
+            true,
+          );
+        }
+        return store.write(args as WriteOptions);
+      }),
   });
 }

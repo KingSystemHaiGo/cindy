@@ -146,7 +146,16 @@ function parseEnvelope(result: unknown): Envelope {
 /** 「假模型回合」:模型经二级分派写一条记忆。 */
 async function modelWritesMemory(
   client: Client,
-  args: { type: string; name: string; title: string; description: string; body: string },
+  args: {
+    type: string;
+    name: string;
+    title: string;
+    description: string;
+    body: string;
+    occurredAt?: string;
+    significance?: string;
+    sourceSession?: string;
+  },
 ): Promise<Envelope> {
   return parseEnvelope(
     await client.callTool({
@@ -471,5 +480,89 @@ describe('Cindy Bot 记忆全链(形成 → 存 → 取 → 用 → 删)', () =>
       await back.cleanup();
     }
     expect((await botMemoryList(BOT_ID)).map((r) => r.slug)).toEqual(['signed-in']);
+  });
+});
+
+describe('moment 类型严格限定伙伴作用域 (#4124)', () => {
+  it('伙伴会话写 moment 成功, frontmatter 保留 occurredAt/significance, 索引出现 moment 分区', async () => {
+    const session = await connectBotSession({
+      agentKind: 'claude-code',
+      sessionId: 'session-moment-1',
+      memoryScopeKey: buildBotMemoryScopeKey(BOT_ID),
+    });
+    try {
+      const written = await modelWritesMemory(session.client, {
+        type: 'moment',
+        name: 'first-deep-dive',
+        title: '第一次深聊记忆系统',
+        description: '用户提出伙伴要记住重要时刻',
+        body: '用户说:伙伴应该记住我们之间的重要时刻。',
+        occurredAt: '2026-09-08',
+        significance: 'high',
+      });
+      expect(written.ok).toBe(true);
+    } finally {
+      await session.cleanup();
+    }
+
+    const moment = (await botMemoryList(BOT_ID)).find((r) => r.slug === 'first-deep-dive');
+    expect(moment?.frontmatter.type).toBe('moment');
+    expect(moment?.frontmatter.occurredAt).toBe('2026-09-08');
+    expect(moment?.frontmatter.significance).toBe('high');
+
+    // 可: 下一次会话注入的 MEMORY.md 快照里有独立的 moment 分区。
+    const index = await readMemoryIndex(buildBotMemoryScopeKey(BOT_ID));
+    expect(index).toContain('## moment');
+    expect(index).toContain('first-deep-dive');
+    expect(index).toContain('2026-09-08');
+  });
+
+  it('项目会话 (workdir scope) 写 moment 被确定性拒绝为 INVALID_PARAMS, 分片不落盘', async () => {
+    const session = await connectBotSession({
+      agentKind: 'claude-code',
+      sessionId: 'session-moment-2',
+    });
+    try {
+      const written = await modelWritesMemory(session.client, {
+        type: 'moment',
+        name: 'should-be-rejected',
+        title: '不属于项目记忆',
+        description: '全局 workdir 不允许 moment',
+        body: '这条必须被拒绝。',
+      });
+      expect(written.ok).toBe(false);
+      expect((written as { code: string }).code).toBe('INVALID_PARAMS');
+    } finally {
+      await session.cleanup();
+    }
+    const projectStore = await manager.getStore(buildMemoryScopeKey(PROJECT_DIR));
+    expect(await projectStore.list()).toEqual([]);
+  });
+
+  it('隔离: 伙伴有 moment 分片时, 项目 scope 的索引也绝不出现 moment 分区', async () => {
+    const session = await connectBotSession({
+      agentKind: 'pi',
+      sessionId: 'session-moment-3',
+      memoryScopeKey: buildBotMemoryScopeKey(BOT_ID),
+    });
+    try {
+      expect(
+        (
+          await modelWritesMemory(session.client, {
+            type: 'moment',
+            name: 'bot-only-moment',
+            title: '伙伴的时刻',
+            description: '只属于伙伴',
+            body: '只属于伙伴的时刻内容。',
+          })
+        ).ok,
+      ).toBe(true);
+    } finally {
+      await session.cleanup();
+    }
+
+    const projectIndex = await readMemoryIndex(buildMemoryScopeKey(PROJECT_DIR));
+    expect(projectIndex).not.toContain('## moment');
+    expect(projectIndex).not.toContain('bot-only-moment');
   });
 });
