@@ -66,6 +66,8 @@ export interface LegacyShardInfo {
   isLegacy: boolean;
   /** 合法 .md 分片数 (排除 MEMORY.md / meta.json / fts.db)。 */
   recordCount: number;
+  /** skipped / failed 原因 (relative-absPath / worktree-resolve-failure 等)。 */
+  skipReason?: string;
 }
 
 /** 迁移计划。 */
@@ -76,8 +78,10 @@ export interface LegacyShardMigrationPlan {
   emptyToDelete: LegacyShardInfo[];
   /** 有内容需合并的 legacy 分片。 */
   mergeCandidates: LegacyShardInfo[];
-  /** 无 meta.json / SSH 等不处理的分片。 */
+  /** 无 meta.json / SSH / 相对 absPath 等不处理的分片。 */
   skipped: LegacyShardInfo[];
+  /** 活 worktree 解析失败等需 surface 的分片 (不 abort 整份计划)。 */
+  failed: LegacyShardInfo[];
 }
 
 /** 单文件合并结果。 */
@@ -121,6 +125,7 @@ export async function planLegacyShardMigration(
     emptyToDelete: [],
     mergeCandidates: [],
     skipped: [],
+    failed: [],
   };
 
   let entries: string[];
@@ -154,13 +159,13 @@ export async function planLegacyShardMigration(
         typeof (parsed as ShardMeta).absPath !== 'string' ||
         (parsed as ShardMeta).absPath.trim() === ''
       ) {
-        plan.skipped.push(await buildSkippedInfo(dir, entry));
+        plan.skipped.push(await buildSkippedInfo(dir, entry, 'invalid-meta'));
         continue;
       }
       meta = parsed as ShardMeta;
     } catch {
       // 无 meta.json / 非 JSON → 不猜不删, 跳过并报告
-      plan.skipped.push(await buildSkippedInfo(dir, entry));
+      plan.skipped.push(await buildSkippedInfo(dir, entry, 'no-meta'));
       continue;
     }
 
@@ -169,17 +174,25 @@ export async function planLegacyShardMigration(
     // 前缀: sanitizeWorkdir 允许本地路径 (如 /ssh/proj) 恰好产出 ssh- 开头的
     // 目录名, 按前缀误判会把本地 legacy 分片跳过成孤儿 (Codex review on
     // #2519 第五轮)。
-    const isRemote = (meta.absPath ?? '').startsWith(SSH_SCOPE_KEY_PREFIX);
+    const rawAbs = meta.absPath;
+    const isRemote = rawAbs.startsWith(SSH_SCOPE_KEY_PREFIX);
     if (isRemote) {
-      plan.skipped.push(await buildSkippedInfo(dir, entry));
+      plan.skipped.push(await buildSkippedInfo(dir, entry, 'ssh', rawAbs));
+      continue;
+    }
+    // MemoryStorageMeta.absPath 约定绝对路径; 相对路径 (如 "..") 规划阶段
+    // 拒绝, 否则 apply 会把目标解析到 memoryRoot 的父目录并删源
+    // (Codex review on #2519 第十八轮)。
+    if (!path.isAbsolute(rawAbs)) {
+      plan.skipped.push(await buildSkippedInfo(dir, entry, 'relative-absPath', rawAbs));
       continue;
     }
 
     let canonicalScopeKey: string;
     try {
-      canonicalScopeKey = await resolveScopeKey(meta.absPath || entry);
+      canonicalScopeKey = await resolveScopeKey(rawAbs);
     } catch {
-      canonicalScopeKey = meta.absPath || entry;
+      canonicalScopeKey = rawAbs;
     }
     // 已归档/删除的 Cindy worktree (resolver live 探测失败回落原样) —
     // 用 `.cindy-worktrees/<name>` 路径形态做静态推导, 否则旧记录永远孤儿
@@ -191,10 +204,23 @@ export async function planLegacyShardMigration(
     // `git worktree remove` 会删掉 worktree 目录与 `.git/worktrees/<name>` 登记,
     // 但 meta.absPath 仍是托管形态 — 记 unregistered-legacy, 仍静态推导,
     // 否则归档分片永远孤儿。
-    if (canonicalScopeKey === (meta.absPath || entry)) {
-      const raw = meta.absPath || entry;
-      if (!(await isLiveGitRepo(raw)) && (await shouldDeriveArchivedManagedWorktree(raw))) {
-        const derived = deriveCanonicalFromCindyWorktreePath(raw);
+    //
+    // 活托管 worktree 上 resolver 超时/失败也回落原路径, 且 isLiveGitRepo
+    // 为真会压掉静态推导 → 静默 non-legacy、记忆孤儿。记 failed 并 surface
+    // (Codex review on #2519 第十八轮), 不 abort 整份计划。
+    if (canonicalScopeKey === rawAbs) {
+      const live = await isLiveGitRepo(rawAbs);
+      // 活 Cindy worktree 仍有 `.git/worktrees/<name>` 登记, 但 resolver 回落
+      // 原路径 (超时/git 失败) → 不能当 non-legacy 静默吞掉。碰巧同名的
+      // 独立仓库没有登记, 回落原路径是正确结果, 不进 failed。
+      if (live && (await hasGitWorktreeRegistration(rawAbs))) {
+        plan.failed.push(
+          await buildSkippedInfo(dir, entry, 'worktree-resolve-failure', rawAbs),
+        );
+        continue;
+      }
+      if (!live && (await shouldDeriveArchivedManagedWorktree(rawAbs))) {
+        const derived = deriveCanonicalFromCindyWorktreePath(rawAbs);
         if (derived) canonicalScopeKey = derived;
       }
     }
@@ -242,14 +268,20 @@ export async function planLegacyShardMigration(
   return plan;
 }
 
-async function buildSkippedInfo(dir: string, entry: string): Promise<LegacyShardInfo> {
+async function buildSkippedInfo(
+  dir: string,
+  entry: string,
+  reason?: string,
+  legacyWorkdir?: string,
+): Promise<LegacyShardInfo> {
   return {
     dir,
-    legacyWorkdir: entry,
+    legacyWorkdir: legacyWorkdir ?? entry,
     canonicalScopeKey: entry,
     canonicalDirName: entry,
     isLegacy: false,
     recordCount: -1,
+    skipReason: reason,
   };
 }
 
@@ -652,6 +684,13 @@ async function hasManagedWorktreeEvidence(absPath: string): Promise<boolean> {
   } catch {
     // 归档 worktree 通常已无 .git, 继续看主仓登记
   }
+  return hasGitWorktreeRegistration(absPath);
+}
+
+/** 主仓是否仍登记该托管 worktree (`.git/worktrees/<name>`)。 */
+async function hasGitWorktreeRegistration(absPath: string): Promise<boolean> {
+  const root = managedWorktreeRoot(absPath);
+  if (!root) return false;
   const worktreeName = path.basename(root);
   const mainRoot = path.dirname(path.dirname(root));
   if (!worktreeName || !mainRoot) return false;

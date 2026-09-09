@@ -613,6 +613,48 @@ describe('runLegacyShardMigration — 执行', () => {
     expect(plan.mergeCandidates[0].dir.endsWith(wtDir)).toBe(true);
   });
 
+  it('相对路径 absPath 规划阶段 skipped, 其余分片继续 (Codex 第十八轮)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const worktree = path.join(tmpRoot, 'repo-wt');
+    const wtDir = sanitizeWorkdir(worktree);
+    await makeShard(wtDir, { absPath: worktree, files: { 'feedback_a.md': 'X' } });
+    const relDir = 'relative-meta';
+    await makeShard(relDir, { absPath: '..', files: { 'feedback_a.md': 'x' } });
+
+    const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+    const skipped = plan.skipped.find((s) => s.dir.endsWith(relDir));
+    expect(skipped?.skipReason).toBe('relative-absPath');
+    expect(plan.mergeCandidates).toHaveLength(1);
+    expect(plan.mergeCandidates[0].dir.endsWith(wtDir)).toBe(true);
+    expect(plan.failed).toHaveLength(0);
+  });
+
+  it('活托管 worktree 解析回落原路径 → failed, 计划不 abort (Codex 第十八轮)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const liveWt = path.join(mainRepo, '.cindy-worktrees', 'feat-x');
+    await fs.mkdir(path.join(liveWt, '.git'), { recursive: true });
+    await registerManagedWorktree(mainRepo, 'feat-x');
+    const liveDir = sanitizeWorkdir(liveWt);
+    await makeShard(liveDir, { absPath: liveWt, files: { 'feedback_a.md': 'X' } });
+
+    const otherWt = path.join(tmpRoot, 'other-wt');
+    const otherDir = sanitizeWorkdir(otherWt);
+    await makeShard(otherDir, { absPath: otherWt, files: { 'feedback_b.md': 'Y' } });
+
+    const plan = await planLegacyShardMigration(memoryRoot, {
+      resolveScopeKey: async (wd: string) => {
+        if (wd === liveWt) return liveWt; // 模拟 git 超时/失败回落原路径
+        if (wd === otherWt) return mainRepo;
+        return wd;
+      },
+    });
+    expect(plan.failed).toHaveLength(1);
+    expect(plan.failed[0].dir.endsWith(liveDir)).toBe(true);
+    expect(plan.failed[0].skipReason).toBe('worktree-resolve-failure');
+    expect(plan.mergeCandidates).toHaveLength(1);
+    expect(plan.mergeCandidates[0].dir.endsWith(otherDir)).toBe(true);
+  });
+
   it('慢路径合并: plan 后写入的合法分片被一并合并, 数据不丢 (Codex 第四轮: 快照后写入)', async () => {
     const mainRepo = path.join(tmpRoot, 'repo');
     const worktree = path.join(tmpRoot, 'repo-wt');

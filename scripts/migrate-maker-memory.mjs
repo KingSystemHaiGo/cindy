@@ -109,9 +109,9 @@ async function main() {
 
   const summarize = (p) => ({
     memoryRoot,
-    // skipped (SSH / 无 meta) 不进 plan.all, 但仍是扫描到的分片;
-    // 总数不含 skipped 时 dry-run 会显示 0 却列出多项跳过 (Codex #2519)。
-    totalShards: p.all.length + p.skipped.length,
+    // skipped / failed 不进 plan.all, 但仍是扫描到的分片;
+    // 总数不含它们时 dry-run 会显示 0 却列出多项跳过 (Codex #2519)。
+    totalShards: p.all.length + p.skipped.length + p.failed.length,
     legacy: p.emptyToDelete.length + p.mergeCandidates.length,
     emptyToDelete: p.emptyToDelete.map((s) => s.dir),
     mergeCandidates: p.mergeCandidates.map((s) => ({
@@ -119,7 +119,8 @@ async function main() {
       to: path.join(memoryRoot, s.canonicalDirName),
       records: s.recordCount,
     })),
-    skipped: p.skipped.map((s) => s.dir),
+    skipped: p.skipped.map((s) => ({ dir: s.dir, reason: s.skipReason ?? null })),
+    failed: p.failed.map((s) => ({ dir: s.dir, reason: s.skipReason ?? null })),
   });
 
   if (opts.dryRun) {
@@ -136,7 +137,13 @@ async function main() {
         );
       }
       process.stdout.write(`\n跳过不处理 (${summary.skipped.length}):\n`);
-      for (const d of summary.skipped) process.stdout.write(`  - ${d}\n`);
+      for (const s of summary.skipped) {
+        process.stdout.write(`  - ${s.dir}${s.reason ? ` (${s.reason})` : ''}\n`);
+      }
+      process.stdout.write(`\n解析失败 (${summary.failed.length}):\n`);
+      for (const s of summary.failed) {
+        process.stdout.write(`  - ${s.dir}${s.reason ? ` (${s.reason})` : ''}\n`);
+      }
       process.stdout.write('\n(dry-run — 未修改任何文件; 执行请加 --apply)\n');
     }
     process.stdout.write(`RESULT ${JSON.stringify({ mode: 'dry-run', ...summary })}\n`);
