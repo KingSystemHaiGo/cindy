@@ -475,10 +475,12 @@ export class MakerMemoryManager {
    * buildMemoryScopeKey 产出的 `ssh:<hostId>:<path>` 复合键 (调用方负责,
    * manager 不自己判远端) — 见 storage.ts buildMemoryScopeKey。
    *
-   * worktree 归一化兜底 (#2379): agent 启动注入 / MCP withStore 已在调用侧
-   * 经 resolveMemoryScopeKey 解析 (进程内缓存, 此处命中零成本); 本层对非
-   * `ssh:` / `bot:` 入参再解析一次, resetWorkdir/runReview/UI 等旁路即使传入
-   * 未归一化的 worktree 路径也落到同一 Store。归一化幂等。
+   * worktree 归一化边界 (#2379): 本层对非 `ssh:` / `bot:` 入参 await
+   * resolveMemoryScopeKey。agent startSession 只传同步 buildMemoryScopeKey
+   * (原始 workdir / ssh 复合键), 打开 store 时才 spawn git, 避免启动路径
+   * 扰动 elicitation/compacting 时序。MCP withStore 可先解析 (缓存命中
+   * 零成本); resetWorkdir/runReview/UI 等旁路即使传入未归一化的 worktree
+   * 路径也落到同一 Store。归一化幂等。
    *
    * opts.skipDisabledCheck: 清理路径 (resetWorkdir) 用 — 用户关闭 maker memory
    * 后仍需能清空已有记忆, 重置入口按「不论 makerEnabled 值都能清」语义工作

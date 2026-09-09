@@ -137,7 +137,6 @@ import {
 import { applyPiDisabledSkillSettings, filterPiDisabledProjectSkills, piDisabledDiscoveryPaths } from './skill-activation.js';
 import type { ReviewableAction } from '../shared/auto-review.js';
 import { buildMemoryScopeKey } from '../../memory/storage.js';
-import { resolveMemoryScopeKey } from '../../memory/scope-resolver.js';
 import { MAKER_MEMORY_RULES } from '../../memory/system-prompt.js';
 import type {
   Capabilities,
@@ -2983,10 +2982,8 @@ export class PiAgent extends BaseAgent {
     const makerMemoryPromptEnabled =
       sessionMemoryEnabled &&
       (opts.makerMemoryIndexSnapshot !== undefined || !!this.deps.makerMemory);
-    const memoryScopeKey = opts.makerMemoryScopeKey
-      ?? (makerMemoryPromptEnabled || compactionMemoryEnabled
-        ? await resolveMemoryScopeKey(opts.workingDir, opts.remoteHostId)
-        : buildMemoryScopeKey(opts.workingDir, opts.remoteHostId));
+    const memoryScopeKey =
+      opts.makerMemoryScopeKey ?? buildMemoryScopeKey(opts.workingDir, opts.remoteHostId);
     let makerMemoryIndex = '';
     if (makerMemoryPromptEnabled) {
       try {
