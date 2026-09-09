@@ -38,6 +38,7 @@ import {
   buildBotMemoryScopeKey,
   buildMemoryScopeKey,
   memoryScopeDirName,
+  parseBotMemoryScopeKey,
   type Logger,
   type MemoryRecord,
 } from '@cindy/maker-core';
@@ -85,6 +86,8 @@ function createManager(): MakerMemoryManager {
       databases.push(database);
       return database;
     },
+    // 与桌面宿主一致: bot: scope 是独立记忆, 不受全局 Maker Memory 开关影响。
+    isIndependentScope: (scopeKey) => parseBotMemoryScopeKey(scopeKey) !== null,
     agents: {},
     logger: noopLogger,
   });
@@ -517,6 +520,56 @@ describe('moment 类型严格限定伙伴作用域 (#4124)', () => {
     expect(index).toContain('## moment');
     expect(index).toContain('first-deep-dive');
     expect(index).toContain('2026-09-08');
+  });
+
+  it('全局关闭 Maker Memory 时 bot scope 的 moment 读写仍成功', async () => {
+    memoryEnabled = false;
+    const session = await connectBotSession({
+      agentKind: 'claude-code',
+      sessionId: 'session-moment-disabled-global',
+      memoryScopeKey: buildBotMemoryScopeKey(BOT_ID),
+    });
+    try {
+      const written = await modelWritesMemory(session.client, {
+        type: 'moment',
+        name: 'disabled-global-moment',
+        title: '全局关闭时仍记下',
+        description: '关闭全局 Memory 不得挡住伙伴时刻',
+        body: '这条必须落在 bot scope, 不能被 MAKER_MEMORY_NOT_READY 拦下。',
+        occurredAt: '2026-09-09',
+        significance: 'high',
+      });
+      expect(written.ok).toBe(true);
+
+      const searched = parseEnvelope(
+        await session.client.callTool({
+          name: 'call_tool',
+          arguments: { name: 'memory_search', args: { query: '伙伴时刻' } },
+        }),
+      );
+      expect(searched.ok).toBe(true);
+      expect(JSON.stringify((searched as { data: unknown }).data)).toContain('disabled-global-moment');
+    } finally {
+      await session.cleanup();
+    }
+
+    const project = await connectBotSession({
+      agentKind: 'claude-code',
+      sessionId: 'session-project-disabled-global',
+    });
+    try {
+      const blocked = await modelWritesMemory(project.client, {
+        type: 'user',
+        name: 'should-block',
+        title: '项目记忆应被挡',
+        description: '非 bot scope 仍走全局开关',
+        body: '这条必须失败。',
+      });
+      expect(blocked.ok).toBe(false);
+      expect((blocked as { code: string }).code).toBe('MAKER_MEMORY_NOT_READY');
+    } finally {
+      await project.cleanup();
+    }
   });
 
   it('memory_write 从 session ctx 注入 sourceSession, 模型伪造字段被 schema 拒绝', async () => {

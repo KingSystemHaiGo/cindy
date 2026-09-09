@@ -545,7 +545,6 @@ describe('Bot settings unified autosave', () => {
     expect(mocks.updateBotProfile.mock.calls[0]?.[1]).toEqual({
       name: 'Release buddy',
       description: 'Own releases',
-      style: null,
     });
   });
 

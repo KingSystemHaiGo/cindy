@@ -13,7 +13,7 @@
  * thread 的真实 workingDir。
  */
 
-import { buildMemoryScopeKey, type MakerMemoryStore } from '@cindy/maker-core';
+import { buildMemoryScopeKey, parseBotMemoryScopeKey, type MakerMemoryStore } from '@cindy/maker-core';
 
 import type { MemoryToolResult } from '../cindy_memoryToolRegistry.js';
 import type { MemoryMcpDeps } from '../types.js';
@@ -39,12 +39,6 @@ export async function withStore(
   let scopeAtEntry: string | null = null;
   try {
     const manager = deps.getManager();
-    if (!manager.isEnabled()) {
-      return buildJsonResult(
-        { ok: false, code: 'MAKER_MEMORY_NOT_READY', message: 'maker memory disabled (mode != "maker")' },
-        true,
-      );
-    }
     // 操作锚点 (review #2388 Codex 4th P1): getStore 返回的裸 store 在 manager
     // 守卫之外被调用方 await — 在拿 store 前捕获 scope, fn 完成后复核, 期间
     // 登出/切账号则操作结果不可信, fail-closed。
@@ -56,6 +50,15 @@ export async function withStore(
     // scopeKey 透传给 fn (#4124): memory_write 需要 scope 判定 bot-only 类型
     // (moment 仅伙伴记忆可用), 门禁在 store 层 + MCP 边界双重强制。
     scopeKey = ctx?.memoryScopeKey ?? buildMemoryScopeKey(workdir, ctx?.remoteHostId);
+    // 独立 Bot scope 不受全局 Maker Memory 开关影响 (cindy-bots-runtime 红线 /
+    // review #4128 P2)。getStore 的 independentScope 路径已自带 disabled 豁免,
+    // 这里只跳过 MCP 边界的 isEnabled 短路; 非 bot scope 维持原门禁。
+    if (parseBotMemoryScopeKey(scopeKey) === null && !manager.isEnabled()) {
+      return buildJsonResult(
+        { ok: false, code: 'MAKER_MEMORY_NOT_READY', message: 'maker memory disabled (mode != "maker")' },
+        true,
+      );
+    }
     store = await manager.getStore(scopeKey);
   } catch (err) {
     const { code, message } = classifyMemoryError(err);
