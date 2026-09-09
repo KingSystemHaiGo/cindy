@@ -69,6 +69,21 @@ export async function withStore(
     // (含 bot: / ssh:) 原样透传, 不再二次解析。
     scopeKey =
       ctx?.memoryScopeKey ?? (await resolveMemoryScopeKey(workdir, ctx?.remoteHostId));
+    // git 探测是 await: 期间 logout / 切账号会换 owner, 甚至换掉 getManager()
+    // 绑定的 manager。必须在 getStore 前按入口 scope 复核, 否则会把解析到的
+    // key 开到新 owner 的池里 (Codex #2399 P1, 对齐 manager.getStore 的
+    // scopeAtEntry + assertScopeUnchanged)。
+    manager = deps.getManager();
+    if (scopeAtEntry !== null && manager.currentOwnerScopeKey?.() !== scopeAtEntry) {
+      return buildJsonResult(
+        {
+          ok: false,
+          code: 'MAKER_MEMORY_NOT_READY',
+          message: 'owner scope changed during async memory operation; aborting (retry against current scope)',
+        },
+        true,
+      );
+    }
     store = await manager.getStore(scopeKey);
   } catch (err) {
     const { code, message } = classifyMemoryError(err);

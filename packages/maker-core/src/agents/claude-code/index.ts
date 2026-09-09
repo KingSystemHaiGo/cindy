@@ -1615,7 +1615,7 @@ export class ClaudeCodeAgent extends BaseAgent {
       const context: McpProviderContext = {
         agentKind: 'claude-code' as const,
         workingDir: opts.workingDir,
-        ...(opts.makerMemoryScopeKey ? { memoryScopeKey: opts.makerMemoryScopeKey } : {}),
+        ...((makerMemoryEnabled || opts.makerMemoryScopeKey) ? { memoryScopeKey } : {}),
         vendorOptions: vo,
         // business sessionId 由 maker.createSession 通过 opts.sessionId 注入
         // (见 maker.ts: agent.startSession({...opts, sessionId: id}))。MCP server
@@ -3293,7 +3293,7 @@ export class ClaudeCodeAgent extends BaseAgent {
           makerMemoryEnabled,
           // 同一个 scope key 也必须随注册的 session ctx 走: prompt 段用它读索引
           // (上方 memoryScopeKey), 远端工具侧不给就会回落到 workdir 键。
-          ...(opts.makerMemoryScopeKey ? { makerMemoryScopeKey: opts.makerMemoryScopeKey } : {}),
+          ...((makerMemoryEnabled || opts.makerMemoryScopeKey) ? { makerMemoryScopeKey: memoryScopeKey } : {}),
           onApprovalRequest: async (rawParams: unknown) => {
             // 110s timeout — must respond before daemon's 120s server-request timeout.
             // On timeout, dismiss the pending interaction (clears UI) and reject to

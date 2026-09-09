@@ -153,6 +153,43 @@ describe('resolveMemoryScopeKey — fake probe 回落与缓存', () => {
     );
   });
 
+  it('linked worktree 内二级 submodule 沿 superproject 链归一到主仓 (Codex #2399 P1)', async () => {
+    const abs = (p: string) => path.resolve(p);
+    const inner = abs('/wt/mod/inner');
+    const parentMod = abs('/wt/mod');
+    const wt = abs('/wt');
+    const main = abs('/main');
+    const byCwd: Record<string, { toplevel: string; gitDir: string; commonDir: string; superproject: string }> = {
+      [inner]: {
+        toplevel: inner,
+        gitDir: abs('/main/.git/worktrees/wt/modules/mod/modules/inner'),
+        commonDir: abs('/main/.git/worktrees/wt/modules/mod/modules/inner'),
+        superproject: parentMod,
+      },
+      [parentMod]: {
+        toplevel: parentMod,
+        gitDir: abs('/main/.git/worktrees/wt/modules/mod'),
+        commonDir: abs('/main/.git/worktrees/wt/modules/mod'),
+        superproject: wt,
+      },
+      [wt]: {
+        toplevel: wt,
+        gitDir: abs('/main/.git/worktrees/wt'),
+        commonDir: abs('/main/.git'),
+        superproject: '',
+      },
+    };
+    const probe: GitProbe = async (args, cwd) => {
+      if (args.includes('worktree')) return `worktree ${main}\n`;
+      const rec = byCwd[path.normalize(cwd)] ?? byCwd[cwd];
+      if (!rec) throw new Error(`unexpected cwd ${cwd}`);
+      return `${rec.toplevel}\n${rec.gitDir}\n${rec.commonDir}\n${rec.superproject}\n`;
+    };
+    expect(await resolveMemoryScopeKey(inner, null, { execGit: probe })).toBe(
+      path.join(main, 'mod', 'inner'),
+    );
+  });
+
   it('common-dir 非 <root>/.git 形态 (bare/非常规布局) → 原样返回', async () => {
     const probe = probeFor('/fake/bare-wt', '/fake/repo.git/worktrees/x', '/fake/repo.git');
     expect(await resolveMemoryScopeKey('/fake/bare-wt', null, { execGit: probe })).toBe(

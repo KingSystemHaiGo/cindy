@@ -25,7 +25,10 @@
  * 非常规 common-dir 布局 / cwd 不在 toplevel 下。
  * 特例: linked worktree 内初始化过的 submodule 的 gitdir == common-dir
  * (都是 `<主仓>/.git/worktrees/<wt>/modules/<sub>`), 不能当普通 clone 回落;
- * 用 `--show-superproject-working-tree` 找到外层 worktree 后再归一到主仓。
+ * `--show-superproject-working-tree` 只给直接父仓库, 二级 submodule 的父是
+ * 另一层 submodule 而不是 worktree — 必须沿 superproject 链走到最外层
+ * (linked worktree 或主仓) 再归一, 否则 `git worktree list` 会把 `.git`
+ * 元数据目录报成唯一 worktree。
  * 非仓库目录由 `.git` 标记上溯预检直接短路, 连 git 进程都不 spawn
  * (hasGitMarkerUpward, 与 rev-parse 上溯语义一致)。
  *
@@ -174,7 +177,7 @@ async function canonicalizeLocalWorkdir(workingDir: string, execGit: GitProbe): 
   const toplevel = resolveGitDirOutput(toplevelRaw ?? '', cwd);
   const gitDir = resolveGitDirOutput(gitDirRaw ?? '', cwd);
   const commonDir = resolveGitDirOutput(commonDirRaw ?? '', cwd);
-  const superproject = resolveGitDirOutput(superRaw ?? '', cwd);
+  const directSuper = resolveGitDirOutput(superRaw ?? '', cwd);
   if (!toplevel || !gitDir || !commonDir) return workingDir;
 
   // 判定链 (Codex #2399 P1, linked-worktree submodule):
@@ -183,14 +186,17 @@ async function canonicalizeLocalWorkdir(workingDir: string, execGit: GitProbe): 
   //     主仓内 submodule 的 superproject == 主仓根, 原样返回 (与 round-1 契约一致)。
   //     linked worktree 内 submodule 的 gitdir == common-dir (都是
   //     `<主仓>/.git/worktrees/<wt>/modules/<sub>`), 不能当普通 clone 回落;
-  //     把 superproject 当外层 worktree 根再走同一套主仓映射, 得到
-  //     `/main/<sub-rel>` 而不是 `/worktree/<sub-rel>`。
+  //     把**最外层** superproject (walk 链, 不是直接父) 当 mapping 根再走
+  //     同一套主仓映射, 得到 `/main/<nested-rel>` 而不是 `.git` 元数据目录。
   //  3. gitdir == common-dir 且无 superproject → 普通 clone /
   //     --separate-git-dir checkout, 原样返回。separate-git-dir 的 common-dir
   //     basename 恰好也是 `.git`, 不先排除会把主仓根错误推导到 git 存储目录
   //     (Codex review on #2399)。
+  const outermostSuper = directSuper
+    ? await walkOutermostSuperproject(directSuper, execGit)
+    : null;
   if (samePath(gitDir, commonDir)) {
-    if (!superproject) return workingDir;
+    if (!outermostSuper) return workingDir;
   } else if (path.basename(commonDir) !== '.git') {
     // bare repo 的 linked worktree (common-dir 是 `<name>.git`) 等非常规布局
     // 无法可靠推断主仓根, 回落原样。submodule 走上面 superproject 分支,
@@ -198,7 +204,7 @@ async function canonicalizeLocalWorkdir(workingDir: string, execGit: GitProbe): 
     return workingDir;
   }
 
-  const mappingRoot = superproject ?? toplevel;
+  const mappingRoot = outermostSuper ?? toplevel;
 
   // 主仓根不能从 common-dir 推导: 主 checkout 本身用 --separate-git-dir 建
   // 时 common-dir 是 git 存储目录, dirname 不一定是工作树 (Codex review on
@@ -248,4 +254,38 @@ async function resolveMainWorktreeRoot(cwd: string, execGit: GitProbe): Promise<
 
 function samePath(a: string, b: string): boolean {
   return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+/**
+ * `--show-superproject-working-tree` 只给直接父仓库。二级 submodule 的父是
+ * 另一层 submodule, 在那一层跑 `git worktree list` 会把
+ * `<main>/.git/worktrees/<wt>/modules/<parent>` 报成唯一 worktree, 把
+ * scope 映射进 .git 元数据目录 (Codex #2399 P1)。沿链走到没有 superproject
+ * 的最外层 (linked worktree 或主仓) 再交给 resolveMainWorktreeRoot。
+ */
+async function walkOutermostSuperproject(start: string, execGit: GitProbe): Promise<string> {
+  let current = start;
+  const seen = new Set<string>();
+  for (let i = 0; i < 16; i += 1) {
+    const key = process.platform === 'win32' ? current.toLowerCase() : current;
+    if (seen.has(key)) return current;
+    seen.add(key);
+    // 与 canonicalize 同一条 4 行 rev-parse, 让既有 cwd-agnostic fake probe
+    // 仍返回 superproject 在第四行; 单字段 --show-superproject-working-tree
+    // 会被 probeFor 的第一行 toplevel 误当成父仓。
+    const out = await execGit(
+      [
+        'rev-parse',
+        '--show-toplevel',
+        '--git-dir',
+        '--git-common-dir',
+        '--show-superproject-working-tree',
+      ],
+      current,
+    ).catch(() => '');
+    const parent = resolveGitDirOutput(out.split('\n')[3] ?? '', current);
+    if (!parent || samePath(parent, current)) return current;
+    current = parent;
+  }
+  return current;
 }
