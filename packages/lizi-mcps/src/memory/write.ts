@@ -67,7 +67,7 @@ export function registerMemoryWriteTool(registry: MemoryToolRegistry, deps: Memo
         .describe('moment 专用: 重要程度; high = 重大想法/里程碑/明确强调'),
     },
     handler: async (args) =>
-      withStore(deps, async (store, scopeKey): Promise<unknown> => {
+      withStore(deps, async (store, { scopeKey }): Promise<unknown> => {
         // MCP 边界门禁 (#4124): bot-only 类型必须命中 bot scope。throw MemoryError
         // 让 withStore 走 classifyMemoryError (invalid-type → INVALID_PARAMS),
         // 与 store 层门禁同一条错误信封, 避免成功包装套一层 isError JSON。

@@ -13,7 +13,12 @@
  * thread 的真实 workingDir。
  */
 
-import { buildMemoryScopeKey, parseBotMemoryScopeKey, type MakerMemoryStore } from '@cindy/maker-core';
+import {
+  parseBotMemoryScopeKey,
+  resolveMemoryScopeKey,
+  type MakerMemoryManager,
+  type MakerMemoryStore,
+} from '@cindy/maker-core';
 
 import type { MemoryToolResult } from '../cindy_memoryToolRegistry.js';
 import type { MemoryMcpDeps } from '../types.js';
@@ -30,15 +35,23 @@ export function buildJsonResult(payload: unknown, isError = false): MemoryToolRe
  * 拿当前 session 绑定 workdir 的 Store. manager 不可用 (没注入 / disabled) 时
  * 返 MAKER_MEMORY_NOT_READY 错误, 调用方按 plan 决定是否提示用户开 mode。
  */
+export type WithStoreContext = {
+  store: MakerMemoryStore;
+  /** 解析后的 session scope key (linked worktree 已归一到主仓)。 */
+  scopeKey: string;
+  manager: MakerMemoryManager;
+};
+
 export async function withStore(
   deps: MemoryMcpDeps,
-  fn: (store: MakerMemoryStore, scopeKey: string) => Promise<unknown>,
+  fn: (store: MakerMemoryStore, ctx: WithStoreContext) => Promise<unknown>,
 ): Promise<MemoryToolResult> {
   let store: MakerMemoryStore;
-  let scopeKey = '';
+  let manager: MakerMemoryManager;
+  let scopeKey: string;
   let scopeAtEntry: string | null = null;
   try {
-    const manager = deps.getManager();
+    manager = deps.getManager();
     // 操作锚点 (review #2388 Codex 4th P1): getStore 返回的裸 store 在 manager
     // 守卫之外被调用方 await — 在拿 store 前捕获 scope, fn 完成后复核, 期间
     // 登出/切账号则操作结果不可信, fail-closed。
@@ -46,13 +59,30 @@ export async function withStore(
     const ctx = deps.getSessionContext?.();
     const workdir = ctx?.workingDir ?? deps.workdir;
     // SSH remote 会话 (ctx 带 remoteHostId) 的 workdir 是远端路径 — 经 scope
-    // key 定位, 与 agent 启动注入 (claude-code/codex index.ts) 同一键规则。
-    // scopeKey 透传给 fn (#4124): memory_write 需要 scope 判定 bot-only 类型
-    // (moment 仅伙伴记忆可用), 门禁在 store 层 + MCP 边界双重强制。
-    scopeKey = ctx?.memoryScopeKey ?? buildMemoryScopeKey(workdir, ctx?.remoteHostId);
+    // key 定位, 与 agent 启动注入 (claude-code/codex index.ts) 同一键规则;
+    // 本地会话在此额外做 git worktree 归一化 (#2379)。已注入的 memoryScopeKey
+    // (含 bot: / ssh:) 原样透传, 不再二次解析。
+    scopeKey =
+      ctx?.memoryScopeKey ?? (await resolveMemoryScopeKey(workdir, ctx?.remoteHostId));
+    // git 探测是 await: 期间 logout / 切账号会换 owner, 甚至换掉 getManager()
+    // 绑定的 manager。必须在 getStore 前按入口 scope 复核, 否则会把解析到的
+    // key 开到新 owner 的池里 (Codex #2399 P1, 对齐 manager.getStore 的
+    // scopeAtEntry + assertScopeUnchanged)。
+    manager = deps.getManager();
+    if (scopeAtEntry !== null && manager.currentOwnerScopeKey?.() !== scopeAtEntry) {
+      return buildJsonResult(
+        {
+          ok: false,
+          code: 'MAKER_MEMORY_NOT_READY',
+          message: 'owner scope changed during async memory operation; aborting (retry against current scope)',
+        },
+        true,
+      );
+    }
     // 独立 Bot scope 不受全局 Maker Memory 开关影响 (cindy-bots-runtime 红线 /
     // review #4128 P2)。getStore 的 independentScope 路径已自带 disabled 豁免,
     // 这里只跳过 MCP 边界的 isEnabled 短路; 非 bot scope 维持原门禁。
+    // 必须在 resolveMemoryScopeKey 之后判断, 才能识别 bot: key (#4128 merge-6)。
     if (parseBotMemoryScopeKey(scopeKey) === null && !manager.isEnabled()) {
       return buildJsonResult(
         { ok: false, code: 'MAKER_MEMORY_NOT_READY', message: 'maker memory disabled (mode != "maker")' },
@@ -65,7 +95,7 @@ export async function withStore(
     return buildJsonResult({ ok: false, code, message }, true);
   }
   try {
-    const data = await fn(store, scopeKey);
+    const data = await fn(store, { store, scopeKey, manager });
     // 操作后复核: owner 在 fn 执行期间切换 → 结果不可信, 不得按成功返回。
     if (scopeAtEntry !== null && deps.getManager().currentOwnerScopeKey?.() !== scopeAtEntry) {
       return buildJsonResult(

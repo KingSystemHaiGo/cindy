@@ -51,7 +51,7 @@ export function registerMemoryConsolidateTool(registry: MemoryToolRegistry, deps
       }).strict(),
     },
     handler: async ({ sources, target }) =>
-      withStore(deps, async (store, scopeKey): Promise<unknown> => {
+      withStore(deps, async (store, { scopeKey }): Promise<unknown> => {
         // MCP 边界门禁 (#4124): bot-only target 必须命中 bot scope。throw MemoryError
         // 让 withStore 走 classifyMemoryError (invalid-type → INVALID_PARAMS),
         // 与 store 层门禁同一条错误信封。
