@@ -8,18 +8,28 @@
  * the two clients stay in lockstep. This module is presentation-neutral (no i18n strings,
  * no React): it returns structured data; each client formats labels in its own locale.
  *
- * `agent_task_update` is a LIVE-only `AgentEvent` (never persisted), forwarded to the mobile
- * controller over the `maker:event` device-link channel. The mobile store decodes it via
- * `applyAgentTaskUpdateEvent` into a per-session map; the render layer links each update to
- * its originating `Task`/`collab:*` tool-call (or renders it standalone when orphaned).
+ * The renderer/device-link `agent_task_update` transport remains live-only. The desktop host
+ * also projects exact terminal state onto the durable originating tool-call, so history replay
+ * does not have to infer failure from result text. Mobile decodes live updates via
+ * `applyAgentTaskUpdateEvent`; the render layer links either source to its originating tool-call.
  */
 
 export type AgentTaskStatus = 'running' | 'completed' | 'failed' | 'stopped';
+export type AgentTaskTerminalStatus = Exclude<AgentTaskStatus, 'running'>;
+
+export function normalizeAgentTaskTerminalStatus(
+  value: unknown,
+): AgentTaskTerminalStatus | undefined {
+  return value === 'completed' || value === 'failed' || value === 'stopped'
+    ? value
+    : undefined;
+}
 
 export interface AgentTaskUsage {
   totalTokens?: number;
   toolUses?: number;
   durationMs?: number;
+  costUsd?: number;
 }
 
 /**
@@ -140,7 +150,8 @@ export interface AgentTaskUpdate {
   lastToolName?: string;
   taskType?: string;
   workflowName?: string;
-  model?: string;
+  /** `null` is an explicit live-update instruction to clear a stale model badge. */
+  model?: string | null;
   reasoningEffort?: string;
   receiverThreadIds?: string[];
   /**
@@ -153,16 +164,41 @@ export interface AgentTaskUpdate {
 }
 
 /**
+ * Derive the visible task status from the live update and its paired tool result.
+ * A result is a terminal fact, so it closes a stale `running` update without
+ * overriding an explicit failure or stopped state.
+ */
+export function deriveAgentTaskStatus(
+  updateStatus: AgentTaskStatus | undefined,
+  result?: string,
+  options?: {
+    resultIsLaunchReceipt?: boolean;
+    persistedStatus?: AgentTaskTerminalStatus;
+  },
+): AgentTaskStatus {
+  const persistedStatus = normalizeAgentTaskTerminalStatus(options?.persistedStatus);
+  if (persistedStatus) return persistedStatus;
+  const hasResult = typeof result === 'string' && result.trim().length > 0;
+  if (updateStatus === 'running' && hasResult && !options?.resultIsLaunchReceipt) return 'completed';
+  return updateStatus ?? (hasResult ? 'completed' : 'running');
+}
+
+/**
  * Tool names that spawn a sub-agent task: Claude `Task`/`Agent`, Codex collab agents,
  * PI `subagent`(Cindy 自有扩展注册的工具名,与 pi 社区惯例一致)。
  *
  * MCP 工具一律带 `mcp__` 前缀,不会与裸 `subagent` 撞名。
  */
-export function isAgentTaskToolName(toolName: string): boolean {
+export function isSubagentSpawnToolName(toolName: string): boolean {
   return toolName === 'Agent'
     || toolName === 'Task'
     || toolName === PI_SUBAGENT_TOOL_NAME
-    || toolName.startsWith('collab:');
+    || toolName === 'collab:spawn'
+    || toolName === 'collab:spawnAgent';
+}
+
+export function isAgentTaskToolName(toolName: string): boolean {
+  return isSubagentSpawnToolName(toolName) || toolName.startsWith('collab:');
 }
 
 /** PI 子代理工具名 —— maker-core 的 pi 扩展注册端与本文件的卡片判据共用,不各写字面量。 */
@@ -200,6 +236,7 @@ export function normalizeAgentTaskUpdate(
         ...(typeof usageRaw.totalTokens === 'number' ? { totalTokens: usageRaw.totalTokens } : {}),
         ...(typeof usageRaw.toolUses === 'number' ? { toolUses: usageRaw.toolUses } : {}),
         ...(typeof usageRaw.durationMs === 'number' ? { durationMs: usageRaw.durationMs } : {}),
+        ...(typeof usageRaw.costUsd === 'number' ? { costUsd: usageRaw.costUsd } : {}),
       }
     : undefined;
   const workflowProgress = normalizeWorkflowProgressEntries(raw.workflowProgress);
@@ -216,7 +253,11 @@ export function normalizeAgentTaskUpdate(
     ...(typeof raw.lastToolName === 'string' && raw.lastToolName ? { lastToolName: raw.lastToolName } : {}),
     ...(typeof raw.taskType === 'string' && raw.taskType ? { taskType: raw.taskType } : {}),
     ...(typeof raw.workflowName === 'string' && raw.workflowName ? { workflowName: raw.workflowName } : {}),
-    ...(typeof raw.model === 'string' && raw.model ? { model: raw.model } : {}),
+    ...(raw.model === null
+      ? { model: null }
+      : typeof raw.model === 'string' && raw.model
+        ? { model: raw.model }
+        : {}),
     ...(typeof raw.reasoningEffort === 'string' && raw.reasoningEffort ? { reasoningEffort: raw.reasoningEffort } : {}),
     ...(Array.isArray(raw.receiverThreadIds)
       ? { receiverThreadIds: raw.receiverThreadIds.filter((id): id is string => typeof id === 'string') }
@@ -242,6 +283,7 @@ export function mergeAgentTaskUpdate(prev: AgentTaskUpdate | undefined, next: Ag
     // CLI 节流帧不带 workflowProgress(undefined = 沿用旧树),必须保留上一帧。
     workflowProgress: next.workflowProgress ?? prev.workflowProgress,
     createdAt: prev.createdAt ?? next.createdAt,
+    model: next.model === null ? null : next.model ?? prev.model,
     updatedAt: next.updatedAt ?? prev.updatedAt,
   };
 }
@@ -356,14 +398,67 @@ export function subagentSpawnReceiptName(
   return name && trimmed && trimmed === name ? name : undefined;
 }
 
+/**
+ * V1 `collab:spawnAgent` returns a compact child-state summary. A `running`
+ * summary is a launch receipt for the spawn tool, not a terminal result for
+ * the child task, so it must not close a stale running update.
+ */
+export function subagentSpawnResultIndicatesRunning(
+  toolName: string | undefined,
+  result: string | null | undefined,
+): boolean {
+  const trimmed = typeof result === 'string'
+    ? result.trim().replace(/\r\n/g, '\n')
+    : '';
+  // Claude's asynchronous Agent tool returns a textual launch receipt while the
+  // child is still running. Treat it like the structured Codex V1 receipt so a
+  // paired stale `running` update does not close the task prematurely.
+  if (toolName === PI_SUBAGENT_TOOL_NAME
+    && trimmed === 'Cindy subagent launched. The agent is working in the background.') {
+    return true;
+  }
+  if ((toolName === 'Agent' || toolName === 'Task')
+    && (
+      trimmed === 'Async agent launched successfully.'
+      || (
+        trimmed.startsWith('Async agent launched successfully.\nagentId: ')
+        && trimmed.includes('\nThe agent is working in the background.')
+      )
+    )) {
+    return true;
+  }
+  if (toolName !== 'collab:spawnAgent') return false;
+  return (result ?? '').split(/\r?\n/).some((line) =>
+    /^[^:\n]+:\s*(?:running|in[_-]?progress|started|active)\s*$/i.test(line.trim()),
+  );
+}
+
+/** Hide Codex's collaboration-tree address in UI only; keep raw IDs for routing. */
+export function formatAgentTaskTitle(
+  provider: AgentTaskUpdate['provider'],
+  title: string | undefined,
+): string | undefined {
+  const text = title?.trim();
+  if (provider === 'codex' && text && /^\/root(?:\/[^/\s]+)+\/?$/.test(text)) {
+    return text.split('/').filter(Boolean).at(-1);
+  }
+  return title;
+}
+
 export function buildAgentTaskCardModel(input: {
   toolName?: string;
   toolInput?: unknown;
   update?: AgentTaskUpdate;
   result?: string;
+  persistedStatus?: AgentTaskTerminalStatus;
 }): AgentTaskCardModel {
-  const { toolName, toolInput, update, result } = input;
-  const status: AgentTaskStatus = update?.status ?? (result ? 'completed' : 'running');
+  const { toolName, toolInput, update, result, persistedStatus } = input;
+  const status = deriveAgentTaskStatus(update?.status, result, {
+    persistedStatus,
+    resultIsLaunchReceipt:
+      subagentSpawnReceiptName(toolName, toolInput, result) !== undefined
+      || subagentSpawnResultIndicatesRunning(toolName, result),
+  });
   const provider: 'claude-code' | 'codex' | 'pi' =
     update?.provider
     ?? (toolName?.startsWith('collab:')
@@ -372,9 +467,9 @@ export function buildAgentTaskCardModel(input: {
         ? 'pi'
         : 'claude-code');
   const title = compactText(
-    update?.title
+    formatAgentTaskTitle(provider, update?.title
       ?? readInputString(toolInput, ['description', 'task', 'name'])
-      ?? readInputString(toolInput, ['prompt']),
+      ?? readInputString(toolInput, ['prompt'])),
     96,
   );
   const description = compactText(
@@ -385,7 +480,7 @@ export function buildAgentTaskCardModel(input: {
   // title 与运行状态已经表达了同样的信息,再显示「Subagent X 已启动」会让 codex 卡
   // 比 Claude 子代理卡多出一行冗余文案 —— 两者共用同一张卡,形态必须一致。历史回放
   // 拿不到 live update,回执仍是唯一可读摘要,保留原样。
-  const spawnedAgentName = update ? undefined : spawnReceiptName;
+  const spawnedAgentName = update ? undefined : formatAgentTaskTitle(provider, spawnReceiptName);
   // 启动回执命中时 summary 不携带裸路径(路径已在 spawnedAgentName / title 中),
   // 否则手机端会把 agentPath 原样当摘要展示。
   const summary = spawnReceiptName ? detailText(update?.summary) : detailText(result, update?.summary);

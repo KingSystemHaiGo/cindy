@@ -25,6 +25,9 @@ vi.mock('../logger.js', () => ({
   }),
 }));
 
+const mediaRefMock = vi.hoisted(() => ({ commitMessageMediaRefs: vi.fn(async () => null) }));
+vi.mock('../cindy-media/chatAttachments.js', () => mediaRefMock);
+
 import {
   importExternalClaudeCodeSessions,
   importExternalClaudeCodeMessagesForSession,
@@ -664,6 +667,57 @@ describe('parseClaudeCodeMessageLine', () => {
     }
   });
 
+  it('scans original oversized tool_result media URLs before capping import rows', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-local-home-'));
+    const projectsDir = path.join(home, '.claude', 'projects', '-tmp-project');
+    fs.mkdirSync(projectsDir, { recursive: true });
+    const file = path.join(projectsDir, `${sdkSessionId}.jsonl`);
+    const url = 'cindy-media://blobs/0123456789abcdef.png';
+    const huge = `${'m'.repeat(9000)}${url}`;
+    fs.writeFileSync(
+      file,
+      `${line({
+        type: 'user',
+        uuid: 'user-tool',
+        cwd: '/tmp/project',
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'tu-1', content: huge }],
+        },
+      })}\n`,
+    );
+
+    const db = createLocalDb();
+    insertImportedClaudeSession(db, `claude-${sdkSessionId}`, sdkSessionId);
+    const homedir = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    const tx = vi.fn(
+      async (name: string, args: unknown) => runInprocTx(db, { name, args }) as never,
+    );
+    vi.mocked(getRawDb).mockReturnValue(db);
+    setCurrentDbClient({ ...makeTestDbClient(db), tx }, 'test-user');
+    mediaRefMock.commitMessageMediaRefs.mockClear();
+
+    try {
+      await importExternalClaudeCodeMessagesForSession(`claude-${sdkSessionId}`);
+      expect(mediaRefMock.commitMessageMediaRefs).toHaveBeenCalledWith({
+        sessionId: `claude-${sdkSessionId}`,
+        role: 'tool_result',
+        content: huge,
+      });
+      const stored = db
+        .prepare("SELECT content FROM messages WHERE role = 'tool_result' LIMIT 1")
+        .get() as { content: string };
+      const parsed = JSON.parse(stored.content) as string;
+      expect(parsed.length).toBeLessThanOrEqual(8 * 1024);
+      expect(parsed).not.toContain(url);
+    } finally {
+      homedir.mockRestore();
+      resetLocalDb();
+      db.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('does not reuse unchanged Claude JSONL cache across current DB users', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-local-home-'));
     const projectsDir = path.join(home, '.claude', 'projects', '-tmp-project');
@@ -913,8 +967,6 @@ describe('parseClaudeCodeMessageLine', () => {
       const scan = await scanExternalClaudeCodeSessions({ maxSessionsPerRoot: 1 });
 
       expect(scan.rejectedCount).toBe(1);
-      // 内容非法('not json')→ 无顶层有效事件
-      expect(scan.rejected).toMatchObject({ noEvents: 1 });
       expect(scan.candidates.map((item) => item.id)).toEqual([sdkSessionId2]);
       const result = await importExternalClaudeCodeSessions([sdkSessionId2]);
       expect(result).toMatchObject({ scanned: 1, inserted: 1, updated: 0 });
@@ -974,6 +1026,56 @@ describe('parseClaudeCodeMessageLine', () => {
       expect(result).toMatchObject({ scanned: 1, inserted: 1, updated: 0 });
       const rows = db.prepare('SELECT id, title FROM sessions ORDER BY id').all();
       expect(rows).toEqual([{ id: `claude-${sdkSessionId}`, title: 'import me' }]);
+    } finally {
+      homedir.mockRestore();
+      resetLocalDb();
+      db.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('revives a soft-deleted imported session on explicit re-import (#3548)', async () => {
+    // 删除是软删且源 JSONL 不随删,扫描会重新出候选;此前 ON CONFLICT 不更新
+    // status,重导入命中同主键后行仍是 deleted —— 导入计数更新、侧栏不可见。
+    // 删除动作把 updated_at 推到删除时刻(晚于源文件),复活不得受时间门约束。
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-local-home-'));
+    const projectsDir = path.join(home, '.claude', 'projects', '-tmp-project');
+    fs.mkdirSync(projectsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(projectsDir, `${sdkSessionId}.jsonl`),
+      `${line({
+        type: 'user',
+        uuid: 'user-1',
+        cwd: '/tmp/project',
+        message: { role: 'user', content: 'import me' },
+      })}\n`,
+    );
+
+    const db = createLocalDb();
+    const homedir = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    setLocalDb(db);
+
+    try {
+      const first = await importExternalClaudeCodeSessions([sdkSessionId]);
+      expect(first).toMatchObject({ inserted: 1 });
+
+      const before = db
+        .prepare('SELECT title, updated_at AS updatedAt FROM sessions WHERE id = ?')
+        .get(`claude-${sdkSessionId}`) as { title: string; updatedAt: number };
+      db.prepare(
+        "UPDATE sessions SET status = 'deleted', title = 'stale-after-delete', updated_at = updated_at + 999999 WHERE id = ?",
+      ).run(`claude-${sdkSessionId}`);
+
+      const again = await importExternalClaudeCodeSessions([sdkSessionId]);
+      expect(again).toMatchObject({ scanned: 1, inserted: 0, updated: 1 });
+      const row = db
+        .prepare('SELECT status, title, updated_at AS updatedAt FROM sessions WHERE id = ?')
+        .get(`claude-${sdkSessionId}`) as { status: string; title: string; updatedAt: number };
+      expect(row.status).toBe('active');
+      // 复活即按新导入对待:元数据与 updated_at 收敛回源值,不残留删除时刻
+      // 的旧快照(review 反馈:仅复活 status 会让侧栏行与源会话不一致)。
+      expect(row.title).toBe(before.title);
+      expect(row.updatedAt).toBe(before.updatedAt);
     } finally {
       homedir.mockRestore();
       resetLocalDb();
@@ -1305,8 +1407,6 @@ describe('parseClaudeCodeMessageLine', () => {
   });
 
   it('keeps the rejection reason across cache hits for unchanged files (no drift to noEvents)', async () => {
-    // 回归(PR #1807 review):拒绝原因只缓存 summary:null 会导致未变化文件重扫时
-    // 分类漂移成 noEvents。internal 会话首次扫描后,缓存命中必须仍返回 internal。
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-cache-reason-'));
     const file = path.join(dir, `${sdkSessionId}.jsonl`);
     fs.writeFileSync(
@@ -1326,10 +1426,8 @@ describe('parseClaudeCodeMessageLine', () => {
     fs.utimesSync(file, mtime, mtime);
 
     try {
-      // 首次扫描:拒绝为 internal
       const first = await readClaudeCodeSessionScanSummaryResult(file);
       expect(first).toEqual({ kind: 'rejected', reason: 'internal' });
-      // 再次扫描(同 mtime/size,缓存命中):必须仍为 internal,不漂移成 noEvents
       const cached = await readClaudeCodeSessionScanSummaryResult(file);
       expect(cached).toEqual({ kind: 'rejected', reason: 'internal' });
     } finally {

@@ -21,6 +21,8 @@ import type { Effort, PermissionMode } from '@/lib/userPreferences.types';
 /** 被控端当前草稿的原始值(maker:get-new-maker-defaults 隧道返回;字段全可选)。 */
 export interface RemoteDraftDefaults {
   model?: string;
+  /** false = 被控端明确未在 New Maker picker 选过模型；undefined = 旧端未知。 */
+  modelChosenByUser?: boolean;
   effort?: string;
   fastMode?: boolean;
   permissionMode?: string;
@@ -60,6 +62,24 @@ export interface DeviceLinkDraftSelection {
 }
 
 /**
+ * 判断同一远程草稿是否应在 capabilities 刷新后重新校准。
+ * 新设备或 Agent 始终需要 seed；同一目标只有在被控端明确从未选过模型、且控制端也尚未
+ * 编辑运行配置时才允许重校准。旧端的未知状态与任一侧的显式选择都必须保守保留。
+ */
+export function shouldReseedDeviceLinkDraftDefaults(input: {
+  currentSeedKey: string | null;
+  nextSeedKey: string;
+  capabilitiesChanged: boolean;
+  controllerTouched: boolean;
+  remoteModelChosenByUser: boolean | undefined;
+}): boolean {
+  if (input.currentSeedKey !== input.nextSeedKey) return true;
+  return (
+    input.capabilitiesChanged && !input.controllerTouched && input.remoteModelChosenByUser === false
+  );
+}
+
+/**
  * 把被控端草稿值(或 null=回落)按被控端 capabilities 校准成可 seed 的选择。
  *   - model:要解析的模型 = targetModel(用户在草稿里切模型)优先,否则 remoteDraft.model(初始 seed);
  *     该 id 在被控端清单内则用它,否则被控端 availableModels[0]。
@@ -82,8 +102,28 @@ export function resolveDeviceLinkDraftDefaults(
   const providerId = remoteDraft?.providerId ?? null;
   const permissionMode = pickPermissionMode(capabilities, remoteDraft?.permissionMode);
 
-  // 要解析哪个模型:显式 targetModel(切模型)优先;否则被控端当前选中模型(初始 seed)。
-  const wantedModelId = targetModel ?? remoteDraft?.model;
+  // 要解析哪个模型:控制端本次显式 targetModel(切模型)永远优先。初始 seed 只有在**新端明确
+  // 回传未选过模型**时才采用区域目录默认；旧端缺字段时保守保留 remoteDraft.model，避免
+  // 把无法识别的历史显式选择覆盖掉。每个 Agent 只接受自己的 v3 默认标记。
+  const markedDefault = agentKind
+    ? models
+        .map((model, index) => ({ model, index }))
+        .filter(
+          ({ model }) =>
+            model.defaultEnabled !== false &&
+            (model.newSessionDefault?.includes(agentKind) ?? false),
+        )
+        .sort(
+          (a, b) =>
+            (a.model.sortOrder ?? Number.MAX_SAFE_INTEGER) -
+              (b.model.sortOrder ?? Number.MAX_SAFE_INTEGER) || a.index - b.index,
+        )[0]?.model.id
+    : undefined;
+  const wantedModelId =
+    targetModel ??
+    (remoteDraft?.modelChosenByUser === false && providerId === null
+      ? (markedDefault ?? remoteDraft.model)
+      : remoteDraft?.model);
 
   if (models.length === 0) {
     return {
@@ -97,14 +137,21 @@ export function resolveDeviceLinkDraftDefaults(
 
   const chosen = models.find((m) => m.id === wantedModelId) ?? models[0];
   const globalPreset = agentKind ? remoteDraft?.providerModelMemory?.[`${agentKind}:*`] : undefined;
+  const providerPreset =
+    agentKind && providerId
+      ? remoteDraft?.providerModelMemory?.[`${agentKind}:${providerId}`]
+      : undefined;
   // 解析的是不是被控端当前选中模型:是 → 草稿激活值;否 → per-model 记忆(切模型还原)。
   const isActiveModel = chosen.id === remoteDraft?.model;
   // 新建草稿没有 live 会话需要保护:全局模型预设存在时,即使是首页当前显示模型也优先采用。
   // agentKind 缺失时保留旧调用方语义,方便旧测试 / 兼容入口逐步迁移。
-  const wantedEffort = (globalPreset?.effortByModel[chosen.id] ??
+  // 新快照写 `${agent}:${providerId}`，旧快照仍可能只有 `${agent}:*`。
+  const wantedEffort = (providerPreset?.effortByModel[chosen.id] ??
+    globalPreset?.effortByModel[chosen.id] ??
     (isActiveModel ? remoteDraft?.effort : remoteDraft?.effortByModel?.[chosen.id])) as
     Effort | undefined;
-  const presetFast = globalPreset?.fastByModel[chosen.id];
+  const presetFast =
+    providerPreset?.fastByModel[chosen.id] ?? globalPreset?.fastByModel[chosen.id];
   const wantedFast =
     presetFast ??
     (isActiveModel

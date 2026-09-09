@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
-import { resolveDeviceLinkDraftDefaults } from '../deviceLinkDraftDefaults';
+import {
+  resolveDeviceLinkDraftDefaults,
+  shouldReseedDeviceLinkDraftDefaults,
+} from '../deviceLinkDraftDefaults';
 import type { AgentCapabilities } from '@/hooks/useAgentCapabilities';
 
 // 最小被控端 capabilities:两模型(Opus 支持 fast + 多 effort 档;Haiku 无 effort/fast)。
@@ -22,6 +25,8 @@ function caps(overrides: Partial<AgentCapabilities> = {}): AgentCapabilities {
         efforts: [],
         defaultEffort: null,
         supportsFastMode: false,
+        sortOrder: 10,
+        newSessionDefault: ['claude-code'],
       },
     ],
     hasFastMode: true,
@@ -72,6 +77,84 @@ describe('resolveDeviceLinkDraftDefaults', () => {
     });
     expect(sel.model).toBe('claude-opus-4-8');
     expect(sel.effort).toBe('high'); // 'low' 不被 Opus 支持 → defaultEffort
+  });
+
+  it('被控端明确未选过模型 → 初始 seed 优先采用其区域目录默认', () => {
+    const sel = resolveDeviceLinkDraftDefaults(
+      caps(),
+      {
+        model: 'claude-opus-4-8',
+        modelChosenByUser: false,
+        effort: 'xhigh',
+        fastMode: true,
+      },
+      undefined,
+      'claude-code',
+    );
+    expect(sel.model).toBe('claude-haiku-4-5');
+    expect(sel.fastMode).toBe(false);
+  });
+
+  it('显式选择或旧端未知选择状态 → 保留被控端当前模型', () => {
+    expect(
+      resolveDeviceLinkDraftDefaults(
+        caps(),
+        { model: 'claude-opus-4-8', modelChosenByUser: true },
+        undefined,
+        'claude-code',
+      ).model,
+    ).toBe('claude-opus-4-8');
+    expect(
+      resolveDeviceLinkDraftDefaults(caps(), { model: 'claude-opus-4-8' }, undefined, 'claude-code')
+        .model,
+    ).toBe('claude-opus-4-8');
+  });
+
+  it('被控端已有来源偏好时不应用可能丢失该来源的区域默认', () => {
+    const sel = resolveDeviceLinkDraftDefaults(
+      caps(),
+      {
+        model: 'claude-opus-4-8',
+        modelChosenByUser: false,
+        providerId: 'anthropic',
+      },
+      undefined,
+      'claude-code',
+    );
+    expect(sel.model).toBe('claude-opus-4-8');
+    expect(sel.providerId).toBe('anthropic');
+  });
+
+  it('控制端本次显式 targetModel 优先于远端未选择标记', () => {
+    const sel = resolveDeviceLinkDraftDefaults(
+      caps(),
+      { model: 'claude-opus-4-8', modelChosenByUser: false },
+      'claude-opus-4-8',
+      'claude-code',
+    );
+    expect(sel.model).toBe('claude-opus-4-8');
+  });
+
+  it('Pi 的远程新任务默认接受 v3 的 pi 标记', () => {
+    const capabilities = caps();
+    capabilities.availableModels[1]!.newSessionDefault = ['pi'];
+    const sel = resolveDeviceLinkDraftDefaults(
+      capabilities,
+      { model: 'claude-opus-4-8', modelChosenByUser: false },
+      undefined,
+      'pi',
+    );
+    expect(sel.model).toBe('claude-haiku-4-5');
+  });
+
+  it('Pi 的远程新任务不借用 claude-code 默认标记', () => {
+    const sel = resolveDeviceLinkDraftDefaults(
+      caps(),
+      { model: 'claude-opus-4-8', modelChosenByUser: false },
+      undefined,
+      'pi',
+    );
+    expect(sel.model).toBe('claude-opus-4-8');
   });
 
   it('effort 不被目标模型支持 → 落该模型 defaultEffort', () => {
@@ -168,5 +251,186 @@ describe('resolveDeviceLinkDraftDefaults', () => {
     );
     expect(sel.effort).toBe('xhigh');
     expect(sel.fastMode).toBe(true);
+  });
+
+  it('provider 槽优先于 * 槽', () => {
+    const sel = resolveDeviceLinkDraftDefaults(
+      caps(),
+      {
+        model: 'claude-opus-4-8',
+        providerId: 'anthropic',
+        effort: 'high',
+        fastMode: false,
+        providerModelMemory: {
+          'claude-code:*': {
+            effortByModel: { 'claude-opus-4-8': 'low' },
+            fastByModel: {},
+          },
+          'claude-code:anthropic': {
+            effortByModel: { 'claude-opus-4-8': 'xhigh' },
+            fastByModel: { 'claude-opus-4-8': true },
+          },
+        },
+      },
+      undefined,
+      'claude-code',
+    );
+    expect(sel.effort).toBe('xhigh');
+    expect(sel.fastMode).toBe(true);
+  });
+});
+
+describe('shouldReseedDeviceLinkDraftDefaults', () => {
+  it('recalibrates the same untouched target when the remote explicitly has no model choice', () => {
+    expect(
+      shouldReseedDeviceLinkDraftDefaults({
+        currentSeedKey: 'device-a:claude-code',
+        nextSeedKey: 'device-a:claude-code',
+        capabilitiesChanged: true,
+        controllerTouched: false,
+        remoteModelChosenByUser: false,
+      }),
+    ).toBe(true);
+  });
+
+  it('preserves controller edits and remote explicit or legacy-unknown choices', () => {
+    const base = {
+      currentSeedKey: 'device-a:claude-code',
+      nextSeedKey: 'device-a:claude-code',
+    };
+    expect(
+      shouldReseedDeviceLinkDraftDefaults({
+        ...base,
+        capabilitiesChanged: true,
+        controllerTouched: true,
+        remoteModelChosenByUser: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldReseedDeviceLinkDraftDefaults({
+        ...base,
+        capabilitiesChanged: true,
+        controllerTouched: false,
+        remoteModelChosenByUser: true,
+      }),
+    ).toBe(false);
+    expect(
+      shouldReseedDeviceLinkDraftDefaults({
+        ...base,
+        capabilitiesChanged: true,
+        controllerTouched: false,
+        remoteModelChosenByUser: undefined,
+      }),
+    ).toBe(false);
+    expect(
+      shouldReseedDeviceLinkDraftDefaults({
+        ...base,
+        capabilitiesChanged: false,
+        controllerTouched: false,
+        remoteModelChosenByUser: false,
+      }),
+    ).toBe(false);
+  });
+
+  it('always seeds a new device or agent target', () => {
+    expect(
+      shouldReseedDeviceLinkDraftDefaults({
+        currentSeedKey: 'device-a:claude-code',
+        nextSeedKey: 'device-b:codex',
+        capabilitiesChanged: false,
+        controllerTouched: true,
+        remoteModelChosenByUser: true,
+      }),
+    ).toBe(true);
+  });
+
+  /**
+   * 统一面板的跨引擎选择(2026-08-17 review 第三轮 G1)。
+   *
+   * 「新目标一律重种」这条本身没错 —— 错的是**谁先到**:控制端在远程草稿里跨引擎选了一行,
+   * switchVendor 让下一帧的 agent 变成目标引擎,seed key 随之变新,于是这条规则拿被控端的
+   * 远程默认值把用户刚点的模型盖掉。修法是让那次显式选择**前置**把 key 推到目标引擎,
+   * 这一组就是那前后两种输入的对照。
+   */
+  it('treats a cross-engine pick as its own seed once the key was advanced', () => {
+    // 没前置(旧行为):agent 一变就是「新目标」→ 无条件重种 → 用户刚选的模型被远程默认覆盖。
+    expect(
+      shouldReseedDeviceLinkDraftDefaults({
+        currentSeedKey: 'device-a:claude-code',
+        nextSeedKey: 'device-a:codex',
+        capabilitiesChanged: true,
+        controllerTouched: true,
+        remoteModelChosenByUser: true,
+      }),
+    ).toBe(true);
+    // 前置之后:同一目标 + 控制端已编辑 → 不重种。目标引擎的 capabilities 到货那一帧只做
+    // 合法性夹紧(保留 current.model),用户的选择留在草稿里。
+    expect(
+      shouldReseedDeviceLinkDraftDefaults({
+        currentSeedKey: 'device-a:codex',
+        nextSeedKey: 'device-a:codex',
+        capabilitiesChanged: true,
+        controllerTouched: true,
+        remoteModelChosenByUser: true,
+      }),
+    ).toBe(false);
+    // 重复渲染 / 重复播种窗口:key 已被显式选择占住,后续每一帧都判成同一目标,同样不重种。
+    expect(
+      shouldReseedDeviceLinkDraftDefaults({
+        currentSeedKey: 'device-a:codex',
+        nextSeedKey: 'device-a:codex',
+        capabilitiesChanged: false,
+        controllerTouched: true,
+        remoteModelChosenByUser: false,
+      }),
+    ).toBe(false);
+    // 换设备仍然照常重种(这次前置只影响「同设备换引擎」,不能顺手把换机也挡掉)。
+    expect(
+      shouldReseedDeviceLinkDraftDefaults({
+        currentSeedKey: 'device-a:codex',
+        nextSeedKey: 'device-b:codex',
+        capabilitiesChanged: true,
+        controllerTouched: true,
+        remoteModelChosenByUser: true,
+      }),
+    ).toBe(true);
+  });
+});
+
+describe('capabilities refresh clamp contract', () => {
+  it('保留仍合法的控制端选择，但会夹紧已失效的模型与运行参数', () => {
+    const refreshed = caps();
+    refreshed.availableModels = [
+      {
+        id: 'claude-haiku-4-5',
+        displayName: 'Haiku',
+        contextWindow: 200_000,
+        efforts: ['low'],
+        defaultEffort: 'low',
+        supportsFastMode: false,
+      },
+    ];
+    refreshed.permissionModes = [{ id: 'default', displayName: 'Default' }];
+
+    expect(
+      resolveDeviceLinkDraftDefaults(
+        refreshed,
+        {
+          model: 'removed-model',
+          modelChosenByUser: true,
+          effort: 'high',
+          fastMode: true,
+          permissionMode: 'bypassPermissions',
+          providerId: 'anthropic',
+        },
+        'removed-model',
+      ),
+    ).toEqual({
+      model: 'claude-haiku-4-5',
+      effort: 'low',
+      fastMode: false,
+      permissionMode: undefined,
+      providerId: 'anthropic',
+    });
   });
 });

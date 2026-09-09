@@ -3,6 +3,7 @@ import {
   DEVICE_LINK_MEDIA_FETCH_CHANNEL,
   DEVICE_LINK_VOICE_CREDENTIAL_SYNC_CHANNEL,
   DEVICE_LINK_VOICE_DICTIONARY_LEARNING_CHANNEL,
+  DEVICE_LINK_VOICE_DICTIONARY_SNAPSHOT_CHANNEL,
   DEVICE_LINK_VOICE_TRANSCRIBE_CHANNEL,
   MOBILE_REMOTE_INVOKE_CHANNELS,
   connectionIssueHint,
@@ -29,10 +30,14 @@ describe('device-link shared contract', () => {
     expect(DEVICE_LINK_VOICE_TRANSCRIBE_CHANNEL).toBe('device-link:voice:transcribe');
     expect(DEVICE_LINK_VOICE_CREDENTIAL_SYNC_CHANNEL).toBe('device-link:voice:credential-sync');
     expect(DEVICE_LINK_VOICE_DICTIONARY_LEARNING_CHANNEL).toBe('device-link:voice:dictionary-learning');
+    expect(DEVICE_LINK_VOICE_DICTIONARY_SNAPSHOT_CHANNEL).toBe(
+      'device-link:voice:dictionary:snapshot',
+    );
     expect(MOBILE_REMOTE_INVOKE_CHANNELS).toContain('maker:send');
     expect(MOBILE_REMOTE_INVOKE_CHANNELS).toContain('maker:switch-session-agent');
     expect(MOBILE_REMOTE_INVOKE_CHANNELS).toContain('maker:get-session-agent-switch-intent');
     expect(MOBILE_REMOTE_INVOKE_CHANNELS).toContain('maker:input:compact');
+    expect(MOBILE_REMOTE_INVOKE_CHANNELS).toContain('local-db:conversations:search');
     expect(MOBILE_REMOTE_INVOKE_CHANNELS).toContain('local-db:messages:around-client-id');
     expect(MOBILE_REMOTE_INVOKE_CHANNELS).toContain('maker:message:delete');
     expect(MOBILE_REMOTE_INVOKE_CHANNELS).toContain('maker:get-session-tree');
@@ -41,6 +46,9 @@ describe('device-link shared contract', () => {
     expect(MOBILE_REMOTE_INVOKE_CHANNELS).toContain('maker:schedule:delete-run');
     expect(MOBILE_REMOTE_INVOKE_CHANNELS).toContain('maker:usage:codex-rate-limits');
     expect(MOBILE_REMOTE_INVOKE_CHANNELS).toContain('maker:usage:codex-rate-limit-reset');
+    expect(MOBILE_REMOTE_INVOKE_CHANNELS).toContain('maker:get-new-maker-worktree-branch-pref');
+    expect(MOBILE_REMOTE_INVOKE_CHANNELS).toContain('maker:apply-new-maker-worktree-branch-pref');
+    expect(MOBILE_REMOTE_INVOKE_CHANNELS).toContain('worktree:list-branches');
     expect(MOBILE_REMOTE_INVOKE_CHANNELS).toContain('worktree:discard-precreated');
     expect(MOBILE_REMOTE_INVOKE_CHANNELS).not.toContain(DEVICE_LINK_VOICE_CREDENTIAL_SYNC_CHANNEL);
     expect(MOBILE_REMOTE_INVOKE_CHANNELS).toContain(DEVICE_LINK_VOICE_DICTIONARY_LEARNING_CHANNEL);

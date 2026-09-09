@@ -1,3 +1,4 @@
+import { LocalSkillControls } from './components/LocalSkillControls';
 /**
  * SkillhubDetailView — route for /skillhub/{kind}/{global|project}/[hash]/:name.
  *
@@ -16,7 +17,7 @@
  */
 
 import * as Dialog from '@radix-ui/react-dialog';
-import { AlertCircle, AlertTriangle, ArrowLeft, ArrowUp, Bot, CheckCircle, ChevronDown, ChevronRight, FileText, Folder, FolderOpen, Globe, type LucideIcon, Package, Pencil, Save, Search, SquareTerminal, Trash2, Upload, X } from 'lucide-react';
+import { AlertCircle, AlertTriangle, ArrowLeft, ArrowUp, Bot, CheckCircle, ChevronDown, ChevronRight, Clock3, FileText, Folder, FolderOpen, Globe, type LucideIcon, Package, Pencil, Save, Search, SquareTerminal, Upload, X } from 'lucide-react';
 import { type CSSProperties, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
@@ -32,6 +33,7 @@ import { plainTextToTiptapDoc, saveDraft as saveComposerDraft } from '@/lib/comp
 import { createLogger } from '@/lib/logger';
 import { buildFence, detectRenderable } from '@/lib/textPreview';
 import { toast } from '@/lib/toast';
+import { useAuth } from '@/contexts/AuthContext';
 import { cn } from '@/lib/utils';
 import { getDraft, getFastModeForModel } from '@/state/newMakerDraft';
 import { useMetaColumnResize } from './hooks/useMetaColumnResize';
@@ -45,6 +47,11 @@ import {
 } from './hooks/useSkillhub';
 import { triggerIncrementalSync } from './hooks/useSkillSync';
 import { type DetailState, deriveDetailActionState, deriveDetailState } from './lib/detailButtons';
+import {
+  buildLocalSkillRoute,
+  findLocalSkillByPath,
+  findLocalSkillRouteEntry,
+} from './lib/localRoutes';
 import { isMarketDeleted as checkMarketDeleted, getCachedInfo, invalidate as invalidateInfo, refreshInfo } from './lib/infoDedupe';
 import {
   activePublishedReviewFromVersions,
@@ -52,6 +59,7 @@ import {
   effectivePublishedStatus,
   isEffectiveActivePublishedReview,
   latestRejectedVersionFromVersions,
+  publishedStatusLabelKey,
   rejectedPublishedReviewFromVersions,
 } from './lib/publishedStatus';
 import { isPassingScanStatus } from './lib/scanStatus';
@@ -66,6 +74,7 @@ import { buildRecentTrendRows, formatLocalDayKey } from './lib/skillUsageTrend';
 import { type SkillUsageVersionComparison, selectSkillUsageVersionComparison } from './lib/skillUsageViewModel';
 import { PublishDialog, type ScanResultPayload } from './PublishDialog';
 import { ScanResultDialog } from './ScanResultDialog';
+import { useSkillhubIdentityPolicy } from './hooks/useSkillhubIdentityPolicy';
 import { SkillhubDiffPanel } from './SkillhubDiffPanel';
 
 const log = createLogger('SkillhubDetailView');
@@ -102,7 +111,7 @@ const KIND_ICON: Record<SkillhubKind, LucideIcon> = {
 };
 
 // Compact chip — tuned to sit cleanly to the right of the h2 title (text-lg).
-// h-5 + text-[11px] keeps the visual weight subdued so the title leads.
+// h-5 + text-11 keeps the visual weight subdued so the title leads.
 function KindChip({ kind }: { kind: SkillhubKind }) {
   const Icon = KIND_ICON[kind];
   return (
@@ -116,7 +125,7 @@ function KindChip({ kind }: { kind: SkillhubKind }) {
       {/* relative top-[1px]: optical correction — Inter's cap sits high in
           the line-box at small sizes, so text-only nudge gets it level
           with the icon center without affecting layout. */}
-      <span className="relative top-[0.5px] text-[11px] font-medium leading-none">{KIND_LABEL[kind]}</span>
+      <span className="relative top-[0.5px] text-11 font-medium leading-none">{KIND_LABEL[kind]}</span>
     </span>
   );
 }
@@ -132,7 +141,7 @@ function ScopeChip({ scope }: { scope: SkillhubScope }) {
       )}
     >
       <Icon size={11} className="shrink-0 text-[var(--settings-theme-icon)]" />
-      <span className="relative top-[0.5px] text-[11px] font-medium leading-none">
+      <span className="relative top-[0.5px] text-11 font-medium leading-none">
         {scope === 'global' ? t('skillhub.detail.scopeGlobal') : t('skillhub.detail.scopeProject')}
       </span>
     </span>
@@ -960,11 +969,18 @@ function FileTreeRow({ entry, parentDir, depth, currentPath, onSelectFile }: Fil
 
 export function SkillhubDetailView() {
   const { t } = useTranslation();
+  const { user } = useAuth();
+  const identityPolicy = useSkillhubIdentityPolicy(user);
   const params = useParams();
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   const location = useLocation();
-  const { skills, bootstrapped } = useSkillhub();
+  const { skills, bootstrapped, loading: skillsLoading } = useSkillhub();
+  const commandPath = searchParams.get('path');
+  useEffect(() => {
+    // The palette can discover a newly added Skill before the SkillHub cache does.
+    if (commandPath) void refreshSkillhub();
+  }, [commandPath]);
   const { createSession } = useCCSessions();
   // 入口来源：market 卡片会带 state.from。详情页返回不走浏览器式历史，
   // 而是退出到 SkillHub 一级页：market 来源回 market，其它入口回 local 欢迎页。
@@ -979,27 +995,10 @@ export function SkillhubDetailView() {
   const metaResize = useMetaColumnResize();
 
   const entry = useMemo(() => {
-    const { kind, projectHash, name } = params as Record<string, string | undefined>;
-    if (!kind || !name) return null;
-    const decodedName = decodeURIComponent(name);
-    const engine = searchParams.get('engine');
-    const matchEngine = (s: SkillhubSkill) => !engine || s.engine === engine;
-    if (projectHash) {
-      return (
-        skills.find(
-          (s) =>
-            s.kind === kind &&
-            s.scope === 'project' &&
-            s.projectHash === projectHash &&
-            s.name === decodedName &&
-            matchEngine(s),
-        ) ?? null
-      );
-    }
-    return (
-      skills.find(
-        (s) => s.kind === kind && s.scope === 'global' && s.name === decodedName && matchEngine(s),
-      ) ?? null
+    return findLocalSkillRouteEntry(
+      skills,
+      params as Record<string, string | undefined>,
+      searchParams,
     );
   }, [params, searchParams, skills]);
 
@@ -1051,10 +1050,15 @@ export function SkillhubDetailView() {
   // 拉新数据;publish 完成后通过 invalidateInfo + bump infoFetchTrigger 强刷。
   // detailState 完全基于 infoResult 派生(不再用批量 syncResults),保证按钮永远
   // 反映「这个 skill 在服务器上的真实状态」。
+  const entryCatalogScope = entry?.registryEntry?.catalogScope;
   const [infoResult, setInfoResult] = useState<SkillhubInfoResult | null>(
-    () => (entry?.name ? getCachedInfo(entry.name) : null),
+    () => (entry?.name ? getCachedInfo(entry.name, entryCatalogScope) : null),
   );
   const [infoLoading, setInfoLoading] = useState(false);
+  const [publishTargetInfo, setPublishTargetInfo] = useState<SkillhubInfoResult | null>(
+    () => (entry?.name && entryCatalogScope === 'team' ? getCachedInfo(entry.name) : null),
+  );
+  const [publishTargetLoading, setPublishTargetLoading] = useState(false);
   const [infoFetchTrigger, setInfoFetchTrigger] = useState(0);
 
   // 同步重置:entry.name 变化时立刻把 infoResult 切到新 name 的缓存值。
@@ -1064,21 +1068,25 @@ export function SkillhubDetailView() {
   // 关键升级:不再无脑置 null(那会让按钮闪过一次"无版本号 → 有版本号"),
   // 改成同步从 SWR 缓存取上次结果,缓存命中(常见的重访场景)时直接渲染最终态,
   // 完全不闪;缓存 miss(首访)时才退回到 null + loading=true。
-  const [trackedEntryName, setTrackedEntryName] = useState<string | null>(entry?.name ?? null);
-  if ((entry?.name ?? null) !== trackedEntryName) {
-    setTrackedEntryName(entry?.name ?? null);
-    const cached = entry?.name ? getCachedInfo(entry.name) : null;
+  const entryInfoKey = entry?.name ? `${entryCatalogScope ?? 'default'}:${entry.name}` : null;
+  const [trackedEntryInfoKey, setTrackedEntryInfoKey] = useState<string | null>(entryInfoKey);
+  if (entryInfoKey !== trackedEntryInfoKey) {
+    setTrackedEntryInfoKey(entryInfoKey);
+    const cached = entry?.name ? getCachedInfo(entry.name, entryCatalogScope) : null;
     setInfoResult(cached);
+    setPublishTargetInfo(
+      entry?.name && entryCatalogScope === 'team' ? getCachedInfo(entry.name) : null,
+    );
     setLiveScanStatus(null);
     // 有缓存就不显示 loading(SWR 后台静默刷),没缓存才进 loading 态
     setInfoLoading(isSkill && entry != null && cached === null);
   }
 
-  const refreshRemoteInfo = useCallback(async (name: string): Promise<{
+  const refreshRemoteInfo = useCallback(async (name: string, catalogScope?: StoredInstall['catalogScope']): Promise<{
     info: SkillhubInfoResult | null;
     liveScanStatus: { status: string; version: string } | null;
   }> => {
-    const info = await refreshInfo(name);
+    const info = await refreshInfo(name, catalogScope);
     if (!info) {
       return { info: null, liveScanStatus: null };
     }
@@ -1090,7 +1098,7 @@ export function SkillhubDetailView() {
       return { info, liveScanStatus: null };
     }
 
-    const versionsRes = await window.electronAPI.skillhub.listPublishedVersions(name);
+    const versionsRes = await window.electronAPI.skillhub.listPublishedVersions(name, catalogScope);
     if (versionsRes.success) {
       const active = activePublishedReviewFromVersions(versionsRes.versions);
       if (active) {
@@ -1117,8 +1125,8 @@ export function SkillhubDetailView() {
   const remoteInfoName = isSkill ? (entry?.name ?? null) : null;
   const remoteInfoRequest = useMemo(() => {
     if (!remoteInfoName) return null;
-    return { name: remoteInfoName, refreshKey: infoFetchTrigger };
-  }, [remoteInfoName, infoFetchTrigger]);
+    return { name: remoteInfoName, catalogScope: entryCatalogScope, refreshKey: infoFetchTrigger };
+  }, [remoteInfoName, entryCatalogScope, infoFetchTrigger]);
 
   useEffect(() => {
     if (!remoteInfoRequest) {
@@ -1129,9 +1137,9 @@ export function SkillhubDetailView() {
     let cancelled = false;
     // SWR:不再清空 infoResult。render 阶段已经 seed 过(缓存命中 → 旧值/缓存值;
     // miss → null),这里只决定要不要显示 loading 态。后台 fetch 拿到新值再 setState。
-    const cached = getCachedInfo(remoteInfoRequest.name);
+    const cached = getCachedInfo(remoteInfoRequest.name, remoteInfoRequest.catalogScope);
     if (cached === null) setInfoLoading(true);
-    refreshRemoteInfo(remoteInfoRequest.name)
+    refreshRemoteInfo(remoteInfoRequest.name, remoteInfoRequest.catalogScope)
       .then((result) => {
         if (cancelled) return;
         setLiveScanStatus(result.liveScanStatus);
@@ -1145,6 +1153,28 @@ export function SkillhubDetailView() {
       });
     return () => { cancelled = true; };
   }, [remoteInfoRequest, refreshRemoteInfo]);
+
+  // 组织目录条目可能来自只读代理，而发布始终写入原生 Hub。用无 scope
+  // 详情独立读取写入目标，避免拿组织目录的同名 Skill 判断首发/升级。
+  useEffect(() => {
+    if (!remoteInfoRequest || remoteInfoRequest.catalogScope !== 'team') {
+      setPublishTargetLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setPublishTargetLoading(getCachedInfo(remoteInfoRequest.name) === null);
+    refreshInfo(remoteInfoRequest.name)
+      .then((info) => {
+        if (!cancelled) setPublishTargetInfo(info);
+      })
+      .catch((err) => {
+        log.warn(`[DetailView/publish-target] getInfo failed name=${remoteInfoRequest.name}`, err);
+      })
+      .finally(() => {
+        if (!cancelled) setPublishTargetLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [remoteInfoRequest]);
 
   // Local folder hash — only meaningful for skill kind.
   // force=true:每次切换 entry 都强制重算,bypass 30s cache,
@@ -1212,7 +1242,8 @@ export function SkillhubDetailView() {
     return unsubscribe;
   }, [publishProgressTarget]);
 
-  // dialog 关闭后重新查当前 skill 远端状态；如果仍在审核中，下方 poll effect 会恢复轮询。
+  // dialog 关闭后重新查一次当前 skill 远端状态。进入人工审核后不再自动轮询，
+  // 用户主动刷新时由常规 info 请求读取最新状态。
   useEffect(() => {
     const wasOpen = previousPublishOpenRef.current;
     previousPublishOpenRef.current = publishOpen;
@@ -1232,51 +1263,50 @@ export function SkillhubDetailView() {
         latestVersion: liveScanStatus.version,
       }
     : null;
-  const reviewVersion = activePublishedReviewVersion(infoResult) ?? activePublishedReviewVersion(liveScanSource);
-  const isPublishedReviewing = isEffectiveActivePublishedReview(infoResult) || isEffectiveActivePublishedReview(liveScanSource);
-  const publishedStatus = effectivePublishedStatus(infoResult) ?? effectivePublishedStatus(liveScanSource);
+  const effectivePublishInfo = entryCatalogScope === 'team' ? publishTargetInfo : infoResult;
+  const effectivePublishLoading = entryCatalogScope === 'team' ? publishTargetLoading : infoLoading;
+  const reviewVersion = activePublishedReviewVersion(effectivePublishInfo) ?? activePublishedReviewVersion(liveScanSource);
+  const isPublishedReviewing = isEffectiveActivePublishedReview(effectivePublishInfo) || isEffectiveActivePublishedReview(liveScanSource);
+  const publishedStatus = effectivePublishedStatus(effectivePublishInfo) ?? effectivePublishedStatus(liveScanSource);
   const publishDialogPendingVersion =
-    infoResult?.pendingVersion ??
+    effectivePublishInfo?.pendingVersion ??
     (reviewVersion && publishedStatus
       ? { version: reviewVersion, status: publishedStatus }
       : null);
 
-  // 审核状态 scan 轮询：优先跟踪 pendingVersion,没有 pending 时回落到旧 moderationStatus。
-  useEffect(() => {
-    if (!isSkill || !entry?.name || !reviewVersion || publishOpen) return;
-
-    void window.electronAPI.skillhub.startScanPoll({
-      slug: entry.name,
-      version: reviewVersion,
-    });
-
-    return () => {
-      void window.electronAPI.skillhub.stopScanPoll();
-    };
-  }, [entry?.name, isSkill, publishOpen, reviewVersion]);
-
   // 按钮区/banner 数据就绪:info 落定 + hash 算完即可,不再依赖批量 sync。
   // 仅 isSkill 场景需要 hash;command/agent 直接视为 ready。
   const hashReady = !isSkill || (!hashLoading && localFolderHash !== null);
-  const detailReady = !isSkill || (!infoLoading && hashReady);
+  const detailReady = !isSkill || (!infoLoading && !effectivePublishLoading && hashReady);
 
   // 三维度 detail state
-  const marketDeleted = !infoLoading && checkMarketDeleted(entry?.name ?? '');
+  const marketDeleted = !infoLoading && checkMarketDeleted(entry?.name ?? '', entryCatalogScope);
   const detailState = useMemo<DetailState | null>(() => {
     const state = deriveDetailState(isSkill ? entry : null, infoResult, marketDeleted);
     return state;
   }, [isSkill, entry, infoResult, marketDeleted]);
+  const publishTargetDeleted = !effectivePublishLoading
+    && checkMarketDeleted(entry?.name ?? '', entryCatalogScope === 'team' ? undefined : entryCatalogScope);
+  const publishDetailState = useMemo<DetailState | null>(() => (
+    deriveDetailState(isSkill ? entry : null, effectivePublishInfo, publishTargetDeleted)
+  ), [isSkill, entry, effectivePublishInfo, publishTargetDeleted]);
 
   // ── 从 detailState 派生互斥的 UI action state ──
   const registryEntry = entry?.registryEntry ?? null;
   const detailActionState = useMemo(
-    () => deriveDetailActionState(detailState, registryEntry, localFolderHash, publishedStatus),
-    [detailState, registryEntry, localFolderHash, publishedStatus],
+    () => deriveDetailActionState(
+      detailState,
+      registryEntry,
+      localFolderHash,
+      publishedStatus,
+      identityPolicy.canWrite,
+      publishDetailState,
+    ),
+    [detailState, registryEntry, localFolderHash, publishedStatus, identityPolicy.canWrite, publishDetailState],
   );
   const detailAction = detailActionState?.status ?? null;
   const isOutdated = detailActionState?.isOutdated ?? false;
   const isMineDirty = detailActionState?.isMineDirty ?? false;
-  const showUninstall = detailActionState?.showUninstall ?? false;
   const showForeignDirtyBanner = detailActionState?.showForeignDirtyBanner ?? false;
 
   const [scanResult, setScanResult] = useState<ScanResultPayload | null>(null);
@@ -1309,14 +1339,8 @@ export function SkillhubDetailView() {
   const initialRawRef = useRef<string>('');
   const { confirm } = useConfirmDialog();
 
-  // 当前用户的部门信息：仅在打开 PublishDialog 时按需拉一次
-  // 已发布的 skill 也可走 infoResult.currentUserDeptIds 兜底
-  const [myDepts, setMyDepts] = useState<{ ids: string[]; names: string[] }>({ ids: [], names: [] });
-  const currentUserDeptIds = myDepts.ids.length > 0 ? myDepts.ids : (infoResult?.currentUserDeptIds ?? []);
-  const currentUserDeptNames = myDepts.names.length > 0 ? myDepts.names : (infoResult?.currentUserDeptNames ?? []);
-
   const openPublish = useCallback(async () => {
-    if (entry?.kind !== 'skill') return;
+    if (entry?.kind !== 'skill' || !identityPolicy.canWrite) return;
 
     if (isPublishedReviewing) {
       const shouldProceed = await confirm({
@@ -1328,46 +1352,12 @@ export function SkillhubDetailView() {
       if (!shouldProceed) return;
     }
 
-    if (myDepts.ids.length === 0) {
-      const r = await window.electronAPI.skillhub.getMyDepts();
-      if (r.success) setMyDepts({ ids: r.ids, names: r.names });
-    }
     setPublishOpen(true);
-  }, [entry, isPublishedReviewing, myDepts.ids.length, confirm, t]);
+  }, [entry, identityPolicy.canWrite, isPublishedReviewing, confirm, t]);
 
   // installed-from-market 视图的卸载/更新动作。
   // 跟 SkillhubMarketListView 走同一条 IPC，保持后端逻辑唯一。
   const [marketActionRunning, setMarketActionRunning] = useState(false);
-
-  const handleUninstallInstalled = useCallback(async () => {
-    if (!entry?.absolutePath) return;
-    const ok = await confirm({
-      title: t('skillhub.detail.uninstallDialog.title', { name: entry.name }),
-      description: t('skillhub.detail.uninstallDialog.description', { path: entry.absolutePath }),
-      confirmText: t('skillhub.detail.uninstallDialog.confirm'),
-      cancelText: t('skillhub.detail.uninstallDialog.cancel'),
-    });
-    if (!ok) return;
-    setMarketActionRunning(true);
-    try {
-      const res = await window.electronAPI.skillhub.uninstall(entry.absolutePath);
-      if (res.success) {
-        toast.success(t('skillhub.detail.uninstalledToast', { name: entry.name }));
-        // 卸载后当前 entry 已经不存在,detail view 渲染会失败 → 跳到 local
-        // 欢迎页(它会自己 pick 上一次选中的本地技能;若该技能就是刚卸载的,
-        // welcome 会清掉 lastEntryId 然后展示空态)。原来跳到 market 不合理 ——
-        // 用户从 local 树点进 detail 时不应该被甩到 market。
-        clearLastEntryId();
-        clearHistory();
-        void refreshSkillhub();
-        navigate('/skillhub/local');
-      } else {
-        toast.error(t('skillhub.detail.uninstallFailed', { message: res.message }));
-      }
-    } finally {
-      setMarketActionRunning(false);
-    }
-  }, [entry, confirm, navigate, t]);
 
   const handleUpdateInstalled = useCallback(async (
     latestVersion: string,
@@ -1389,6 +1379,7 @@ export function SkillhubDetailView() {
         name: entry.name,
         installPath: entry.absolutePath,
         version: latestVersion,
+        catalogScope: entry.registryEntry?.catalogScope,
         // 主动"更新到 vN":完整替换,但保留 Cindy 备份。即使 dirty 判定漏掉,
         // 旧目录也不会在更新成功后被直接删除;替换失败会尽力恢复旧目录。
         force: true,
@@ -1790,7 +1781,7 @@ export function SkillhubDetailView() {
   if (!entry) {
     return (
       <div className="flex h-full w-full flex-col items-center justify-center gap-2 text-sm text-[var(--cmd-palette-item-meta)]">
-        {bootstrapped ? (
+        {bootstrapped && !skillsLoading ? (
           <>
             <p>{t('skillhub.detail.notFound')}</p>
             <button
@@ -1870,20 +1861,33 @@ export function SkillhubDetailView() {
             </h2>
             <KindChip kind={entry.kind} />
             <ScopeChip scope={entry.scope} />
-            {entry.linkedEngines.map(le => (
-              <span
-                key={le.engine}
-                className={cn(
-                  'inline-flex h-5 shrink-0 items-center rounded-full px-2 whitespace-nowrap',
-                  'bg-[var(--settings-btn-secondary-bg)] text-[var(--msg-assistant-text)]',
-                )}
-              >
-                <span className="relative top-[0.5px] text-[11px] font-medium leading-none">
-                  {le.label}
+            {entry.linkedEngines.map(le => {
+              const statusKey = le.runtimeStatus === 'discovered'
+                ? 'skillhub.common.statusDiscovered'
+                : le.runtimeStatus === 'approved'
+                  ? 'skillhub.common.statusApproved'
+                  : le.runtimeStatus === 'loaded'
+                    ? 'skillhub.common.statusLoaded'
+                    : le.runtimeStatus === 'failed'
+                      ? 'skillhub.common.statusFailed'
+                      : le.runtimeStatus === 'unknown'
+                        ? 'skillhub.common.statusUnknown'
+                        : null;
+              return (
+                <span
+                  key={le.engine}
+                  className={cn(
+                    'inline-flex h-5 shrink-0 items-center rounded-full px-2 whitespace-nowrap',
+                    'bg-[var(--settings-btn-secondary-bg)] text-[var(--msg-assistant-text)]',
+                  )}
+                >
+                  <span className="relative top-[0.5px] text-11 font-medium leading-none">
+                    {statusKey ? `${le.label} · ${t(statusKey)}` : le.label}
+                  </span>
                 </span>
-              </span>
-            ))}
-            {detailState?.isMine && publishedStatus === 'rejected' && (
+              );
+            })}
+            {publishDetailState?.canManage && publishedStatus === 'rejected' && (
               <Tip text={t('skillhub.detail.rejectedTooltip')}>
                 <button
                   type="button"
@@ -2008,25 +2012,12 @@ export function SkillhubDetailView() {
             {/* skill 按钮组 — detailAction.status 保证市场状态/动作互斥 */}
             {isSkill && detailState && (
               <>
-            {/* D1: 卸载 — origin=installed（市场）或 imported（本地导入） */}
-            {showUninstall && (
-              <button
-                type="button"
-                onClick={() => { void handleUninstallInstalled(); }}
-                disabled={marketActionRunning}
-                className={cn(
-                  'flex h-9 shrink-0 items-center gap-2 rounded-full border px-[18px]',
-                  'text-sm font-medium',
-                  'border-[var(--confirm-btn-secondary-border)] bg-transparent text-[var(--settings-btn-secondary-text)]',
-                  'hover:bg-[var(--surface-hover)]',
-                  'disabled:opacity-50 disabled:cursor-not-allowed',
-                  'transition-colors',
-                )}
-              >
-                <Trash2 size={14} className="shrink-0" />
-                <span>{t('skillhub.detail.uninstall')}</span>
-              </button>
-            )}
+            {entry && <LocalSkillControls skill={entry} disabled={marketActionRunning || editMode}
+              onUninstalled={() => {
+                clearLastEntryId();
+                clearHistory();
+                navigate('/skillhub/local');
+              }} />}
             {/* 编辑入口 */}
             {!editButtonState.hidden && (
               <Tip text={editButtonState.tip}>
@@ -2050,7 +2041,7 @@ export function SkillhubDetailView() {
             )}
             {/* My published skill, local is clean. */}
             {detailAction?.kind === 'published-tag' && (
-              isPublishedReviewing ? (
+              isPublishedReviewing && identityPolicy.canWrite ? (
                 <button
                   type="button"
                   onClick={openPublish}
@@ -2062,13 +2053,17 @@ export function SkillhubDetailView() {
                     'transition-colors',
                   )}
                 >
-                  <Spinner size={14} />
-                  <span>{t('skillhub.detail.reviewing')}</span>
+                  {publishedStatus === 'pending' ? <Clock3 size={14} /> : <Spinner size={14} />}
+                  <span>
+                    {publishedStatus
+                      ? t(publishedStatusLabelKey(publishedStatus))
+                      : t('skillhub.detail.reviewing')}
+                  </span>
                 </button>
               ) : (
                 <span className={cn(
                   'inline-flex h-9 items-center gap-1.5 rounded-full border px-[14px]',
-                  'text-[13px] text-[var(--cmd-palette-item-meta)]',
+                  'text-13 text-[var(--cmd-palette-item-meta)]',
                   'border-[var(--confirm-btn-secondary-border)]',
                 )}>
                   <CheckCircle size={12} className="shrink-0" />
@@ -2080,7 +2075,7 @@ export function SkillhubDetailView() {
             {detailAction?.kind === 'installed-tag' && (
               <span className={cn(
                 'inline-flex h-9 items-center gap-1.5 rounded-full border px-[14px]',
-                'text-[13px] text-[var(--cmd-palette-item-meta)]',
+                'text-13 text-[var(--cmd-palette-item-meta)]',
                 'border-[var(--confirm-btn-secondary-border)]',
               )}>
                 <CheckCircle size={12} className="shrink-0" />
@@ -2103,8 +2098,12 @@ export function SkillhubDetailView() {
                       'transition-colors',
                     )}
                   >
-                    <Spinner size={14} />
-                    <span>{t('skillhub.detail.reviewing')}</span>
+                    {publishedStatus === 'pending' ? <Clock3 size={14} /> : <Spinner size={14} />}
+                    <span>
+                      {publishedStatus
+                        ? t(publishedStatusLabelKey(publishedStatus))
+                        : t('skillhub.detail.reviewing')}
+                    </span>
                   </button>
                 ) : (
                   <button
@@ -2237,7 +2236,7 @@ export function SkillhubDetailView() {
             </div>
           )}
           {/* outdated: 另一台设备发布了新版,本地版本号已落后 */}
-          {isOutdated && detailState.isMine && entry.registryEntry && (
+          {isOutdated && publishDetailState?.canManage && entry.registryEntry && (
             <div className="shrink-0 pl-3 pr-3 pt-4">
               <button
                 type="button"
@@ -2282,7 +2281,7 @@ export function SkillhubDetailView() {
             </div>
           )}
           {/* unregistered: name may be taken by someone else */}
-          {detailState.origin === null && infoResult && !infoResult.isMine && (
+          {detailState.origin === null && effectivePublishInfo && !effectivePublishInfo.canManage && (
             <div className="shrink-0 pl-3 pr-3 pt-4">
               <div className={cn(
                 'flex items-center gap-2.5 rounded-xl px-4 py-3',
@@ -2290,7 +2289,7 @@ export function SkillhubDetailView() {
               )}>
                 <AlertTriangle size={16} className="shrink-0 text-[var(--settings-section-desc)]" />
                 <span className="text-sm font-medium text-[var(--msg-assistant-text)]">
-                  {t('skillhub.detail.bannerNameTaken', { name: entry.name, author: infoResult.authorName })}
+                  {t('skillhub.detail.bannerNameTaken', { name: entry.name, author: effectivePublishInfo.authorName })}
                 </span>
               </div>
             </div>
@@ -2541,43 +2540,34 @@ export function SkillhubDetailView() {
           open={publishOpen}
           onOpenChange={setPublishOpen}
           skill={entry}
-          isFirstPublish={!detailState || detailAction?.kind === 'publish-to-market'}
+          isFirstPublish={!publishDetailState || detailAction?.kind === 'publish-to-market'}
           autoCleanName={
             detailState?.origin === null &&
-            !!infoResult && !infoResult.isMine
+            !!effectivePublishInfo && !effectivePublishInfo.canManage
           }
           latestVersion={
-            detailState?.isMine && detailState.latestVersion !== null
-              ? detailState.latestVersion
+            publishDetailState?.canManage && publishDetailState.latestVersion !== null
+              ? publishDetailState.latestVersion
               : undefined
           }
-          latestVersionStatus={detailState?.isMine ? infoResult?.moderationStatus : undefined}
+          latestVersionStatus={publishDetailState?.canManage ? effectivePublishInfo?.moderationStatus : undefined}
           pendingVersion={
-            detailState?.isMine
+            publishDetailState?.canManage
               ? publishDialogPendingVersion
               : undefined
           }
-          currentUserDeptIds={currentUserDeptIds}
-          currentUserDeptNames={currentUserDeptNames}
-          onLocalRenamed={(newAbsolutePath, newName) => {
+          onLocalRenamed={(newAbsolutePath) => {
             // skill 在本地被改名(目录 + frontmatter)。先清掉 history(旧 entry id 已失效)
             // + 旧 name 的 info 缓存(让新 name 重新查),然后刷新 scanner,
             // 最后导航到新 URL。先 await refresh 才 navigate,确保新 URL 落地时
             // skills 已包含新 entry,免得短暂闪一下"未找到"。
-            const newId = entry
-              ? `${entry.kind}:${entry.scope}:${entry.scope === 'project' ? `${entry.projectHash}:` : ''}${newName}`
-              : null;
-            const newUrl = entry
-              ? entry.scope === 'global'
-                ? `/skillhub/local/${entry.kind}/global/${encodeURIComponent(newName)}`
-                : `/skillhub/local/${entry.kind}/project/${entry.projectHash}/${encodeURIComponent(newName)}`
-              : null;
             invalidateInfo(entry.name);
             invalidateHash(newAbsolutePath);
-            // 在新 URL 上替换 lastEntryId,避免下次启动还指向旧 id
-            if (newId) setLastEntryId(newId);
-            void refreshSkillhub().then(() => {
-              if (newUrl) navigate(newUrl, { replace: true });
+            void refreshSkillhub().then((scannedSkills) => {
+              const renamed = findLocalSkillByPath(scannedSkills, newAbsolutePath);
+              if (!renamed) return;
+              setLastEntryId(renamed.id);
+              navigate(buildLocalSkillRoute(renamed), { replace: true });
             });
           }}
           onScanResult={setScanResult}

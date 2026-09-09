@@ -1,7 +1,6 @@
 /**
- * Regression coverage for the market Plugin detail view's conflict state:
- * 行动按钮只说「暂不可用」,不可用的原因必须同时出现在正文并绑给按钮,
- * 否则详情页比改动前信息更少(改动前按钮文案本身就是「插件标识冲突」)。
+ * Regression coverage for the market Plugin detail view's explicit same-ID
+ * replacement action and its data-preservation explanation.
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  * @vitest-environment jsdom
  */
@@ -14,7 +13,18 @@ vi.mock('react-i18next', () => ({
 }));
 
 import { MarketPluginDetailView } from '../MarketPluginDetailView';
+import type { GhostManifest } from '../../../../shared/ghost';
 import type { PluginMarketDetail } from '../../../../shared/pluginMarket';
+
+const manifest: GhostManifest = {
+  schemaVersion: 2,
+  id: 'google-calendar',
+  name: 'Google Calendar',
+  version: '1.3.11',
+  kind: 'chip',
+  entry: 'main.js',
+  notify: true,
+};
 
 const detail: PluginMarketDetail = {
   pluginId: 'release-google-calendar',
@@ -33,15 +43,7 @@ const detail: PluginMarketDetail = {
   enabled: null,
   sourceType: 'server',
   sourceMarketName: null,
-  manifest: {
-    schemaVersion: 2,
-    id: 'google-calendar',
-    name: 'Google Calendar',
-    version: '1.3.11',
-    kind: 'chip',
-    entry: 'index.html',
-    slots: [],
-  },
+  manifest,
 };
 
 const renderDetail = (overrides: Partial<PluginMarketDetail> = {}) =>
@@ -67,23 +69,59 @@ describe('MarketPluginDetailView', () => {
     ).toBeNull();
   });
 
-  it('explains why a conflicting plugin is unavailable and binds it to the action', () => {
+  it('presents server catalog permissions before the package is downloaded', () => {
+    renderDetail();
+    expect(screen.getByText('settings.ghosts.perm.grantsTitle')).toBeTruthy();
+  });
+
+  it('offers an explicit same-id replacement and binds its explanation to the action', () => {
     renderDetail({ installState: 'conflict' });
 
-    const reason = screen.getByText('settings.ghosts.market.conflictDescription');
+    const reason = screen.getByText('settings.ghosts.market.replaceDescription');
     expect(reason.id).toBeTruthy();
     // 冲突态下正文让位给原因,不再显示营销描述。
     expect(screen.queryByText('Connect Google Calendar')).toBeNull();
 
     const action = screen.getByRole('button', {
-      name: /settings\.ghosts\.market\.conflict$/,
+      name: /settings\.ghosts\.market\.replace$/,
     }) as HTMLButtonElement;
-    expect(action.disabled).toBe(true);
+    expect(action.disabled).toBe(false);
     expect(action.getAttribute('aria-describedby')).toBe(reason.id);
   });
 
   it('falls back to the ghostId when a plugin has no description', () => {
     renderDetail({ description: null });
     expect(screen.getByText('google-calendar')).toBeTruthy();
+  });
+
+  it('hides the install action when the host does not provide one', () => {
+    render(
+      <MarketPluginDetailView
+        detail={detail}
+        busy={false}
+        onBack={vi.fn()}
+        onIconLoadError={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole('button', { name: /settings\.ghosts\.market\.install/ })).toBeNull();
+  });
+
+  it('replaces the install action with a spinner while busy', () => {
+    render(
+      <MarketPluginDetailView
+        detail={detail}
+        busy
+        onBack={vi.fn()}
+        onInstall={vi.fn()}
+        onIconLoadError={vi.fn()}
+      />,
+    );
+
+    const action = screen.getByRole('button', {
+      name: /settings\.ghosts\.market\.install/,
+    });
+    expect(action.getAttribute('aria-busy')).toBe('true');
+    expect(action.querySelector('.animate-spinner')).toBeTruthy();
+    expect(action.textContent).toBe('');
   });
 });

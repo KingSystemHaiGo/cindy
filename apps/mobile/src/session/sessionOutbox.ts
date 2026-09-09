@@ -15,10 +15,18 @@
  *
  * 本模块只做纯数据变换(node 可单测);上传路由、enqueue RPC、React state 接线
  * 在 [sessionId].tsx。
+ *
+ * 生命周期边界：队列只拥有尚未开始 enqueue、或能证明请求尚未发出的条目，并在当前
+ * 会话页存活期间自动重连续发。正常切任务 / 退屏由页面 cleanup 把这些正文接回草稿；
+ * 一旦 enqueue 已开始，所有权转给既有在线发送 / optimistic projection 路径，回执不确定
+ * 的写请求绝不重新降级成会丢 clientId 的草稿。若未来要跨页面或跨进程继续自动重试，
+ * 必须单独设计可对账的 outbox owner，不能把草稿库当 write-ahead log（它没有消息边界、
+ * 附件任务或远端 acceptance 状态）。
  */
 import { i18n } from '@/i18n';
 import type { MobileSessionReference } from '@/session/sessionReferences';
 import type { RemoteSerializedAttachment } from '@/session/types';
+import { isInFlightDeviceLinkError } from '@cindy/device-link';
 import type { AgentInputReference } from '@cindy/maker-shared/agent-input-projection';
 import {
   composerDocumentFromSerializedMessage,
@@ -38,6 +46,53 @@ export function createOutboxClientId(): string {
   const cryptoWithUuid = globalThis.crypto as Crypto | undefined;
   if (typeof cryptoWithUuid?.randomUUID === 'function') return cryptoWithUuid.randomUUID();
   return `mobile-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+export interface MobileOutboxConnectionState {
+  relayOnline: boolean;
+  /** null = 尚未拿到当前目标设备的 presence，不据未知状态阻塞。 */
+  targetAvailable: boolean | null;
+  deviceUnresponsive: boolean;
+  /** 请求级错误已被判定为断线 / 弱网 / 超时等自动恢复类错误。 */
+  autoRecoveringError: boolean;
+  /** 恢复同步开始时会先清旧 error；同步落定前仍不能据此提前派发。 */
+  syncInProgress: boolean;
+}
+
+/**
+ * 连接恢复期间 outbox 只收消息、不向被控端派发；任一恢复信号转好后由页面重新 pump。
+ */
+export function shouldHoldOutboxDispatchForConnection(
+  state: MobileOutboxConnectionState,
+): boolean {
+  return !state.relayOnline
+    || state.targetAvailable === false
+    || state.deviceUnresponsive
+    || state.autoRecoveringError
+    || state.syncInProgress;
+}
+
+/**
+ * enqueue 只有在能证明请求尚未交给被控端时才可自动回 outbox。
+ * in-flight 断线与 INVOKE_TIMEOUT 都可能是「已执行、回执丢失」，必须排除。
+ */
+export function isSafelyUnsentOutboxEnqueueError(error: unknown): boolean {
+  if (isInFlightDeviceLinkError(error)) return false;
+  const code = (error as { code?: unknown } | null)?.code;
+  if (
+    code === 'NOT_CONNECTED'
+    || code === 'BACKPRESSURE'
+    || code === 'LINK_NOT_OPEN'
+    || code === 'DEVICE_OFFLINE'
+    || code === 'DEVICE_UNRESPONSIVE'
+  ) return true;
+  const message = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
+  return message.includes('[NOT_CONNECTED]')
+    || message.includes('[DEVICE_LINK_NOT_CONNECTED]')
+    || message.includes('[BACKPRESSURE]')
+    || message.includes('[LINK_NOT_OPEN]')
+    || message.includes('[DEVICE_OFFLINE]')
+    || message.includes('[DEVICE_UNRESPONSIVE]');
 }
 
 export type MobileOutboxPhase =
@@ -78,7 +133,7 @@ export interface MobileOutboxItem {
    * (图片 = 缩略图方块,文件 = 计数行),previewUri 为本地预览(file://,
    * 上传中即可显示——乐观语义下图从第一帧就该以图的形态出现,不做「附件→图片」跳变)。
    */
-  slotMeta: ReadonlyArray<{ kind: 'image' | 'file'; previewUri: string | null }>;
+  slotMeta: ReadonlyArray<{ kind: 'image' | 'file'; previewUri: string | null; name?: string }>;
   /** 上传任务 localId → 槽位下标。 */
   slotByLocalId: Readonly<Record<string, number>>;
   /** 尚未落定的上传任务。 */
@@ -97,6 +152,8 @@ export interface MobileOutboxThumb {
   uri: string | null;
   /** 已落定槽位的 OSS 引用(sentAttachmentThumbStore 兜底查询键);未落定为 null。 */
   ossRef: string | null;
+  /** Original upload ref, retained when the host materializes ossRef. */
+  previewRef?: string;
   /** 对应上传任务尚未落定(渲染转圈遮罩)。 */
   uploading: boolean;
 }
@@ -114,6 +171,7 @@ export interface MobileOutboxDisplayItem {
   thumbnails: MobileOutboxThumb[];
   /** 非图片附件数(pdf / office 等,渲染「N 个文件」计数行)。 */
   fileCount: number;
+  fileNames?: string[];
   failed: boolean;
   /** 失败原因(附件失败给统一文案,enqueue 失败给 RPC 错误)。 */
   errorText: string | null;
@@ -158,12 +216,14 @@ export function buildOutboxItem(input: {
     failed: boolean;
     kind?: 'image' | 'file';
     previewUri?: string;
+    name?: string;
   }>;
 }): MobileOutboxItem {
   const slots: Array<RemoteSerializedAttachment | null> = [...input.readyAttachments];
-  const slotMeta: Array<{ kind: 'image' | 'file'; previewUri: string | null }> =
+  const slotMeta: Array<{ kind: 'image' | 'file'; previewUri: string | null; name?: string }> =
     input.readyAttachments.map((attachment, index) => ({
       kind: attachment.category === 'image' ? 'image' : 'file',
+      name: attachment.name,
       previewUri: input.readyPreviews?.[index] ?? null,
     }));
   const slotByLocalId: Record<string, number> = {};
@@ -172,7 +232,7 @@ export function buildOutboxItem(input: {
   for (const upload of input.claimedUploads) {
     slotByLocalId[upload.localId] = slots.length;
     slots.push(null);
-    slotMeta.push({ kind: upload.kind ?? 'image', previewUri: upload.previewUri ?? null });
+    slotMeta.push({ kind: upload.kind ?? 'image', previewUri: upload.previewUri ?? null, name: upload.name });
     if (upload.failed) failedIds.push(upload.localId);
     else waitingIds.push(upload.localId);
   }
@@ -332,6 +392,11 @@ export function outboxItemRetrying(item: MobileOutboxItem): MobileOutboxItem {
   };
 }
 
+/** 派发途中撞上断线：回到可派发态留在队首，等连接恢复，不显示失败操作。 */
+export function outboxItemWaitingForConnection(item: MobileOutboxItem): MobileOutboxItem {
+  return { ...item, enqueueError: null, phase: 'uploading' };
+}
+
 /** enqueue RPC 失败:条目回队首失败态(附件都在,重试只需重新派发)。 */
 export function outboxItemWithEnqueueFailure(item: MobileOutboxItem, error: string): MobileOutboxItem {
   return { ...item, enqueueError: error, phase: 'failed' };
@@ -356,10 +421,12 @@ export function outboxDisplayItem(item: MobileOutboxItem): MobileOutboxDisplayIt
   const uploadedCount = item.attachmentSlots.filter((slot) => slot !== null).length;
   const thumbnails: MobileOutboxThumb[] = [];
   let fileCount = 0;
+  const fileNames: string[] = [];
   item.attachmentSlots.forEach((slot, index) => {
     const meta = item.slotMeta[index];
     if (meta?.kind !== 'image') {
       fileCount += 1;
+      fileNames.push(slot?.name ?? meta?.name ?? i18n.t('message.queue.attachmentMessage'));
       return;
     }
     thumbnails.push({
@@ -379,6 +446,7 @@ export function outboxDisplayItem(item: MobileOutboxItem): MobileOutboxDisplayIt
     uploadedCount,
     thumbnails,
     fileCount,
+    fileNames,
     failed: item.phase === 'failed',
     errorText: item.phase !== 'failed'
       ? null

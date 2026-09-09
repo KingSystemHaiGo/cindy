@@ -32,10 +32,10 @@ function chipGhost(id = 'demo'): InstalledGhost {
       version: '1.0.0',
       kind: 'chip',
       entry: 'main.js',
-      slots: ['cindy'],
     },
     dir: `/fake/brain/${id}`,
     enabled: true,
+    approval: { state: 'approved', revision: '00000000-0000-4000-8000-000000000001' },
   };
 }
 

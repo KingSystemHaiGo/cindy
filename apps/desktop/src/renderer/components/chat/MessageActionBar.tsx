@@ -1,7 +1,7 @@
 /**
  * MessageActionBar
  * ---------------------------------------------------------------------------
- * Hover-revealed action bar for chat messages (V1.2 spec).
+ * Action bar for chat messages (V1.2 spec).
  *
  * Layout:
  *   - Bar gap 2px, align-items: center
@@ -14,7 +14,8 @@
  *     hover color #262626 (Light) / #ffffff (Dark)
  *   - Time text 12px Inter normal, color INVERTED from icon (#a3a3a3 / #737373)
  *
- * Visibility (controlled by parent hover container):
+ * Visibility (controlled by parent hover container unless the Bot-only
+ * simplified mode keeps the bar visible):
  *   - visible=true  → opacity 1 (mounted, no fade-in per spec)
  *   - visible=false → opacity 0 + pointer-events-none, parent owns 200ms
  *     debounce + 150ms fade-out lifecycle
@@ -33,7 +34,9 @@ import {
   Ellipsis,
   Link2,
   MessageSquarePlus,
+  MessageSquareReply,
   Pencil,
+  Share,
   Split,
   Trash2,
   Undo2,
@@ -51,6 +54,7 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { toast } from '@/lib/toast';
 import { formatAbsolute, useRelativeTime } from '@/hooks/useRelativeTime';
+import { SHARE_EXCLUDE_ATTR } from '@/lib/shareConversationImage';
 import { formatCompactTokens, formatTurnCostMoney } from '@/lib/usageFormat';
 import { buildTurnUsageTooltipLines } from '@/lib/turnUsageTooltip';
 import type { TurnUsageDetails } from '../../../shared/turnUsageDetails';
@@ -71,6 +75,8 @@ interface MessageActionBarProps {
   /** Whether the parent message is currently hovered. Drives the entire
    *  fade lifecycle internally so quick re-enters don't replay from 0. */
   hovered: boolean;
+  /** 伙伴对话专属精简态：操作栏常显，隐藏费用和 Fork，并把引用入口外显为“回复”。 */
+  simplifiedBotConversation?: boolean;
   /** When provided, render a Fork button (user messages fork *before* the
    *  question; assistant messages fork *through* the reply's turn — the
    *  parent decides whether to wire it). Returning a promise keeps the
@@ -80,6 +86,8 @@ interface MessageActionBarProps {
   onFork?: () => Promise<void>;
   /** Insert this message's anchored conversation link into the active composer. */
   onAddToChat?: () => void;
+  /** 进入「分享为图片」选择模式并预选本条。放在复制按钮右边(产品指定位置)。 */
+  onShareAsImage?: () => void;
   /** When provided, the More menu exposes single-message deletion. The
    *  parent owns confirmation + persistence; the promise keeps the action
    *  bar disabled until the flow resolves. */
@@ -118,8 +126,10 @@ export function MessageActionBar({
   copyLinkText,
   align,
   hovered,
+  simplifiedBotConversation = false,
   onFork,
   onAddToChat,
+  onShareAsImage,
   onDelete,
   onEdit,
   onRewind,
@@ -276,7 +286,43 @@ export function MessageActionBar({
     </button>
   );
 
-  const forkBtn = onFork && (
+  // 分享为图片 — 紧贴复制右侧。点击进入选择模式并预选本条,后续勾选与出口都在
+  // 底部操作条上完成(ShareSelectionBar),所以这里是纯 fire-and-forget。
+  const shareBtn = onShareAsImage && (
+    <Tooltip.Root key="share">
+      <Tooltip.Trigger asChild>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onShareAsImage();
+          }}
+          disabled={inFlight}
+          className={cn(
+            'group flex h-[24px] w-[24px] items-center justify-center',
+            'rounded-full border-none bg-transparent outline-none cursor-pointer',
+            'hover:bg-[var(--cmd-palette-item-hover)] transition-colors disabled:cursor-default',
+          )}
+          aria-label={t('chat.shareImage.entry')}
+        >
+          {/* iOS 同款分享形状(托盘 + 上箭头,对应 SF Symbols 的
+              square.and.arrow.up);lucide 的 Share2 是三点连线的通用款,不用。 */}
+          <Share
+            size={14}
+            strokeWidth={2}
+            className={cn(
+              'text-[var(--cmd-palette-item-meta)]',
+              'group-hover:text-[var(--msg-assistant-text)]',
+              'transition-colors duration-150',
+            )}
+          />
+        </button>
+      </Tooltip.Trigger>
+      <Tooltip.Content>{t('chat.shareImage.entry')}</Tooltip.Content>
+    </Tooltip.Root>
+  );
+
+  const forkBtn = !simplifiedBotConversation && onFork && (
     <Tooltip.Root key="fork">
       <Tooltip.Trigger asChild>
         <button
@@ -313,13 +359,46 @@ export function MessageActionBar({
     </Tooltip.Root>
   );
 
+  const replyBtn = simplifiedBotConversation && onAddToChat && (
+    <Tooltip.Root key="reply">
+      <Tooltip.Trigger asChild>
+        <button
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation();
+            onAddToChat();
+          }}
+          disabled={inFlight}
+          className={cn(
+            'group flex h-[24px] w-[24px] items-center justify-center',
+            'rounded-full border-none bg-transparent outline-none cursor-pointer',
+            'hover:bg-[var(--cmd-palette-item-hover)] transition-colors disabled:cursor-default',
+            'focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]',
+          )}
+          aria-label={t('chat.messageActionBar.reply')}
+        >
+          <MessageSquareReply
+            size={14}
+            strokeWidth={2}
+            className={cn(
+              'text-[var(--cmd-palette-item-meta)]',
+              'group-hover:text-[var(--msg-assistant-text)]',
+              'transition-colors duration-150',
+            )}
+          />
+        </button>
+      </Tooltip.Trigger>
+      <Tooltip.Content>{t('chat.messageActionBar.reply')}</Tooltip.Content>
+    </Tooltip.Root>
+  );
+
   const timeText = relText && (
     <Tooltip.Root key="time">
       <Tooltip.Trigger asChild>
         <time
           dateTime={createdAt}
           className={cn(
-            'inline-flex h-[24px] items-center text-[12px] font-normal whitespace-nowrap',
+            'inline-flex h-[24px] items-center text-12 font-normal whitespace-nowrap',
             // Optical adjustment: nudge time text down 0.5px so its visual
             // mid-line aligns with the lucide Copy icon glyph center.
             'relative top-[0.5px]',
@@ -384,7 +463,7 @@ export function MessageActionBar({
   // bar 的 gap-0.5(2px)对两段相邻文本太挤,额外 6px 左距(共 8px)让「时间 | 用量」
   // 读成两个独立信息组。金额与 token 回退共用同一套 —— 换的是内容,不是位置。
   const metaTextClassName = cn(
-    'inline-flex h-[24px] items-center text-[12px] font-normal whitespace-nowrap',
+    'inline-flex h-[24px] items-center text-12 font-normal whitespace-nowrap',
     'relative top-[0.5px]',
     'ml-1.5',
     'text-[var(--settings-section-desc)] cursor-default',
@@ -464,10 +543,12 @@ export function MessageActionBar({
     </Tooltip.Root>
   );
 
-  // Rewind、链接复制与单条删除收进 More 菜单；Fork 与复制同级外显。
+  // Rewind、链接复制与单条删除收进 More 菜单；普通任务仍在菜单里提供
+  // “添加到对话”，伙伴对话则将同一动作外显成“回复”。
   // 面板/行几何遵守 12px container + 8px inner-control 两档圆角。
   const canRewind = Boolean(onRewind && align === 'right');
-  const moreMenu = (onAddToChat || copyLinkText || canRewind || onDelete) && (
+  const addToChatInMenu = simplifiedBotConversation ? undefined : onAddToChat;
+  const moreMenu = (addToChatInMenu || copyLinkText || canRewind || onDelete) && (
     <DropdownMenu key="more" open={menuOpen} onOpenChange={setMenuOpen}>
       <DropdownMenuTrigger asChild>
         <button
@@ -524,11 +605,11 @@ export function MessageActionBar({
           'bg-[var(--cmd-palette-bg)] p-1 text-[var(--cmd-palette-item-text)] shadow-none',
         )}
       >
-        {onAddToChat && (
+        {addToChatInMenu && (
           <DropdownMenuItem
             onSelect={(event) => {
               event.stopPropagation();
-              onAddToChat();
+              addToChatInMenu();
             }}
             className="h-8 cursor-pointer select-none rounded-lg px-2 text-sm focus:bg-[var(--cmd-palette-item-hover)]"
           >
@@ -563,7 +644,7 @@ export function MessageActionBar({
         )}
         {onDelete && (
           <>
-            {(onAddToChat || copyLinkText || canRewind) && (
+            {(addToChatInMenu || copyLinkText || canRewind) && (
               <DropdownMenuSeparator className="my-1 h-px bg-[var(--cmd-palette-border)]" />
             )}
             <DropdownMenuItem
@@ -586,15 +667,27 @@ export function MessageActionBar({
     </DropdownMenu>
   );
 
-  // align='left'  → [copy][fork][more][time][cost]   (assistant)
-  // align='right' → [time][copy][fork][edit][more]   (user)
+  // 普通任务:
+  // align='left'  → [copy][share][fork][more][time][cost]   (assistant)
+  // align='right' → [time][copy][share][fork][edit][more]   (user)
+  // 伙伴对话:[copy][share][reply][more][time] / [time][copy][share][reply][edit][more]
   const items =
     align === 'left'
-      ? [copyBtn, forkBtn, moreMenu, timeText, costText || tokensText]
-      : [timeText, copyBtn, forkBtn, editBtn, moreMenu];
+      ? [
+          copyBtn,
+          shareBtn,
+          forkBtn,
+          replyBtn,
+          moreMenu,
+          timeText,
+          simplifiedBotConversation ? null : costText || tokensText,
+        ]
+      : [timeText, copyBtn, shareBtn, forkBtn, replyBtn, editBtn, moreMenu];
 
   return (
     <div
+      // 操作栏是纯交互件:分享图片的光栅化会按这个标记整条剔除,不进产物。
+      {...{ [SHARE_EXCLUDE_ATTR]: '' }}
       className={cn(
         'flex items-center gap-0.5',
         align === 'right' ? 'justify-end' : 'justify-start',
@@ -602,7 +695,9 @@ export function MessageActionBar({
         // Hover re-enters mid-fade interpolate from the current opacity
         // (browser CSS transition behavior — no replay from 0).
         'transition-opacity duration-[250ms] ease-out',
-        visible || menuOpen ? 'opacity-100' : 'opacity-0 pointer-events-none',
+        simplifiedBotConversation || visible || menuOpen
+          ? 'opacity-100'
+          : 'opacity-0 pointer-events-none',
         // Menu-owned actions dim the entire bar and block clicks. Fork only
         // disables its own button so More remains available.
         moreInFlight && 'opacity-60 pointer-events-none',

@@ -1,6 +1,7 @@
 import { RouterProvider } from 'react-router-dom';
 
 import { useEffect } from 'react';
+import { RemoteDesktopHost } from '@/features/remote-desktop/RemoteDesktopHost';
 
 import { useCloseWindowFallbackShortcut } from '@/hooks/useCloseWindowShortcut';
 import { useDisableContextMenu } from '@/hooks/useDisableContextMenu';
@@ -9,6 +10,7 @@ import { ThemeProvider } from '@/hooks/useTheme';
 import { FontSettingsProvider } from '@/hooks/useFontSettings';
 import { LocaleProvider } from '@/hooks/useLocale';
 import { AuthProvider, useAuth } from '@/contexts/AuthContext';
+import { AppShellCoverProvider, useAppShellCover } from '@/contexts/AppShellCoverContext';
 import { LoginHandoffProvider } from '@/contexts/LoginHandoffContext';
 import { EnvCheckProvider, EnvCheckGuard } from '@/contexts/EnvCheckContext';
 import { WorktreeProvider } from '@/contexts/WorktreeContext';
@@ -26,7 +28,13 @@ import { ConfirmDialogProvider } from '@/components/ui/confirm-dialog-provider';
 import { FindInPageBar } from '@/components/find-in-page/FindInPageBar';
 import { ProjectAutomationNotifyBridge } from '@/features/scheduler/components/ProjectAutomationNotifyBridge';
 import { GhostConfirmDialogHost } from '@/cindy-brain/GhostConfirmDialogHost';
+import { ForgeOidcInstallConfirmHost } from '@/cindy-brain/ForgeOidcInstallConfirmHost';
+import { PluginPublisherConfirmHost } from '@/features/plugin/PluginPublisherConfirmHost';
 import { makerChatStore } from '@/lib/makerChatStore';
+import {
+  initializePromptRecommendationStore,
+  setPromptRecommendationOwner,
+} from '@/lib/promptRecommendationStore';
 import { installSystemNetworkErrorToastListener } from '@/lib/systemNetworkErrorToast';
 import { installSilentInstallToastListener } from '@/lib/silentInstallToast';
 import { installProviderUpstreamErrorToastListener } from '@/lib/providerUpstreamErrorToast';
@@ -52,8 +60,14 @@ import {
   setProviderModelChoice,
   setProviderModelEffort,
   setProviderModelFast,
+  setProviderModelThinking,
   subscribeProviderModelMemory,
 } from '@/state/providerModelMemory';
+import {
+  readWorkerCreationPrefs,
+  setWorkerPermissionModePreference,
+  subscribeWorkerCreationPrefs,
+} from '@/state/workerCreationPrefs';
 import type { Effort } from '@/lib/userPreferences.types';
 
 import { router } from './router';
@@ -65,10 +79,12 @@ import { router } from './router';
  */
 function LoginHandoffHost({ children }: { children: React.ReactNode }) {
   const { isInitializing, isAuthenticated, canEnterApp } = useAuth();
+  const { coverHeld } = useAppShellCover();
   return (
     <LoginHandoffProvider
       authResolved={!isInitializing}
       authenticated={isAuthenticated || canEnterApp}
+      coverHeld={coverHeld}
     >
       {/* 认证恢复后已登录(直进受保护路由、LoginPage 不挂载)时结束首启亮色门,
           避免 renderer localStorage 被清空但主进程仍持有会话时整个已登录会话
@@ -80,9 +96,14 @@ function LoginHandoffHost({ children }: { children: React.ReactNode }) {
 }
 
 function MakerBootstrap() {
-  const { isAuthenticated, dataOwnerId } = useAuth();
+  const { isAuthenticated, dataOwnerId, dataOwnerRecoveryEpoch } = useAuth();
 
   useResyncAgentIslandSettingsAfterLogin(isAuthenticated);
+
+  useEffect(() => {
+    setPromptRecommendationOwner(`${dataOwnerId ?? 'signed-out'}:${dataOwnerRecoveryEpoch}`);
+    initializePromptRecommendationStore();
+  }, [dataOwnerId, dataOwnerRecoveryEpoch]);
 
   useEffect(() => {
     makerChatStore.syncActiveTurnsFromMain();
@@ -145,11 +166,14 @@ export function App() {
         effort: cc.effort,
         permissionMode: cc.permissionMode,
         fastMode: draft.fastModeByModel[cc.model] === true,
+        // /ctr 新建会话需要与模型配套的供应商路由；缺省会走隐式路由落到官方网关，
+        // 用户供应商专有的模型（如 deepseek-v4-pro）会被网关 400 拒绝。
+        providerId: cc.providerId ?? null,
       });
       // main 缓存两用途:① collab worker spawn 读 model/effort/fastMode;② device-link 远程
-      // 草稿镜像读全量(model/effort/fast/permission/source)。故 lastByVendor 每项带上
-      // permissionMode + providerId(worker spawn 不消费这两项,远程草稿镜像才用)。仅 cc/codex,
-      // 不带 orca。fire-and-forget。
+      // 草稿镜像读全量(model/effort/fast/permission/source)+「是否显式选过模型」。故
+      // lastByVendor 覆盖 cc/codex/pi，并带上 permissionMode + providerId(worker spawn
+      // 不消费这两项,远程草稿镜像才用)。fire-and-forget。
       window.electronAPI.syncNewMakerDraft({
         lastByVendor: {
           cc: {
@@ -164,6 +188,17 @@ export function App() {
             permissionMode: draft.lastByVendor.codex.permissionMode,
             providerId: draft.lastByVendor.codex.providerId ?? null,
           },
+          pi: {
+            model: draft.lastByVendor.pi.model,
+            effort: draft.lastByVendor.pi.effort,
+            permissionMode: draft.lastByVendor.pi.permissionMode,
+            providerId: draft.lastByVendor.pi.providerId ?? null,
+          },
+        },
+        modelChosenByVendor: {
+          cc: draft.modelChosenByVendor.cc === true,
+          codex: draft.modelChosenByVendor.codex === true,
+          pi: draft.modelChosenByVendor.pi === true,
         },
         fastModeByModel: draft.fastModeByModel,
         effortByModel: draft.effortByModel,
@@ -173,6 +208,26 @@ export function App() {
     };
     syncPrefs();
     return subscribeDraft(syncPrefs);
+  }, []);
+
+  // Worker 创建偏好的真源是 renderer localStorage；main 只缓存权限默认值供
+  // Orca UI / agent tool 的创建路径读取。tool 显式改默认时再经 apply push 回写真源。
+  useEffect(() => {
+    const sync = () => {
+      const prefs = readWorkerCreationPrefs();
+      window.electronAPI.syncWorkerCreationPrefs({
+        workerPermissionMode: prefs.workerPermissionMode,
+      });
+    };
+    sync();
+    const unsubscribe = subscribeWorkerCreationPrefs(sync);
+    const offApply = window.electronAPI.onWorkerCreationPrefsApply(({ workerPermissionMode }) => {
+      setWorkerPermissionModePreference(workerPermissionMode);
+    });
+    return () => {
+      unsubscribe();
+      offApply();
+    };
   }, []);
 
   // device-link 被控端单一真相:把 providerModelMemory(草稿模型列表行的真实读源)全量镜像给 main,
@@ -190,7 +245,7 @@ export function App() {
   // 通过 providerModelMemory 同步。写入触发上面的镜像 effect → NEW_MAKER_DRAFT_CHANGED 回流控制端。
   useEffect(() => {
     const offDraft = window.electronAPI.onMakerDraftPrefApply(
-      ({ agent, providerId, modelId, active, effort, fast, markModelChoice }) => {
+      ({ agent, providerId, modelId, active, effort, fast, thinking, markModelChoice }) => {
         const vendor = agentKindToVendor(agent);
         if (active) {
           const patch =
@@ -198,6 +253,10 @@ export function App() {
           const shouldPatchActiveModel = markModelChoice !== false || effort !== undefined;
           if (shouldPatchActiveModel) {
             patch(vendor, {
+              // markModelChoice=false 仍要写回当前活动模型:远程新建草稿
+              // pushActiveDraftPref、以及旧控制端换模都走这条 wire。丢掉 model
+              // 会让被控端 lastByVendor 停在旧模型。选模标记由 store 的
+              // preserving 路径单独守住,这里只负责同步当前活动值。
               model: modelId,
               providerId: providerId || null,
               ...(effort !== undefined ? { effort: effort as Effort } : {}),
@@ -215,6 +274,9 @@ export function App() {
         if (fast !== undefined) {
           setProviderModelFast(agent, providerId, modelId, fast);
           if (active) setFastModeForModel(modelId, fast); // 旧层兜底保持一致
+        }
+        if (thinking !== undefined) {
+          setProviderModelThinking(agent, providerId, modelId, thinking);
         }
       },
     );
@@ -286,8 +348,9 @@ export function App() {
           <ConfirmDialogProvider>
             <EnvCheckProvider>
               <AuthProvider>
-                <WorktreeProvider>
-                  <PrRefsProvider>
+                <AppShellCoverProvider>
+                  <WorktreeProvider>
+                    <PrRefsProvider>
                     <Tooltip.Provider>
                       {/* LoginHandoffProvider 包 SplashScreen + RouterProvider(Step 3b
                           WHAT2 宿主契约):Splash→登录/主界面衔接动画状态机。
@@ -306,11 +369,14 @@ export function App() {
                         )}
                         <EnvCheckGuard>
                           <MakerBootstrap />
+                          {!isSecondaryWindow() && !isSidebarWindow() && !isGhostPanelWindow() && <RemoteDesktopHost />}
                           <ProjectAutomationNotifyBridge />
                           {/* confirm 槽:插件请主机弹确认框。必须在 ConfirmDialogProvider
                               内(要 useConfirmDialog);main 只投单个窗口,所以每个窗口
                               都挂、谁收到谁弹,不按窗口类型 gate。 */}
                           <GhostConfirmDialogHost />
+                          <ForgeOidcInstallConfirmHost />
+                          <PluginPublisherConfirmHost />
                           <OwnerScopedRouter />
                         </EnvCheckGuard>
                       </LoginHandoffHost>
@@ -321,8 +387,9 @@ export function App() {
                         <LegacyMigrationDialog />
                       )}
                     </Tooltip.Provider>
-                  </PrRefsProvider>
-                </WorktreeProvider>
+                    </PrRefsProvider>
+                  </WorktreeProvider>
+                </AppShellCoverProvider>
               </AuthProvider>
             </EnvCheckProvider>
           </ConfirmDialogProvider>

@@ -41,6 +41,43 @@ export function buildMobileClientPromptNote(): string {
   );
 }
 
+function singleTextContent(message: unknown): string | null {
+  if (typeof message === 'string') return message;
+  if (!message || typeof message !== 'object' || Array.isArray(message)) return null;
+  const content = (message as { content?: unknown }).content;
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content) || content.length !== 1) return null;
+  const part = content[0];
+  if (!part || typeof part !== 'object' || Array.isArray(part)) return null;
+  const { type, text } = part as { type?: unknown; text?: unknown };
+  return (
+    (type === 'text' || type === 'input_text' || type === 'output_text')
+    && typeof text === 'string'
+  ) ? text : null;
+}
+
+/**
+ * 原生命令必须位于消息开头；环境说明不能抢占这个位置。
+ * Claude 旁路 /compact；Pi 的 slash 输入交由运行时自己的命令发现处理。
+ */
+export function shouldPrependMobileClientPromptNote(
+  message: unknown,
+  agentKind: string,
+): boolean {
+  const text = singleTextContent(message);
+  // Pi owns command discovery. Leave slash inputs intact so its runtime can
+  // execute installed commands (or treat unknown ones as literal text).
+  if (agentKind === 'pi') {
+    const content = message && typeof message === 'object'
+      ? (message as { content?: unknown }).content : null;
+    const parts = Array.isArray(content) ? content : [];
+    const firstText = parts.find((part) => part?.type === 'text' && typeof part.text === 'string')?.text;
+    return !(text ?? firstText ?? '').trimStart().startsWith('/');
+  }
+  if (agentKind !== 'claude-code') return true;
+  return text === null || !/^\/compact(?:\s|$)/.test(text);
+}
+
 /**
  * 在 IPC 边界给队列项盖上手机来源(返回新对象,不原地改入参)。
  *
@@ -107,6 +144,8 @@ export function attachMainOwnedInputBoundary(
  * `fromMobileClient` 是 coordinator 从队列项透传给 send 事务的内部字段;直连
  * `maker:send` 的 sendOpts 却来自 wire —— 不剥的话客户端自填一个就能让 agent 收到手机
  * 说明。直连路径的来源判据只能是 async context(invoke-context),不看 sendOpts。
+ * `turnPermissionPolicy` 同样只能由 Main 的 IM dispatcher 创建；Renderer/device-link
+ * 即使伪造相同字段形状，也不能把普通文本升级成已认证 IM 指令。
  *
  * 非对象输入原样返回(事务自己会按 `?? {}` 兜底)。
  */
@@ -115,17 +154,25 @@ export function stripMainOnlySendOpts(sendOpts: unknown): unknown {
   const opts = sendOpts as Record<string, unknown>;
   if (
     !('fromMobileClient' in opts) &&
+    !('fromDeviceLinkClient' in opts) &&
     !('expectedInputGeneration' in opts) &&
+    !('expectedTurnSession' in opts) &&
+    !('expectedTurnGeneration' in opts) &&
     !('inputAbortSignal' in opts) &&
-    !('signal' in opts)
+    !('signal' in opts) &&
+    !('turnPermissionPolicy' in opts)
   ) {
     return sendOpts;
   }
   const {
     fromMobileClient: _ignoredMobile,
+    fromDeviceLinkClient: _ignoredDeviceLink,
     expectedInputGeneration: _ignoredGeneration,
+    expectedTurnSession: _ignoredTurnSession,
+    expectedTurnGeneration: _ignoredTurnGeneration,
     inputAbortSignal: _ignoredAbortSignal,
     signal: _ignoredSignal,
+    turnPermissionPolicy: _ignoredTurnPermissionPolicy,
     ...rest
   } = opts;
   return rest;

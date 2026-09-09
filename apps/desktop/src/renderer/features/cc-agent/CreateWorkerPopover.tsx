@@ -1,7 +1,9 @@
+import { useModelPickerAgents } from '@/hooks/useAvailableAgents';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
-import { X } from 'lucide-react';
+import { Info, TriangleAlert, X } from 'lucide-react';
+import { requiresFullAccessConfirmation } from '@cindy/maker-shared/permission-mode';
 import {
   connectedProvidersForAgent,
   effectiveSourceIdForModel,
@@ -12,7 +14,9 @@ import {
 } from '@cindy/model-providers';
 
 import { FastModeToggle } from '@/components/new-chat/FastModeToggle';
+import { FullAccessConfirmContent } from '@/components/new-chat/FullAccessConfirmContent';
 import { ModelSelector } from '@/components/new-chat/ModelSelector';
+import { PermissionSelector } from '@/components/new-chat/PermissionSelector';
 import { VendorSegmentedSwitcher } from '@/components/new-chat/VendorSegmentedSwitcher';
 import { agentKindToVendor } from '@/components/sidebar/VendorIcon';
 import { useAgentCapabilities } from '@/hooks/useAgentCapabilities';
@@ -29,70 +33,24 @@ import {
   setProviderModelEffort,
   setProviderModelFast,
 } from '@/state/providerModelMemory';
+import {
+  DEFAULT_WORKER_CREATION_PREFS,
+  readWorkerCreationPrefs,
+  writeWorkerCreationPrefs,
+  type WorkerCreationPrefs,
+} from '@/state/workerCreationPrefs';
 import type { Effort } from '@/lib/userPreferences.types';
+import { useConfirmDialog } from '@/components/ui/confirm-dialog-provider';
+import { Tip } from '@/components/ui/tooltip';
+import {
+  DEFAULT_ORCA_WORKER_PERMISSION_MODE,
+  ORCA_WORKER_PERMISSION_MODES,
+  type OrcaWorkerPermissionMode,
+} from '../../../shared/orca-worker-permission-mode';
 import { selectWorkerModels } from './workerModelAvailability';
 
 const PREDEFINED_ROLES = ['developer', 'designer', 'reviewer', 'tester', 'merger'] as const;
-const PREFS_KEY = 'workerCreationPrefs';
-
-interface WorkerAgentPrefs {
-  model: string;
-  effort: Effort;
-  fast: boolean;
-  /** 上次显式选定的模型来源;null = 未显式选择(跟随默认路由解析)。 */
-  providerId: string | null;
-}
-
-interface WorkerPrefs {
-  lastAgent: 'codex' | 'claude-code' | 'pi';
-  codex: WorkerAgentPrefs;
-  'claude-code': WorkerAgentPrefs;
-  pi: WorkerAgentPrefs;
-}
-
-const DEFAULT_PREFS: WorkerPrefs = {
-  lastAgent: 'codex',
-  codex: { model: 'codex/gpt-5.5', effort: 'high', fast: false, providerId: null },
-  'claude-code': { model: 'claude-opus-4-7', effort: 'high', fast: false, providerId: null },
-  // pi worker 默认模型与 orcaWorkerCreationService.resolveWorkerConfig 的 pi 分支一致。
-  pi: { model: 'claude-sonnet-4-6', effort: 'high', fast: false, providerId: null },
-};
-
-function readWorkerPrefs(): WorkerPrefs {
-  try {
-    const raw = window.localStorage.getItem(PREFS_KEY);
-    if (!raw) return DEFAULT_PREFS;
-    const parsed = JSON.parse(raw) as Partial<WorkerPrefs>;
-    const agentPrefs = (agent: 'codex' | 'claude-code' | 'pi'): WorkerAgentPrefs => {
-      const p = parsed[agent];
-      return {
-        ...DEFAULT_PREFS[agent],
-        ...(p ?? {}),
-        fast: p?.fast === true,
-        // 老版本 prefs 无此字段 → null(未显式);非法类型/空白串同样回落(与 IPC 同口径 trim)。
-        providerId:
-          typeof p?.providerId === 'string' && p.providerId.trim() ? p.providerId.trim() : null,
-      };
-    };
-    return {
-      lastAgent:
-        parsed.lastAgent === 'claude-code' ? 'claude-code' : parsed.lastAgent === 'pi' ? 'pi' : 'codex',
-      codex: agentPrefs('codex'),
-      'claude-code': agentPrefs('claude-code'),
-      pi: agentPrefs('pi'),
-    };
-  } catch {
-    return DEFAULT_PREFS;
-  }
-}
-
-function writeWorkerPrefs(prefs: WorkerPrefs): void {
-  try {
-    window.localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
-  } catch {
-    // localStorage can be unavailable in restricted contexts; prefs are best-effort.
-  }
-}
+const AUTO_ONLY_WORKER_PERMISSION_MODES = ['auto'] as const;
 
 export interface CreateWorkerForm {
   role: string;
@@ -103,6 +61,8 @@ export interface CreateWorkerForm {
   /** 显式选定的模型来源;null = 未显式,由 main 侧按默认路由解析。 */
   providerId: string | null;
   initialTask: string;
+  /** 本次 Worker 权限；提交后同时成为下一次创建 Worker 的默认值。 */
+  workerPermissionMode?: OrcaWorkerPermissionMode;
 }
 
 export interface CreateWorkerPopoverProps {
@@ -121,6 +81,8 @@ export interface CreateWorkerPopoverProps {
    * (codex review R28)。提交前就在面板里藏掉,与 ChatInput 同口径。
    */
   sshRemote?: boolean;
+  /** 开启新协同时必须确认执行端支持权限偏好；已有旧版远程 Team 创建 Worker 仍兼容旧行为。 */
+  requireWorkerPermissionModeSupport?: boolean;
 }
 
 export function CreateWorkerPopover({
@@ -132,20 +94,24 @@ export function CreateWorkerPopover({
   className,
   deviceId,
   sshRemote,
+  requireWorkerPermissionModeSupport = false,
 }: CreateWorkerPopoverProps) {
   const { t } = useTranslation();
+  const { confirm: confirmDialog } = useConfirmDialog();
   const navigate = useNavigate();
   const [role, setRole] = useState('developer');
   const [customRole, setCustomRole] = useState('');
   const [agent, setAgent] = useState<'claude-code' | 'codex' | 'pi'>('codex');
-  const [model, setModel] = useState(DEFAULT_PREFS.codex.model);
-  const [effort, setEffort] = useState<Effort>(DEFAULT_PREFS.codex.effort);
-  const [fast, setFast] = useState(DEFAULT_PREFS.codex.fast);
+  const [model, setModel] = useState(DEFAULT_WORKER_CREATION_PREFS.codex.model);
+  const [effort, setEffort] = useState<Effort>(DEFAULT_WORKER_CREATION_PREFS.codex.effort);
+  const [fast, setFast] = useState(DEFAULT_WORKER_CREATION_PREFS.codex.fast);
   // 显式选定的模型来源(标准面板供应商分段);null = 未显式。device-link 远程创建
   // 面板退化为被控端纯列表(无来源维度),恒为 null。
   const [providerSource, setProviderSource] = useState<string | null>(null);
   const [initialTask, setInitialTask] = useState('');
-  const [prefs, setPrefs] = useState<WorkerPrefs>(DEFAULT_PREFS);
+  const [selectedWorkerPermissionMode, setSelectedWorkerPermissionMode] =
+    useState<OrcaWorkerPermissionMode>(DEFAULT_ORCA_WORKER_PERMISSION_MODE);
+  const [prefs, setPrefs] = useState<WorkerCreationPrefs>(DEFAULT_WORKER_CREATION_PREFS);
   const [prefsRestored, setPrefsRestored] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const submittingRef = useRef(false);
@@ -153,6 +119,7 @@ export function CreateWorkerPopover({
   const ccCaps = useAgentCapabilities('claude-code', deviceId);
   const codexCaps = useAgentCapabilities('codex', deviceId);
   const piCaps = useAgentCapabilities('pi', deviceId);
+  const pickerAgents = useModelPickerAgents(agent, deviceId);
   const localProviders = useProviders();
   const remoteProviders = useDeviceProviders(deviceId);
   const providers = deviceId ? remoteProviders.providers : localProviders.providers;
@@ -161,6 +128,12 @@ export function CreateWorkerPopover({
   const visibilityVersion = useModelVisibilityVersion();
   const activeCapabilitiesState = agent === 'codex' ? codexCaps : agent === 'pi' ? piCaps : ccCaps;
   const activeCaps = activeCapabilitiesState.capabilities;
+  const supportsWorkerPermissionModeSelection =
+    !deviceId || activeCaps?.supportsOrcaWorkerPermissionMode === true;
+  const remoteWorkerPermissionModeUnsupported =
+    !!deviceId
+    && activeCaps !== null
+    && activeCaps?.supportsOrcaWorkerPermissionMode !== true;
   const activeModels = useMemo(() => {
     return selectWorkerModels({
       agent,
@@ -212,7 +185,7 @@ export function CreateWorkerPopover({
   );
   const narrowProviderSource = useCallback(
     (candidate: string | null, modelId: string): string | null => {
-      if (!candidate || deviceId) return null;
+      if (!candidate || (deviceId && remoteProviders.unsupported)) return null;
       const provider = routableProviders.find((p) => p.id === candidate);
       if (!provider || !providerOffersModel(provider, modelId, agent)) return null;
       const catalogModel = getModel(provider, modelId, agent);
@@ -227,7 +200,7 @@ export function CreateWorkerPopover({
         ? candidate
         : null;
     },
-    [agent, deviceId, routableProviders],
+    [agent, deviceId, remoteProviders.unsupported, routableProviders],
   );
 
   // per-provider Fast 能力:同一 model id 在不同来源下 supportsFastMode 可不同(见
@@ -238,7 +211,7 @@ export function CreateWorkerPopover({
   // peer 无 provider 镜像,解析不出来源)才回落拍平并集(codex review)。
   const providerFastSupported = useCallback(
     (candidate: string | null, modelId: string): boolean => {
-      // device-link 面板无来源维度,candidate 恒 null,走默认来源解析。
+      // 本机和远程显式来源同一口径；只有未指定时解析默认来源。
       const sourceId =
         candidate ?? effectiveSourceIdForModel(routableProviders, null, modelId, agent);
       if (!sourceId) {
@@ -268,10 +241,8 @@ export function CreateWorkerPopover({
   const routeEffortMetaFor = useCallback(
     (modelId: string): { efforts: readonly string[]; defaultEffort: string | null } | undefined => {
       const flat = activeModels.find((m) => m.id === modelId);
-      const sourceId = deviceId
-        ? effectiveSourceIdForModel(providers, null, modelId, agent)
-        : narrowProviderSource(providerSource, modelId)
-          ?? effectiveSourceIdForModel(routableProviders, null, modelId, agent);
+      const sourceId = narrowProviderSource(providerSource, modelId)
+        ?? effectiveSourceIdForModel(routableProviders, null, modelId, agent);
       const provider = sourceId
         ? (deviceId ? connectedProvidersForAgent(providers, agent) : routableProviders).find(
             (p) => p.id === sourceId,
@@ -303,7 +274,7 @@ export function CreateWorkerPopover({
       setPrefsRestored(false);
       return;
     }
-    const stored = readWorkerPrefs();
+    const stored = readWorkerCreationPrefs();
     const agentPrefs = stored[stored.lastAgent];
     setPrefs(stored);
     setAgent(stored.lastAgent);
@@ -312,8 +283,18 @@ export function CreateWorkerPopover({
     setFast(agentPrefs.fast);
     setProviderSource(deviceId ? null : agentPrefs.providerId);
     setInitialTask('');
+    setSelectedWorkerPermissionMode(stored.workerPermissionMode);
     setPrefsRestored(true);
   }, [deviceId, open]);
+
+  useEffect(() => {
+    if (
+      !supportsWorkerPermissionModeSelection
+      && selectedWorkerPermissionMode !== 'auto'
+    ) {
+      setSelectedWorkerPermissionMode('auto');
+    }
+  }, [selectedWorkerPermissionMode, supportsWorkerPermissionModeSelection]);
 
   // capabilities 可能尚未加载或模型被移除；加载后把当前选择收敛到可用模型和 effort。
   useEffect(() => {
@@ -367,7 +348,7 @@ export function CreateWorkerPopover({
       // 恢复读的是 prefs,不快照会把「改了还没提交就切了个 tab」的编辑静默回滚到
       // 打开弹窗时的旧值(codex review)。只更新内存态,localStorage 仍只在提交时
       // 写 —— 关闭弹窗不持久化未提交编辑,语义不变。
-      const snapshot: WorkerPrefs = {
+      const snapshot: WorkerCreationPrefs = {
         ...prefs,
         [agent]: {
           model,
@@ -415,24 +396,22 @@ export function CreateWorkerPopover({
   // 主动从模型级全局预设恢复(codex review:否则用户在非选中行 hover 配置的
   // effort/Fast 在选中该行后被丢弃);Fast 还要叠加该来源条目的 per-provider 能力。
   const handleProviderChange = useCallback(
-    (providerId: string | null, modelId?: string, reconciledEffort?: Effort) => {
+    (providerId: string | null, modelId?: string, reconciledEffort?: Effort, reconciledFast?: boolean) => {
       const nextModel = modelId ?? model;
       const narrowed = narrowProviderSource(providerId, nextModel);
       // 「钉/重选当前生效来源」与「切到恰好提供同一模型的另一来源」必须区分
       // (codex review):前者保留表单 live 值(仅把生效来源钉成显式);后者是真实
       // 来源切换,要恢复目标行显示的预设。判据 = 目标来源是否就是切换前的生效来源
       // (显式值,未显式时为解析出的默认来源),不能只看模型是否相同。
-      const effectiveBefore = deviceId
-        ? null
-        : providerSource ?? effectiveSourceIdForModel(routableProviders, null, model, agent);
+      const effectiveBefore = providerSource ?? effectiveSourceIdForModel(routableProviders, null, model, agent);
       setProviderSource(narrowed);
       if (!modelId) return;
-      if (modelId === model && narrowed !== null && narrowed === effectiveBefore) {
+      if (modelId === model && narrowed !== null && narrowed === effectiveBefore && reconciledEffort === undefined && reconciledFast === undefined) {
         // 钉当前生效来源也是一次真实选定:live effort/Fast 保留,但 (来源, 模型)
         // 要记入全局 choice —— 该来源槽的 lastModel 可能还指着别的模型,不记会让
         // 其它标准选择器切到该来源时恢复 stale 模型(codex review)。无档模型跳过,
         // 与下方真实切换路径同规则。
-        if (currentModel && currentModel.efforts.length > 0) {
+        if (!deviceId && currentModel && currentModel.efforts.length > 0) {
           setProviderModelChoice(agent, narrowed, modelId, effort);
         }
         return;
@@ -444,7 +423,7 @@ export function CreateWorkerPopover({
       // 同 id 模型的 efforts/defaultEffort 跨来源可分叉,按拍平条目校验会保留/赋予
       // 选中来源不支持的档位,提交后被 main 侧路由来源校验拒掉(codex review)。
       // 未收窄出显式来源时取生效默认来源的条目;来源条目缺失或无档位元数据时
-      // 回落拍平条目(device-link 无本地目录,handleProviderChange 本就不接线)。
+      // 回落拍平条目(仅旧被控端缺少完整来源目录)。
       const effortSourceId =
         narrowed ?? effectiveSourceIdForModel(routableProviders, null, modelId, agent);
       const effortSourceProvider = effortSourceId
@@ -459,7 +438,7 @@ export function CreateWorkerPopover({
       const validEfforts: readonly string[] = effortMeta.efforts;
       const remembered =
         reconciledEffort ??
-        (providerId ? getProviderModelEffort(agent, providerId, modelId) : undefined);
+        (!deviceId && providerId ? getProviderModelEffort(agent, providerId, modelId) : undefined);
       let nextEffort: Effort | null = null;
       if (remembered && validEfforts.includes(remembered)) {
         nextEffort = remembered;
@@ -477,7 +456,7 @@ export function CreateWorkerPopover({
       // 其它标准选择器的 resolveSourceSwitch 用它做切来源落点),否则本面板的显式
       // 选择不进全局记忆,别处切到该来源仍恢复旧模型(codex review)。无档模型
       // 跳过 —— store 的 lastModel 依附 effort 记录。
-      if (effortSourceId && nextEffort) {
+      if (!deviceId && effortSourceId && nextEffort) {
         setProviderModelChoice(agent, effortSourceId, modelId, nextEffort);
       }
       if (!providerFastSupported(narrowed, modelId)) {
@@ -485,10 +464,10 @@ export function CreateWorkerPopover({
       } else {
         // 面板行的 Fast 闪电按全局预设显示,无预设 = 关:选行后必须对齐显示,
         // 不能沿用上一个模型的 true(codex review)。
-        const rememberedFast = providerId
+        const rememberedFast = !deviceId && providerId
           ? getProviderModelFast(agent, providerId, modelId)
           : undefined;
-        setFast(rememberedFast === true);
+        setFast((reconciledFast ?? rememberedFast) === true);
       }
     },
     [
@@ -563,9 +542,30 @@ export function CreateWorkerPopover({
     activeRole.length <= 32 &&
     !customRoleError &&
     !remoteModelListBlocked &&
+    (!requireWorkerPermissionModeSupport || !remoteWorkerPermissionModeUnsupported) &&
     !!currentModel;
   const resolvedTitle = title ?? t('orca.createWorker.title');
   const resolvedSubmitLabel = submitLabel ?? t('orca.createWorker.submit');
+
+  const updateWorkerPermissionMode = useCallback(
+    async (nextMode: OrcaWorkerPermissionMode) => {
+      if (requiresFullAccessConfirmation(selectedWorkerPermissionMode, nextMode)) {
+        const confirmed = await confirmDialog({
+          title: t('newChat.chatInput.fullAccessConfirmation.title'),
+          description: t('newChat.chatInput.fullAccessConfirmation.description'),
+          content: <FullAccessConfirmContent />,
+          describeContent: true,
+          maxWidth: 440,
+          confirmText: t('newChat.chatInput.fullAccessConfirmation.confirm'),
+          cancelText: t('newChat.chatInput.fullAccessConfirmation.cancel'),
+          confirmIcon: <TriangleAlert size={14} />,
+        });
+        if (!confirmed) return;
+      }
+      setSelectedWorkerPermissionMode(nextMode);
+    },
+    [confirmDialog, selectedWorkerPermissionMode, t],
+  );
 
   const handleCreate = useCallback(async () => {
     if (!canCreate || submittingRef.current) return;
@@ -573,9 +573,12 @@ export function CreateWorkerPopover({
     setIsSubmitting(true);
     // 提交前对 (来源, 模型) 再收窄一次:收敛 effect 与提交之间目录可能已变化。
     const submitProviderId = narrowProviderSource(providerSource, model);
-    const nextPrefs: WorkerPrefs = {
+    const nextPrefs: WorkerCreationPrefs = {
       ...prefs,
       lastAgent: agent,
+      workerPermissionMode: supportsWorkerPermissionModeSelection
+        ? selectedWorkerPermissionMode
+        : prefs.workerPermissionMode,
       [agent]: {
         model,
         effort,
@@ -585,7 +588,7 @@ export function CreateWorkerPopover({
       },
     };
     setPrefs(nextPrefs);
-    writeWorkerPrefs(nextPrefs);
+    writeWorkerCreationPrefs(nextPrefs);
     // 提交 effort 按**实际路由来源档位表**对账(codex/copilot review):恢复路径的
     // stale effort、以及路由来源条目无档而拍平条目有档的组合,直接把 live 值
     // explicit 下发会被 main 侧路由来源校验拒掉(INVALID_PARAMS 阻断创建)。条目
@@ -608,6 +611,9 @@ export function CreateWorkerPopover({
         fast: currentModelSupportsFast ? fast : undefined,
         providerId: submitProviderId,
         initialTask,
+        ...(supportsWorkerPermissionModeSelection
+          ? { workerPermissionMode: selectedWorkerPermissionMode }
+          : {}),
       });
     } finally {
       submittingRef.current = false;
@@ -629,6 +635,8 @@ export function CreateWorkerPopover({
     initialTask,
     onCreate,
     routeEffortMetaFor,
+    selectedWorkerPermissionMode,
+    supportsWorkerPermissionModeSelection,
   ]);
 
   if (!open) return null;
@@ -641,7 +649,7 @@ export function CreateWorkerPopover({
         style={{ boxShadow: 'var(--shadow-menu)' }}
       >
         <div className="mb-5 flex items-center justify-between">
-          <span className="text-17 font-medium text-[var(--text-primary)]">{resolvedTitle}</span>
+          <span className="text-16 font-medium text-[var(--text-primary)]">{resolvedTitle}</span>
           <button
             type="button"
             aria-label={t('orca.createWorker.closeAria')}
@@ -653,8 +661,28 @@ export function CreateWorkerPopover({
         </div>
 
         <div className="mb-4">
-          <div className="mb-2 text-12 font-medium uppercase tracking-[0.5px] text-[var(--text-tertiary)]">
-            {t('orca.createWorker.roleLabel')}
+          <div className="mb-2 flex items-center gap-1">
+            <span className="text-12 font-medium uppercase tracking-[0.5px] text-[var(--text-tertiary)]">
+              {t('orca.createWorker.roleLabel')}
+            </span>
+            <Tip
+              text={t('orca.createWorker.roleHint')}
+              side="top"
+              contentClassName="max-w-[280px] whitespace-normal break-words text-left"
+            >
+              <button
+                type="button"
+                className={cn(
+                  'inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border-0 bg-transparent p-0',
+                  'text-[var(--text-tertiary)] outline-none transition-colors',
+                  'hover:bg-[var(--surface-hover)] hover:text-[var(--text-secondary)]',
+                  'focus:bg-[var(--surface-hover)] focus:text-[var(--text-secondary)]',
+                )}
+                aria-label={t('orca.createWorker.roleHintAria')}
+              >
+                <Info size={13} aria-hidden />
+              </button>
+            </Tip>
           </div>
           <div className="flex flex-wrap gap-2">
             {PREDEFINED_ROLES.map((r) => (
@@ -692,22 +720,15 @@ export function CreateWorkerPopover({
           )}
         </div>
 
-        <div className="mb-4 grid grid-cols-[220px_minmax(0,1fr)] gap-4">
-          <div className="min-w-0">
-            <div className="mb-2 text-12 font-medium uppercase tracking-[0.5px] text-[var(--text-tertiary)]">
-              {t('orca.createWorker.agentLabel')}
-            </div>
-            {/* 应用标准 Agent 分段控件(替换此前手写的按钮组;与 New Maker / IM 目录偏好同款,
-                「不自建选择 UI」的组件复用原则)。 */}
+        <div className="mb-4 grid gap-4">
+          {deviceId && remoteProviders.unsupported && (
             <VendorSegmentedSwitcher
               value={vendorKey}
               width={220}
               ariaLabel={t('orca.createWorker.agentLabel')}
-              onChange={(next) =>
-                updateAgent(next === 'codex' ? 'codex' : next === 'pi' ? 'pi' : 'claude-code')
-              }
+              onChange={(next) => updateAgent(next === 'codex' ? 'codex' : next === 'pi' ? 'pi' : 'claude-code')}
             />
-          </div>
+          )}
 
           <div className="min-w-0">
             <div className="mb-2 text-12 font-medium uppercase tracking-[0.5px] text-[var(--text-tertiary)]">
@@ -720,10 +741,20 @@ export function CreateWorkerPopover({
                 且面板行级 Fast 依赖来源分段(fastEditable 走 connected 目录),故远程仍用
                 外置 FastModeToggle,不能删。 */}
             <div className="flex min-w-0 items-center gap-2">
-              {deviceId && currentModelSupportsFast && (
+              {deviceId && remoteProviders.unsupported && currentModelSupportsFast && (
                 <FastModeToggle enabled={fast} onToggle={() => setFast((v) => !v)} />
               )}
               <ModelSelector
+                fastModeConfigurable={['codex', 'pi']}
+                unifiedAgents={sshRemote ? (pickerAgents ?? ['claude-code', 'codex']).filter((kind) => kind !== 'pi') : pickerAgents}
+                onUnifiedSelect={deviceId && remoteProviders.unsupported ? undefined : (selection) => {
+                  const nextAgent = selection.engine === 'cc' ? 'claude-code' : selection.engine;
+                  updateAgent(nextAgent);
+                  setModel(selection.modelId);
+                  setProviderSource(selection.providerId);
+                  setEffort(selection.effort ?? '');
+                  setFast(selection.fast);
+                }}
                 modelId={model}
                 effort={effort}
                 onModelChange={updateModel}
@@ -737,13 +768,9 @@ export function CreateWorkerPopover({
                 excludeChatBridgedCodex={sshRemote === true}
                 popoverSide="bottom"
                 currentProviderId={
-                  deviceId
-                    ? undefined
-                    : sshRemote === true
-                      ? narrowProviderSource(providerSource, model)
-                      : providerSource
+                  sshRemote === true ? narrowProviderSource(providerSource, model) : providerSource
                 }
-                onProviderChange={deviceId ? undefined : handleProviderChange}
+                onProviderChange={deviceId && remoteProviders.unsupported ? undefined : handleProviderChange}
                 // providerSource=null 时面板高亮的是**解析出来的生效默认来源**,点它的
                 // 语义是「把默认来源钉成显式偏好」,必须照常回调(codex review)——否则
                 // 用户点了没反应,之后默认路由一变创建就静默换来源。显式同值幂等无害。
@@ -763,9 +790,9 @@ export function CreateWorkerPopover({
                 // worker 创建链的显式 Fast 派发支持 Codex 与 Pi(resolveWorkerConfig 对二者
                 // 消费 input.fast,并按模型 supportsFastMode 收口):cc 层面为 no-op,不接线,
                 // 面板就不显示 Fast 开关,避免「开关能开、提交被丢」的名不副实(codex review)。
-                fastMode={deviceId || !(agent === 'codex' || agent === 'pi') ? undefined : fast}
+                fastMode={!(agent === 'codex' || agent === 'pi') ? undefined : fast}
                 onFastModeChange={
-                  deviceId || !(agent === 'codex' || agent === 'pi') ? undefined : updateFast
+                  !(agent === 'codex' || agent === 'pi') ? undefined : updateFast
                 }
               />
             </div>
@@ -779,20 +806,41 @@ export function CreateWorkerPopover({
           </div>
         </div>
 
-        {/* device-link creation executes on the controlled app. An older peer may still default
-            Workers to Full access, so do not make an Auto-review claim without a versioned remote
-            capability. Local and SSH Workers use this app's creation service and remain accurate. */}
-        {!deviceId && (
+        {remoteWorkerPermissionModeUnsupported ? (
+          requireWorkerPermissionModeSupport ? (
+            <div
+              data-testid="worker-permission-mode"
+              className="mb-4 rounded-xl border border-[var(--border-default)] px-3.5 py-3"
+            >
+            <p className="text-12 leading-snug text-[var(--error-fg)]" role="status">
+              {t('newChat.collaboration.unsupportedRemoteHint')}
+            </p>
+            </div>
+          ) : null
+        ) : (
           <div
             data-testid="worker-permission-mode"
-            className="mb-4 flex items-center justify-between rounded-xl border border-[var(--border-default)] px-3.5 py-3"
+            className="mb-4 grid grid-cols-[minmax(0,1fr)_220px] items-center gap-4 rounded-xl border border-[var(--border-default)] px-3.5 py-3"
           >
             <span className="text-12 font-medium uppercase tracking-[0.5px] text-[var(--text-tertiary)]">
               {t('orca.createWorker.permissionLabel')}
             </span>
-            <span className="text-13 font-medium text-[var(--text-primary)]">
-              {t(`newChat.permissionSelector.modes.${agent}.auto.label`)}
-            </span>
+            <PermissionSelector
+              permissionMode={selectedWorkerPermissionMode}
+              onPermissionModeChange={(mode) =>
+                void updateWorkerPermissionMode(mode as OrcaWorkerPermissionMode)
+              }
+              vendorKey={vendorKey}
+              deviceId={deviceId}
+              triggerVariant="field"
+              dense
+              ariaContext={t('orca.createWorker.permissionLabel')}
+              allowedModes={
+                supportsWorkerPermissionModeSelection
+                  ? ORCA_WORKER_PERMISSION_MODES
+                  : AUTO_ONLY_WORKER_PERMISSION_MODES
+              }
+            />
           </div>
         )}
 

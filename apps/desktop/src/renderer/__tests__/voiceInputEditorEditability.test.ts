@@ -11,27 +11,25 @@ const chatInputSource = readFileSync(
 describe('ChatInput voice lifecycle locks', () => {
   it('keeps the editor read-only for the entire voice lifecycle', () => {
     expect(chatInputSource).toContain(
-      'const composerMutationLocked = composerEditorLocked || voiceInput.isBusy;',
+      'const composerMutationLocked = composerEditorLocked || voiceBusyOnCurrentComposer;',
     );
-    expect(chatInputSource).toContain('editor?.setEditable(!composerMutationLocked);');
+    expect(chatInputSource).toContain('editor?.setEditable(!composerTypingLocked);');
     expect(chatInputSource).toContain('if (composerMutationLockedRef.current) return true;');
-    expect(chatInputSource).toContain('active={voiceInput.isBusy}');
+    expect(chatInputSource).toContain('active={voiceBusyOnCurrentComposer}');
   });
 
   it('keeps attachments locked while leaving permission mode available', () => {
     const extraDirsStart = chatInputSource.indexOf('<ExtraDirsButton');
     expect(extraDirsStart).toBeGreaterThanOrEqual(0);
-    const extraDirsEnd = chatInputSource.indexOf('/>', extraDirsStart);
-    expect(extraDirsEnd).toBeGreaterThan(extraDirsStart);
-    const extraDirsBlock = chatInputSource.slice(extraDirsStart, extraDirsEnd);
-    expect(extraDirsBlock).toContain('disabled={composerMutationLocked}');
-
     const permissionStart = chatInputSource.indexOf('<PermissionSelector');
     expect(permissionStart).toBeGreaterThanOrEqual(0);
+    const extraDirsBlock = chatInputSource.slice(extraDirsStart, permissionStart);
+    expect(extraDirsBlock).toContain('disabled={composerMutationLocked}');
+
     const permissionEnd = chatInputSource.indexOf('/>', permissionStart);
     expect(permissionEnd).toBeGreaterThan(permissionStart);
     const permissionBlock = chatInputSource.slice(permissionStart, permissionEnd);
-    expect(permissionBlock).toContain('disabled={composerEditorLocked}');
+    expect(permissionBlock).toContain('disabled={composerEditorLocked || settingsLocked}');
     expect(permissionBlock).not.toContain('disabled={composerMutationLocked}');
   });
 
@@ -54,5 +52,6 @@ describe('ChatInput voice lifecycle locks', () => {
     expect(shortcutHandlerBlock.indexOf('[data-morph-side]')).toBeLessThan(
       voiceCancelStart,
     );
+    expect(shortcutHandlerBlock).toContain('voiceOwnsCurrentComposer');
   });
 });

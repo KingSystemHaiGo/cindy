@@ -30,12 +30,22 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
+import {
+  findSlashCommandToken,
+  leadingSlashCommandRange,
+  restoreSlashCommandRuntimeAlias,
+  slashCommandRangeCoversToken,
+} from '@cindy/maker-shared/composer-palette';
 import { cn } from '@/lib/utils';
 import { Spinner } from '@/components/ui/spinner';
 import { ListComposerTextarea } from '@/components/new-chat/ListComposerTextarea';
 import { toast } from '@/lib/toast';
 import { ApiError } from '@/lib/httpClient';
 import { rewindPreview } from '@/lib/sessionService';
+import {
+  readSendFollowCancelGeneration,
+  tryRequestFollowLatest,
+} from '@/components/chat/autoFollowIntent';
 import { commitEditAndResendWithRunningRetry } from '@/lib/editLastUserMessage';
 import type { RewindDraftImage } from '@/lib/rewindDraftAttachments';
 import type { FileRef, PastedTextRange, SlashCommandRange } from '@/lib/imageRef';
@@ -172,7 +182,14 @@ export function UserMessageEditBox({
   const doCommit = useCallback(async () => {
     try {
       const visibleTextUnchanged = text === initialText;
-      const submitText = visibleTextUnchanged ? (initialSubmitText ?? text) : text;
+      const originalWireText = initialSubmitText ?? initialText;
+      const originalHadConfirmedRange = slashCommandRangeCoversToken(
+        slashCommandRanges,
+        findSlashCommandToken(originalWireText),
+      );
+      const submitText = visibleTextUnchanged
+        ? originalWireText
+        : restoreSlashCommandRuntimeAlias(originalWireText, text, slashCommandRanges);
       const preserveQuoteMetadata = quotesEncoded && visibleTextUnchanged;
       const preservedAgentReferences =
         visibleTextUnchanged && agentReferences && agentReferences.length > 0
@@ -182,10 +199,22 @@ export function UserMessageEditBox({
         visibleTextUnchanged && pastedTextRanges && pastedTextRanges.length > 0
           ? [...pastedTextRanges]
           : undefined;
-      const preservedSlashCommandRanges =
-        visibleTextUnchanged && slashCommandRanges !== undefined
-          ? [...slashCommandRanges]
+      const rebuiltSlashRange = leadingSlashCommandRange(submitText);
+      const submitTokenIsRuntimeAlias = rebuiltSlashRange
+        ? submitText.slice(rebuiltSlashRange.start, rebuiltSlashRange.end).toLowerCase().startsWith('/skill:')
+        : false;
+      const preservedSlashCommandRanges = visibleTextUnchanged && slashCommandRanges !== undefined
+        ? [...slashCommandRanges]
+        : submitTokenIsRuntimeAlias && originalHadConfirmedRange && rebuiltSlashRange
+          ? [rebuiltSlashRange]
           : undefined;
+      const followStartGeneration = readSendFollowCancelGeneration(sessionId);
+      // 点发送就跟底。等受理会让阅读历史时的残留上翻把票作废。
+      tryRequestFollowLatest({
+        sourceSessionId: sessionId,
+        currentSessionId: sessionId,
+        startGeneration: followStartGeneration,
+      });
       if (onCommitOverride) {
         // 被拦消息:普通重发(不 rewind)。失败抛错落入下方 catch 保留编辑态。
         await onCommitOverride({
@@ -209,8 +238,6 @@ export function UserMessageEditBox({
           ...(preservedSlashCommandRanges !== undefined ? { slashCommandRanges: preservedSlashCommandRanges } : {}),
         });
       }
-      // 先归零守卫再 onSent:onSent 让父组件立刻卸载本组件,晚于它的 setState
-      // 在已卸载组件上是无效 no-op(bot review 指出的死代码顺序问题)。
       submittingRef.current = false;
       setSubmitting(false);
       onSent();
@@ -320,7 +347,7 @@ export function UserMessageEditBox({
       />
       <div className="mt-2 flex items-center justify-end gap-2">
         {rollbackFileCount !== null && rollbackFileCount > 0 && (
-          <span className="min-w-0 flex-1 truncate text-left text-[11px] text-[var(--text-tertiary)]">
+          <span className="min-w-0 flex-1 truncate text-left text-11 text-[var(--text-tertiary)]">
             {t('chat.userMessage.editRollbackHint', { count: rollbackFileCount })}
           </span>
         )}
@@ -329,7 +356,7 @@ export function UserMessageEditBox({
           onClick={onCancel}
           disabled={submitting}
           className={cn(
-            'h-7 shrink-0 rounded-full px-3 text-[12px] font-medium',
+            'h-7 shrink-0 rounded-full px-3 text-12 font-medium',
             'border border-[var(--msg-user-border)] bg-transparent',
             'text-[var(--text-secondary)]',
             'hover:bg-[var(--cmd-palette-item-hover)] transition-colors',
@@ -344,7 +371,7 @@ export function UserMessageEditBox({
           disabled={!canSend}
           className={cn(
             'inline-flex h-7 shrink-0 items-center gap-1.5 rounded-full px-3',
-            'text-[12px] font-medium',
+            'text-12 font-medium',
             'bg-[var(--accent-cta-bg)] text-[var(--accent-pure-cta-fg)]',
             'hover:opacity-90 transition-opacity',
             'disabled:opacity-40 disabled:pointer-events-none',

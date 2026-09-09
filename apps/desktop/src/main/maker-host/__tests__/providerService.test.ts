@@ -9,6 +9,38 @@ import { createProviderService } from '../provider-service.js';
 const bundledCatalog = () => BUNDLED_CATALOG;
 
 describe('createProviderService', () => {
+  it('keeps media readiness separate from subscription authorization and scopes it by provider', async () => {
+    let media = [{ providerId: 'openai', id: 'gpt-image-2' }];
+    const svc = createProviderService({
+      getCatalog: bundledCatalog,
+      connection: { xd: () => false, anthropic: () => false, openai: () => false, xai: () => false },
+      getAvailableMediaModels: () => media,
+    });
+    const providers = await svc.listProviders();
+    expect(providers.find((p) => p.id === 'openai')).toMatchObject({ connected: false, availableMediaModelIds: ['gpt-image-2'] });
+    expect(providers.find((p) => p.id === 'xd')?.availableMediaModelIds).toEqual([]);
+    media = [];
+    expect((await svc.listProviders()).find((p) => p.id === 'openai')?.availableMediaModelIds).toEqual([]);
+  });
+
+  it('keeps guest provider configuration available when optional media discovery fails', async () => {
+    let failed = true;
+    const svc = createProviderService({
+      getCatalog: bundledCatalog,
+      connection: { xd: () => false, anthropic: () => false, openai: () => false, xai: () => false },
+      getAvailableMediaModels: () => {
+        if (failed) throw new Error('art: proxy.baseUrl is required');
+        return [{ providerId: 'openai', id: 'gpt-image-2' }];
+      },
+    });
+    const providers = await svc.listProviders();
+    expect(providers.map((provider) => provider.id)).toEqual(BUNDLED_CATALOG.providers.map((provider) => provider.id));
+    expect(providers.every((provider) => !provider.connected)).toBe(true);
+    expect(providers.every((provider) => provider.availableMediaModelIds?.length === 0)).toBe(true);
+    failed = false;
+    expect((await svc.listProviders()).find((provider) => provider.id === 'openai')?.availableMediaModelIds).toEqual(['gpt-image-2']);
+  });
+
   it('lists providers with injected connection state', async () => {
     const svc = createProviderService({
       getCatalog: bundledCatalog,
@@ -102,6 +134,57 @@ describe('createProviderService', () => {
     ).toBe(true);
     expect(checkModelRoute(await svc.listProviders({ catalog: fullCatalog }), agent, capabilityModel.id, 'xd'))
       .toEqual({ kind: 'reject', reason: 'capability-model' });
+  });
+
+  it('reads a lazy full-catalog override after async connection side effects settle', async () => {
+    const anthropic = BUNDLED_CATALOG.providers.find((provider) => provider.id === 'anthropic')!;
+    const modelSeed = BUNDLED_CATALOG.providers
+      .find((provider) => provider.id === 'xd')!
+      .models['claude-code']![0]!;
+    const discoveredModel = {
+      ...modelSeed,
+      id: 'claude-first-fire',
+      name: 'Claude First Fire',
+    };
+    const freshFullCatalog = {
+      ...BUNDLED_CATALOG,
+      providers: BUNDLED_CATALOG.providers.map((provider) =>
+        provider.id === 'anthropic'
+          ? {
+              ...provider,
+              models: {
+                ...provider.models,
+                'claude-code': [discoveredModel],
+              },
+            }
+          : provider,
+      ),
+    };
+    let releaseConnection!: () => void;
+    const connectionGate = new Promise<void>((resolve) => { releaseConnection = resolve; });
+    const getFullCatalog = vi.fn(() => freshFullCatalog);
+    const svc = createProviderService({
+      // Desktop's default catalog is the user-selectable projection; policy callers need
+      // a lazy full-catalog override without capturing a pre-claim snapshot.
+      getCatalog: bundledCatalog,
+      connection: {
+        xd: () => false,
+        anthropic: async () => {
+          await connectionGate;
+          return true;
+        },
+        openai: () => false,
+        xai: () => false,
+      },
+    });
+
+    const providersPromise = svc.listProviders({ getCatalog: getFullCatalog });
+    expect(getFullCatalog).not.toHaveBeenCalled();
+    releaseConnection();
+
+    const provider = (await providersPromise).find(({ id }) => id === anthropic.id);
+    expect(getFullCatalog).toHaveBeenCalledTimes(1);
+    expect(provider?.models['claude-code']).toEqual([discoveredModel]);
   });
 
   it('supports async connection readers (codex oauth)', async () => {

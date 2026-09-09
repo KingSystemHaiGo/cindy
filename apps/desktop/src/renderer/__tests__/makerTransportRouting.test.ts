@@ -22,7 +22,9 @@ function stubElectron() {
     getContextUsage: vi.fn(),
     setExtraDirs: vi.fn(),
     closeSession: vi.fn(),
+    compactSession: vi.fn().mockResolvedValue({ tokensBefore: 100, estimatedTokensAfter: 20 }),
     enableOrca: vi.fn(),
+    dispatchOrcaUiAssignment: vi.fn(),
     disableOrca: vi.fn(),
     regenerateSessionTitle: vi.fn().mockResolvedValue({ title: 'local title' }),
     plugins: { getState: vi.fn().mockResolvedValue({ effectiveEnabled: true }) },
@@ -42,15 +44,20 @@ function stubElectron() {
   const localMessages = {
     estimatedSessionValue: vi.fn().mockResolvedValue({ totalValueUsd: 0, entries: [] }),
   };
+  const localSessions = {
+    get: vi.fn().mockRejectedValue(new Error('[NOT_FOUND] Session does not exist')),
+    update: vi.fn(),
+  };
   const invoke = vi.fn().mockResolvedValue(undefined);
+  const getState = vi.fn().mockResolvedValue({ disabledControlDeviceIds: [] });
   vi.stubGlobal('window', {
     electronAPI: {
       maker: makerSpies,
-      localDb: { orcaWorkflows, messages: localMessages },
-      deviceLink: { invoke },
+      localDb: { orcaWorkflows, messages: localMessages, sessions: localSessions },
+      deviceLink: { invoke, getState },
     },
   });
-  return { makerSpies, orcaWorkflows, localMessages, invoke };
+  return { makerSpies, orcaWorkflows, localMessages, localSessions, invoke, getState };
 }
 
 const sess = (id: string): Session => ({ id }) as unknown as Session;
@@ -70,7 +77,9 @@ describe('makerApiFor 路由(完整对等会话级操作)', () => {
     api.getContextUsage('rs', { agentKind: 'codex', workingDir: '/w', model: 'm' });
     api.setExtraDirs('rs', ['/a']);
     api.closeSession('rs');
+    api.compactSession('rs', 'focus on API design');
     api.enableOrca('rs', { workerAgent: 'codex' });
+    api.dispatchOrcaUiAssignment('rs', 'worker-1', 'Review this PR', 123, true);
     api.disableOrca('rs');
     api.input.compact(
       'rs',
@@ -89,9 +98,17 @@ describe('makerApiFor 路由(完整对等会话级操作)', () => {
     ]);
     expect(invoke).toHaveBeenCalledWith('dev-1', 'maker:set-extra-dirs', ['rs', ['/a']]);
     expect(invoke).toHaveBeenCalledWith('dev-1', 'maker:close-session', ['rs']);
+    expect(invoke).toHaveBeenCalledWith('dev-1', 'maker:compact-session', ['rs', 'focus on API design']);
     expect(invoke).toHaveBeenCalledWith('dev-1', 'maker:session:enable-orca', [
       'rs',
       { workerAgent: 'codex' },
+    ]);
+    expect(invoke).toHaveBeenCalledWith('dev-1', 'maker:worker:dispatch-ui-assignment', [
+      'rs',
+      'worker-1',
+      'Review this PR',
+      123,
+      true,
     ]);
     expect(invoke).toHaveBeenCalledWith('dev-1', 'maker:session:disable-orca', ['rs']);
     expect(invoke).toHaveBeenCalledWith('dev-1', 'maker:input:compact', [
@@ -114,6 +131,18 @@ describe('makerApiFor 路由(完整对等会话级操作)', () => {
     expect(invoke).toHaveBeenCalledWith('dev-sticky', 'maker:set-effort', ['rs', 'xhigh']);
     expect(makerSpies.setModel).not.toHaveBeenCalled();
     expect(makerSpies.setEffort).not.toHaveBeenCalled();
+  });
+
+  it('远程 compactSession 裁掉尾部 undefined，同时保留显式空 instructions', async () => {
+    const { invoke } = stubElectron();
+    const { makerApiForDevice } = await import('@/lib/makerTransport');
+    const api = makerApiForDevice('dev-wire');
+
+    await api.compactSession('rs');
+    await api.compactSession('rs', '');
+
+    expect(invoke).toHaveBeenNthCalledWith(1, 'dev-wire', 'maker:compact-session', ['rs']);
+    expect(invoke).toHaveBeenNthCalledWith(2, 'dev-wire', 'maker:compact-session', ['rs', '']);
   });
 
   it('远程 setModel 压缩 JSON 可选参数,保留中间占位且裁掉尾部 null', async () => {
@@ -241,6 +270,60 @@ describe('makerApiFor 路由(完整对等会话级操作)', () => {
     ]);
   });
 
+  it.each([
+    ['archived', { status: 'archived', pinnedAt: null }],
+    ['deleted', { status: 'deleted' }],
+  ] as const)(
+    'setStatus routes a disabled remote-id collision to the verified local row for %s',
+    async (status, expectedPatch) => {
+      const { getState, invoke, localSessions } = stubElectron();
+      const { remoteProjectsStore } = await import('@/features/device-link/remoteProjectsStore');
+      const { getStickySessionDeviceId } = await import(
+        '@/features/device-link/stickySessionOrigin'
+      );
+      const sessionService = await import('@/lib/sessionService');
+      const localRow = sess('collision');
+
+      remoteProjectsStore.setDeviceSessions('dev-disabled', 'Old desktop', [localRow]);
+      expect(getStickySessionDeviceId('collision')).toBe('dev-disabled');
+      remoteProjectsStore.removeDevice('dev-disabled');
+      getState.mockResolvedValue({ disabledControlDeviceIds: ['dev-disabled'] });
+      localSessions.get.mockResolvedValue(localRow);
+      localSessions.update.mockResolvedValue({ ...localRow, status });
+
+      await sessionService.setStatus('collision', status);
+
+      expect(getState).toHaveBeenCalledOnce();
+      expect(localSessions.get).toHaveBeenCalledWith('collision');
+      expect(localSessions.update).toHaveBeenCalledWith('collision', expectedPatch);
+      expect(invoke).not.toHaveBeenCalled();
+    },
+  );
+
+  it('setStatus keeps a disabled true remote session pinned when no local row exists', async () => {
+    const { getState, invoke, localSessions } = stubElectron();
+    const { remoteProjectsStore } = await import('@/features/device-link/remoteProjectsStore');
+    const { getStickySessionDeviceId } = await import(
+      '@/features/device-link/stickySessionOrigin'
+    );
+    const sessionService = await import('@/lib/sessionService');
+
+    remoteProjectsStore.setDeviceSessions('dev-disabled', 'Old desktop', [sess('remote-only')]);
+    expect(getStickySessionDeviceId('remote-only')).toBe('dev-disabled');
+    remoteProjectsStore.removeDevice('dev-disabled');
+    getState.mockResolvedValue({ disabledControlDeviceIds: ['dev-disabled'] });
+
+    await sessionService.setStatus('remote-only', 'archived');
+
+    expect(getState).toHaveBeenCalledOnce();
+    expect(localSessions.get).toHaveBeenCalledWith('remote-only');
+    expect(localSessions.update).not.toHaveBeenCalled();
+    expect(invoke).toHaveBeenCalledWith('dev-disabled', 'local-db:sessions:patch-meta', [
+      'remote-only',
+      { status: 'archived', pinnedAt: null },
+    ]);
+  });
+
   it('本机会话:走本地 maker,不经隧道', async () => {
     const { makerSpies, invoke } = stubElectron();
     const { makerApiFor } = await import('@/lib/makerTransport');
@@ -328,12 +411,21 @@ describe('makerApiFor 路由(完整对等会话级操作)', () => {
 
     invoke.mockClear();
     makerSpies.enableOrca.mockClear();
+    makerSpies.compactSession.mockClear();
     await makerApiForSticky('lead').enableOrca('lead', { workerAgent: 'codex' });
     expect(invoke).toHaveBeenCalledWith('dev-1', 'maker:session:enable-orca', [
       'lead',
       { workerAgent: 'codex' },
     ]);
     expect(makerSpies.enableOrca).not.toHaveBeenCalled();
+    // 手动压缩同属「误判本机会静默失败」的 mutation(greptile P1):远程 pi 压缩必须
+    // 隧道到被控端,重连窗口内不退回控制端本机 maker(本机无该 live 会话 → null)。
+    await makerApiForSticky('lead').compactSession('lead', 'focus on API design');
+    expect(invoke).toHaveBeenCalledWith('dev-1', 'maker:compact-session', [
+      'lead',
+      'focus on API design',
+    ]);
+    expect(makerSpies.compactSession).not.toHaveBeenCalled();
   });
 
   it('makerApiForSticky:从未解析过归属的本机会话仍走本机(零回归)', async () => {
@@ -343,6 +435,8 @@ describe('makerApiFor 路由(完整对等会话级操作)', () => {
     await makerApiForSticky('local-only').disableOrca('local-only');
     expect(makerSpies.disableOrca).toHaveBeenCalledWith('local-only');
     expect(invoke).not.toHaveBeenCalled();
+    await makerApiForSticky('local-only').compactSession('local-only');
+    expect(makerSpies.compactSession).toHaveBeenCalledWith('local-only');
   });
 
   // issue #1170:协同入口的项目级 collab 开关此前一律查控制端本机 —— 拿被控端的路径查

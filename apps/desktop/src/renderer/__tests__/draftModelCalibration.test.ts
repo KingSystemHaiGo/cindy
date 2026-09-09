@@ -12,6 +12,7 @@ import type { CatalogModel, ProviderView } from '@cindy/model-providers';
 import {
   calibrateDraftModel,
   pickConnectedModelForAgent,
+  pickFirstConnectedModelForAgent,
   resolveDraftSessionProviderId,
   type DraftModelCalibrationInput,
 } from '../lib/draftModelCalibration';
@@ -246,6 +247,199 @@ describe('pickConnectedModelForAgent', () => {
   });
 });
 
+describe('pickFirstConnectedModelForAgent', () => {
+  it('忽略 newSessionDefault marker,严格返回当前可选顺序的第一项', () => {
+    const first = provider(
+      'openai',
+      true,
+      { pi: [model('chatgpt/gpt-first', { sortOrder: 0 })] },
+      'subscription',
+    );
+    const marked = provider('xd', true, {
+      pi: [
+        model('deepseek/marked', {
+          sortOrder: 0,
+          newSessionDefault: ['pi'],
+        }),
+      ],
+    });
+
+    expect(pickFirstConnectedModelForAgent([first, marked], 'pi')).toEqual({
+      model: 'chatgpt/gpt-first',
+      providerId: 'openai',
+    });
+  });
+});
+
+describe('pickConnectedModelForAgent — newSessionDefault 标记优先（步骤 0）', () => {
+  it('被标记为新对话默认的模型优先，即便种子模型本身可用', () => {
+    const providers = [
+      provider('xd', true, {
+        'claude-code': [
+          model('claude-opus-5', { sortOrder: 0 }),
+          model('deepseek', { sortOrder: 44, newSessionDefault: ['claude-code'] }),
+        ],
+      }),
+    ];
+    // 种子是可用的 opus-5，但目录/服务端把 deepseek 标为新对话默认 → 落到 deepseek。
+    expect(pickId(providers, 'claude-code', 'claude-opus-5')).toBe('deepseek');
+  });
+
+  it('没有标记时行为不变：种子可用则保留', () => {
+    const providers = [
+      provider('xd', true, {
+        'claude-code': [model('claude-opus-5'), model('claude-sonnet-5')],
+      }),
+    ];
+    expect(pickId(providers, 'claude-code', 'claude-opus-5')).toBe('claude-opus-5');
+  });
+
+  it('标记只在 XD 条目上时，同 ID 来源仍按订阅优先', () => {
+    const gateway = provider('xd', true, {
+      'claude-code': [model('deepseek', { newSessionDefault: ['claude-code'] })],
+    });
+    const sub = provider(
+      'anthropic',
+      true,
+      { 'claude-code': [model('deepseek')] },
+      'subscription',
+    );
+    const picked = pickConnectedModelForAgent([gateway, sub], 'claude-code', 'seed');
+    expect(picked?.model).toBe('deepseek');
+    expect(picked?.providerId).toBe('anthropic');
+  });
+
+  it('pi accepts its explicit v3 marker', () => {
+    const providers = [
+      provider('xd', true, {
+        pi: [
+          model('claude-sonnet-5', { sortOrder: 0 }),
+          model('deepseek', { sortOrder: 44, newSessionDefault: ['pi'] }),
+        ],
+      }),
+    ];
+    expect(pickId(providers, 'pi', 'claude-sonnet-5')).toBe('deepseek');
+  });
+
+  it('pi does not borrow a claude-code default marker', () => {
+    const providers = [
+      provider('anthropic', true, {
+        pi: [
+          model('claude-sonnet-5', { sortOrder: 0 }),
+          model('claude-opus-5', { sortOrder: 44, newSessionDefault: ['claude-code'] }),
+        ],
+      }),
+    ];
+    expect(pickId(providers, 'pi', 'claude-sonnet-5')).toBe('claude-sonnet-5');
+  });
+
+  it('被标记但默认收起(defaultEnabled:false)时不选', () => {
+    const providers = [
+      provider('xd', true, {
+        'claude-code': [
+          model('visible', { sortOrder: 5 }),
+          model('hidden', {
+            sortOrder: 0,
+            defaultEnabled: false,
+            newSessionDefault: ['claude-code'],
+          }),
+        ],
+      }),
+    ];
+    expect(pickId(providers, 'claude-code', 'visible')).toBe('visible');
+  });
+
+  it('用户显式选过时，标记不覆盖用户选择', () => {
+    const providers = [
+      provider('xd', true, {
+        'claude-code': [model('my-pick'), model('deepseek', { newSessionDefault: ['claude-code'] })],
+      }),
+    ];
+    expect(
+      calibratedId({
+        providers,
+        agent: 'claude-code',
+        model: 'my-pick',
+        chosenByUser: true,
+        providersLoading: false,
+      }),
+    ).toBe('my-pick');
+  });
+
+  it('当前来源有偏好时，区域默认只在该来源内部校准，不会静默丢来源', () => {
+    const providers = [
+      provider(
+        'anthropic',
+        true,
+        {
+          'claude-code': [model('my-pick')],
+        },
+        'subscription',
+      ),
+      provider('xd', true, {
+        'claude-code': [model('deepseek', { newSessionDefault: ['claude-code'] })],
+      }),
+    ];
+    expect(
+      calibrateDraftModel({
+        providers,
+        agent: 'claude-code',
+        model: 'my-pick',
+        chosenByUser: false,
+        preferredProviderId: 'anthropic',
+        providersLoading: false,
+      }),
+    ).toEqual({ model: 'my-pick', providerId: 'anthropic' });
+  });
+
+  it('区域 marker 只在 XD 声明时，选定来源仍可承接其提供的同 ID 模型', () => {
+    const providers = [
+      provider(
+        'anthropic',
+        true,
+        {
+          'claude-code': [model('deepseek')],
+        },
+        'subscription',
+      ),
+      provider('xd', true, {
+        'claude-code': [
+          model('deepseek', { newSessionDefault: ['claude-code'] }),
+          model('old-default'),
+        ],
+      }),
+    ];
+    expect(
+      calibrateDraftModel({
+        providers,
+        agent: 'claude-code',
+        model: 'old-default',
+        chosenByUser: false,
+        preferredProviderId: 'anthropic',
+        providersLoading: false,
+      }),
+    ).toEqual({ model: 'deepseek', providerId: 'anthropic' });
+  });
+
+  it('陈旧的来源偏好不阻塞区域默认，回退完整的已连接候选', () => {
+    const providers = [
+      provider('xd', true, {
+        'claude-code': [model('deepseek', { newSessionDefault: ['claude-code'] })],
+      }),
+    ];
+    expect(
+      calibrateDraftModel({
+        providers,
+        agent: 'claude-code',
+        model: 'old-model',
+        chosenByUser: false,
+        preferredProviderId: 'disconnected-provider',
+        providersLoading: false,
+      }),
+    ).toEqual({ model: 'deepseek', providerId: 'xd' });
+  });
+});
+
 describe('calibrateDraftModel', () => {
   const base = {
     providers: [gatewayWithoutOpus, disconnectedAnthropic],
@@ -470,6 +664,25 @@ describe('校准结果要带上供应商', () => {
 });
 
 describe('resolveDraftSessionProviderId', () => {
+  it('唯一已连接来源是用户 Provider 时仍显式保留，避免 Claude 回退 Cindy gateway', () => {
+    const codingPlan = {
+      ...provider('coding-plan', true, {
+        'claude-code': [model('ark-code-latest')],
+      }),
+      source: 'user',
+    } as ProviderView;
+
+    expect(
+      resolveDraftSessionProviderId({
+        providers: [codingPlan],
+        agent: 'claude-code',
+        model: 'ark-code-latest',
+        explicitProviderId: null,
+        effectiveProviderId: 'coding-plan',
+      }),
+    ).toBe('coding-plan');
+  });
+
   it('XD 已连接但不提供当前模型时,不能省略校准选中的 Anthropic 来源(issue #1196)', () => {
     const gateway = provider('xd', true, {
       'claude-code': [model('claude-sonnet-5')],

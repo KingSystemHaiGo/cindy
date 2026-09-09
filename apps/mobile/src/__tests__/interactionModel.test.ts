@@ -164,6 +164,7 @@ describe('interactionModel', () => {
     });
 
     expect(presentation).toEqual({
+      autoReviewUnavailable: false,
       canAlwaysAllow: false,
       code: 'pnpm --filter mobile test',
       description: 'Run the requested test command.',
@@ -175,6 +176,24 @@ describe('interactionModel', () => {
       title: '允许使用 Shell?',
       toolName: 'Bash',
     });
+  });
+
+  it('localizes auto-review unavailable confirmation copy instead of the English fallback', () => {
+    const presentation = buildPermissionReviewPresentation({
+      kind: 'permission',
+      requestId: 'p-unavailable',
+      toolName: 'Bash',
+      description: 'Automatic review could not finish, so this action needs your confirmation.',
+      metadata: { autoReviewUnavailable: true },
+      input: { command: 'npx tsc --noEmit' },
+    });
+    expect(presentation.autoReviewUnavailable).toBe(true);
+
+    const interactionPanelSource = readFileSync(resolve(process.cwd(), 'src/session/InteractionPanel.tsx'), 'utf8');
+    expect(interactionPanelSource).toContain("t('interaction.permission.autoReviewUnavailable')");
+    expect(i18n.t('interaction.permission.autoReviewUnavailable')).not.toBe(
+      'interaction.permission.autoReviewUnavailable',
+    );
   });
 
   it('projects ask question review presentation through the shared mobile model', () => {
@@ -223,14 +242,16 @@ describe('interactionModel', () => {
     expect(interactionPanelSource).not.toContain('optionCheckboxMark');
   });
 
-  it('keeps issue confirmation unsupported in the mobile adapter and panel', () => {
+  it('keeps every Host-owned confirmation read-only in the mobile adapter and panel', () => {
     const interactionPanelSource = readFileSync(resolve(process.cwd(), 'src/session/InteractionPanel.tsx'), 'utf8');
 
     expect('buildIssueConfirmReviewPresentation' in mobileInteractionModel).toBe(false);
     expect('buildIssueConfirmDecision' in mobileInteractionModel).toBe(false);
     expect('normalizeIssueConfirm' in mobileInteractionModel).toBe(false);
-    expect(interactionPanelSource).toContain("if (kind === 'issue_confirm')");
-    expect(interactionPanelSource).toContain("t('interaction.panel.issueConfirmUnsupported')");
+    expect(interactionPanelSource).toContain(
+      "kind === 'issue_confirm' || kind === 'rename_sessions_confirm' || kind === 'ghost_grant_confirm'",
+    );
+    expect(interactionPanelSource).toContain("t('interaction.panel.desktopConfirmUnsupported')");
     expect(interactionPanelSource).not.toContain('buildIssueConfirmReviewPresentation');
   });
 
@@ -296,7 +317,7 @@ describe('interactionModel', () => {
   it('keeps every plugin setup phase, error code and action kind translated in all locales', async () => {
     const previous = i18n.language;
     try {
-      for (const locale of ['zh-CN', 'en', 'ja', 'ko']) {
+      for (const locale of ['zh-CN', 'zh-TW', 'en', 'ja', 'ko']) {
         await i18n.changeLanguage(locale);
         for (const phase of REMOTE_PLUGIN_SETUP_PHASES) {
           const key = `interaction.pluginSetup.phase.${phase}`;
@@ -346,7 +367,7 @@ describe('interactionModel', () => {
     expect(interactionPanelSource).toContain("t('interaction.panel.queuePositionCurrent')");
     expect(interactionPanelSource).toContain("t('interaction.panel.queuePositionNth', { index: index + 1 })");
 
-    for (const lang of ['zh-CN', 'en', 'ja', 'ko']) {
+    for (const lang of ['zh-CN', 'zh-TW', 'en', 'ja', 'ko']) {
       const bundle = JSON.parse(readFileSync(resolve(process.cwd(), `src/i18n/locales/${lang}/interaction.json`), 'utf8'));
       for (const kind of ['permission', 'ask_user_question', 'plan_review', 'issue_confirm', 'plugin_setup', 'fallback']) {
         expect(bundle.kinds?.[kind]?.title, `${lang}/${kind}.title`).toBeTruthy();
@@ -719,7 +740,7 @@ describe('interactionModel', () => {
   it('translates the collapse affordances in every locale', async () => {
     const previous = i18n.language;
     try {
-      for (const locale of ['zh-CN', 'en', 'ja', 'ko']) {
+      for (const locale of ['zh-CN', 'zh-TW', 'en', 'ja', 'ko']) {
         await i18n.changeLanguage(locale);
         for (const key of [
           'interaction.panel.collapse',
@@ -735,7 +756,7 @@ describe('interactionModel', () => {
       await i18n.changeLanguage(previous);
     }
 
-    for (const lang of ['zh-CN', 'en', 'ja', 'ko']) {
+    for (const lang of ['zh-CN', 'zh-TW', 'en', 'ja', 'ko']) {
       const bundle = JSON.parse(readFileSync(resolve(process.cwd(), `src/i18n/locales/${lang}/interaction.json`), 'utf8'));
       expect(bundle.panel?.expandPendingCard, `${lang}/panel.expandPendingCard`).toContain('{{title}}');
       // 旧的问题卡专属文案随卡内收起一起下线,不留悬空 key。

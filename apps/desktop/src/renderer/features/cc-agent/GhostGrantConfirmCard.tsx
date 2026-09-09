@@ -66,11 +66,13 @@ export function GhostGrantConfirmCard({ pending, onRespond }: GhostGrantConfirmC
       ? 'ghostGrant.confirm.descriptionAttachments'
       : pending.lane === 'dir'
         ? 'ghostGrant.confirm.descriptionDir'
-        : pending.lane === 'fs_write'
-          ? 'ghostGrant.confirm.descriptionFsWrite'
-          : pending.lane === 'workspace'
-            ? 'ghostGrant.confirm.descriptionWorkspace'
-            : 'ghostGrant.confirm.descriptionSaveDir';
+        : pending.lane === 'reveal_path'
+          ? 'ghostGrant.confirm.descriptionRevealPath'
+          : pending.lane === 'fs_write'
+            ? 'ghostGrant.confirm.descriptionFsWrite'
+            : pending.lane === 'workspace'
+              ? 'ghostGrant.confirm.descriptionWorkspace'
+              : 'ghostGrant.confirm.descriptionSaveDir';
 
   return (
     <div
@@ -82,13 +84,18 @@ export function GhostGrantConfirmCard({ pending, onRespond }: GhostGrantConfirmC
       <div className="flex items-start justify-between gap-3">
         <div>
           <p className="text-15 font-semibold leading-tight text-[var(--chat-input-text)]">
-            {t('ghostGrant.confirm.title', { name: pending.ghostName })}
+            {t(
+              pending.lane === 'reveal_path'
+                ? 'ghostGrant.confirm.titleRevealPath'
+                : 'ghostGrant.confirm.title',
+              { name: pending.ghostName },
+            )}
           </p>
           <p className="mt-1 text-12 leading-relaxed text-[var(--status-bar-meta)]">
             {t(descriptionKey)}
           </p>
         </div>
-        <span className="shrink-0 rounded-[6px] border border-[var(--chat-input-border)] px-2 py-1 text-[12px] font-medium text-[var(--status-bar-meta)]">
+        <span className="shrink-0 rounded-[6px] border border-[var(--chat-input-border)] px-2 py-1 text-12 font-medium text-[var(--status-bar-meta)]">
           {t('ghostGrant.confirm.count', { count: pending.items.length })}
         </span>
       </div>
@@ -171,7 +178,7 @@ export function GhostGrantConfirmCard({ pending, onRespond }: GhostGrantConfirmC
         >
           <Check className="size-4" />
           <span>{t('ghostGrant.confirm.allow')}</span>
-          <kbd className="rounded-[4px] border border-[var(--perm-allow-kbd-border)] bg-[var(--perm-allow-kbd-bg)] px-1.5 py-[1px] text-[11px] font-normal text-[var(--perm-allow-btn-text)] opacity-70">
+          <kbd className="rounded-[4px] border border-[var(--perm-allow-kbd-border)] bg-[var(--perm-allow-kbd-bg)] px-1.5 py-[1px] text-11 font-normal text-[var(--perm-allow-btn-text)] opacity-70">
             {window.electronAPI?.platform === 'darwin' ? '⌘↵' : 'Ctrl+Enter'}
           </kbd>
         </button>

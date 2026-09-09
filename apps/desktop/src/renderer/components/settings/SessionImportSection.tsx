@@ -445,7 +445,6 @@ function buildFilteredHint(
   if (reasons.invalidId > 0) parts.push(`${t('settings.sessionImport.summary.reasonInvalidId')} ${reasons.invalidId}`);
   if (reasons.unreadable > 0) parts.push(`${t('settings.sessionImport.summary.reasonUnreadable')} ${reasons.unreadable}`);
   if (parts.length === 0) return base;
-  // 括号与分隔符本地化:中英日韩的样式不同,不能硬编码全角括号。
   return (
     `${base}${t('settings.sessionImport.summary.reasonListOpen')}`
     + t('settings.sessionImport.summary.reasonListSource')
@@ -459,7 +458,7 @@ function ScanSummary({ scan }: { scan: ScanResult }) {
   const projectCount = scan.candidates.filter((item) => item.sidebarBucket === 'project').length;
   const dialogueCount = scan.candidates.length - projectCount;
   return (
-    <div className="grid grid-cols-2 gap-2 md:grid-cols-6">
+    <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
       <SummaryCell
         label={t('settings.sessionImport.summary.total')}
         value={scan.candidates.length}
@@ -476,18 +475,13 @@ function ScanSummary({ scan }: { scan: ScanResult }) {
         hint={t('settings.sessionImport.summary.dialogueHint')}
       />
       <SummaryCell
-        label={t('settings.sessionImport.summary.existing')}
-        value={scan.rejected.existing}
-        hint={t('settings.sessionImport.summary.existingHint')}
-      />
-      <SummaryCell
-        label={t('settings.sessionImport.summary.managedDialogue')}
-        value={scan.rejected.managedDialogue ?? 0}
-        hint={t('settings.sessionImport.summary.managedDialogueHint')}
-      />
-      <SummaryCell
         label={t('settings.sessionImport.summary.filtered')}
-        value={scan.rejected.codex + scan.rejected.claude}
+        value={
+          scan.rejected.codex
+          + scan.rejected.claude
+          + scan.rejected.existing
+          + (scan.rejected.managedDialogue ?? 0)
+        }
         hint={buildFilteredHint(scan.rejected, t)}
       />
     </div>

@@ -80,6 +80,27 @@ describe('capabilities data source', () => {
     expect(entry!.detail).toContain('https://cindy.cn');
     expect(entry!.detail).toContain('https://cindy.app');
   });
+
+  it('issue-tracker 不套固定问卷,并说明自动附加环境含 Harness / 模型 ID', () => {
+    const entry = findCapability('issue-tracker');
+    expect(entry).toBeDefined();
+    expect(entry!.detail).toContain('不套固定问卷');
+    expect(entry!.detail).toContain('Harness / 模型 ID');
+    expect(entry!.detail).toContain('提交时的任务环境');
+    expect(entry!.detail).toContain('不要声称截图已附');
+    expect(entry!.detail).toContain('不写源码级方案');
+    expect(entry!.detail).toContain('不一定是出问题的那个');
+    expect(entry!.detail).toContain('实际故障环境按需写进正文');
+  });
+
+  it('collab-mode 明确 Pi 可作本地 Lead 和 Worker，且不扩大到 SSH 远程 Pi', () => {
+    const entry = findCapability('collab-mode');
+
+    expect(entry).toBeDefined();
+    expect(entry!.detail).toContain('Claude Code / Codex / Pi 本地项目或对话 session');
+    expect(entry!.detail).toContain('也都可以作为 Worker');
+    expect(entry!.detail).toContain('SSH 远程 Lead 与 Worker 当前只支持 Claude Code / Codex');
+  });
 });
 
 describe('get_capabilities tool', () => {

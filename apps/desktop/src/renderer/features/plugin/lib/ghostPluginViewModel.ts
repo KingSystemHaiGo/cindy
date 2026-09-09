@@ -9,6 +9,7 @@
 import {
   ghostContentKeys,
   ghostPermissionItems,
+  type GhostInstallApproval,
   type GhostPermissionItem,
   type GhostTrustInfo,
   type GhostToolDecl,
@@ -34,26 +35,42 @@ export interface GhostPluginListItem {
   version: string;
   enabled: boolean;
   canUse: boolean;
+  /**
+   * Host 是否持有完整、可验证的安装记录。非 `approved` 的安装不可运行，列表与
+   * 详情都必须如实说明并给出恢复入口，而不是让它看起来只是“被关掉了”。
+   */
+  approvalState: GhostInstallApproval['state'];
+  /** 随包内置插件(main 按种子清单投影)。安装记录异常时文案与恢复入口都不同。 */
+  builtin: boolean;
   /** 声明了插件页内独占面板(panel.position:'tab'),主动作为「使用」(打开面板)。 */
   tabPanel: boolean;
+  /** 声明了应用级主视图；只用于侧边栏与详情配置，不参与插件主动作。 */
+  hasMainView: boolean;
+  /** 本地化后的主视图标题；未声明时为 null。 */
+  mainViewTitle: string | null;
+  /** 声明了由 Host 承载、但可从插件 UI 主动进入的能力。 */
+  hostCapability: 'ios-simulator' | null;
+  oauthAuthorizationExpired?: boolean;
   trust?: GhostTrustInfo;
   iconDataUrl?: string;
 }
 
 /**
- * 卡片主动作的三分法(与设计稿一致):
+ * 卡片主动作(只驱动右下角胶囊;整卡点击一律进详情):
  * - `panel`:有页签面板 → 「使用」直接打开面板;
  * - `command`:只有 $指令 → 「对话」把指令插进输入框起话题;
- * - `manage`:纯工具型(Agent 对话中自动调用)→ 无主按钮,点卡片进管理页。
+ * - `capability`:Host 承载的能力 → 「对话」进入该能力的工作流;
+ * - `manage`:纯工具型(Agent 对话中自动调用)→ 无主按钮。
  * 停靠形态(left/right)的面板由布局树承载,不算 panel 主动作。
  */
-export type GhostPrimaryAction = 'panel' | 'command' | 'manage';
+export type GhostPrimaryAction = 'panel' | 'command' | 'capability' | 'manage';
 
 export function ghostPrimaryAction(
-  item: Pick<GhostPluginListItem, 'tabPanel' | 'canUse'>,
+  item: Pick<GhostPluginListItem, 'tabPanel' | 'canUse' | 'hostCapability'>,
 ): GhostPrimaryAction {
   if (item.tabPanel) return 'panel';
   if (item.canUse) return 'command';
+  if (item.hostCapability) return 'capability';
   return 'manage';
 }
 export interface GhostPluginDetail extends GhostPluginListItem {
@@ -73,8 +90,8 @@ export interface GhostPluginDetail extends GhostPluginListItem {
 /**
  * 展示投影只覆盖用户能看到的四个字段；运行时仍完全来自本地安装包。
  *
- * `iconDataUrl` 是有意要求存在的字段：市场项的 `icon: null` 也必须覆盖本地
- * 包图标，而不是因为缺少 URL 又显示旧图标。
+ * `iconDataUrl` 是有意要求存在的字段：服务端市场项的 `icon: null` 仍覆盖本地
+ * 包图标。Git 市场是窄例外：精确匹配到已安装版本时，可复用安装包里已验证的图标。
  */
 export interface GhostPluginMarketPresentation {
   name: string;
@@ -89,11 +106,18 @@ export interface GhostPluginMarketPresentation {
  * market item, or a pending version update must keep using its local manifest.
  */
 export function marketPresentationForInstalledGhost(
-  ghost: Pick<InstalledGhost, 'manifest'>,
+  ghost: Pick<InstalledGhost, 'manifest' | 'iconDataUrl'>,
   marketItem:
     | Pick<
         PluginMarketItem,
-        'ghostId' | 'installState' | 'version' | 'name' | 'description' | 'author' | 'icon'
+        | 'ghostId'
+        | 'installState'
+        | 'version'
+        | 'name'
+        | 'description'
+        | 'author'
+        | 'icon'
+        | 'sourceType'
       >
     | null
     | undefined,
@@ -110,7 +134,10 @@ export function marketPresentationForInstalledGhost(
     name: marketItem.name,
     description: marketItem.description ?? '',
     author: marketItem.author,
-    iconDataUrl: marketItem.icon?.url,
+    iconDataUrl:
+      marketItem.sourceType === 'git-market' && !marketItem.icon
+        ? ghost.iconDataUrl
+        : marketItem.icon?.url,
   };
 }
 
@@ -142,9 +169,7 @@ export function filterGhostPluginItems<T extends GhostPluginListItem>(
 ): T[] {
   const normalizedQuery = query.trim().toLocaleLowerCase();
   return items.filter((item) =>
-    `${item.name} ${item.description} ${item.id}`
-      .toLocaleLowerCase()
-      .includes(normalizedQuery),
+    `${item.name} ${item.description} ${item.id}`.toLocaleLowerCase().includes(normalizedQuery),
   );
 }
 
@@ -251,7 +276,13 @@ export function toGhostPluginListItem(
     version: manifest.version,
     enabled: ghost.enabled,
     canUse: Boolean(manifest.command),
+    approvalState: ghost.approval.state,
+    builtin: ghost.builtin === true,
     tabPanel: manifest.panel?.position === 'tab',
+    hasMainView: manifest.mainView !== undefined,
+    mainViewTitle: manifest.mainView ? (manifest.mainView.title ?? manifest.name) : null,
+    hostCapability: manifest.iosSimulator === true ? 'ios-simulator' : null,
+    oauthAuthorizationExpired: ghost.oauthAuthorizationExpired !== undefined,
     trust: ghost.trust ?? {
       level: 'unverified',
       publisherSigned: false,
@@ -275,7 +306,7 @@ export function toGhostPluginDetail(
   return {
     ...listItem,
     trust: listItem.trust!,
-    author: presentation ? presentation.author : manifest.author ?? null,
+    author: presentation ? presentation.author : (manifest.author ?? null),
     contents: ghostContentKeys(manifest),
     permissions: ghostPermissionItems(manifest),
     tools: manifest.tools ?? [],
@@ -290,14 +321,14 @@ export function toGhostPluginDetail(
 }
 
 /**
- * 插件页内面板宿主的数据归属键。
+ * 插件可见 WebView 宿主的数据归属键（panel / main-view 共用）。
  *
  * 面板承载的是 webview,里面可能存着账号 A 的登录态、表单、已加载数据。
  * 两个账号装了**同 id、同版本、同入口**的插件时,只按 ghostId 做宿主 key
  * 会让 React 复用同一实例——切到账号 B 后 A 的 DOM 与内存态原样留着。
- * 所以 key 必须含 owner 代际:换身份即卸载重建。
+ * 所以 key 必须含 owner 身份:换身份即卸载重建。
  */
-export function ghostPanelOwnerKey(
+export function ghostWebviewOwnerKey(
   mode: 'signed-out' | 'local' | 'cloud',
   dataOwnerId: string | null,
 ): string {

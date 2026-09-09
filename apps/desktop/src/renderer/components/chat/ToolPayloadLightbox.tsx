@@ -31,6 +31,7 @@ import { Tooltip } from '@/components/ui/tooltip';
 
 import { DiffView } from './DiffView';
 import { MarkdownDiffBlock } from './MarkdownDiffBlock';
+import type { DiffDetails } from '@/lib/agent-actions/diffStats';
 import { isRemoteFileOrigin } from '@/lib/sessionFileOrigin';
 import { resolveToolFilePath } from '@/lib/localPathResolver';
 import { revealRemoteChatFile } from '@/lib/remoteFileOpen';
@@ -42,6 +43,8 @@ export type ToolDiffSegment =
       oldString: string;
       newString: string;
       label?: string;
+      /** Pair-level analysis shared with the compact row when available. */
+      analysis?: DiffDetails;
     }
   | {
       key: string;
@@ -53,6 +56,9 @@ export interface ToolDiffFile {
   key: string;
   filePath: string;
   diffs: ToolDiffSegment[];
+  /** Full source segments used by Copy; rendering may be bounded separately. */
+  copyDiffs?: ToolDiffSegment[];
+  omittedDiffCount?: number;
 }
 
 export type ToolPayloadMode =
@@ -103,9 +109,7 @@ export function ToolPayloadLightbox({
   // 会话文件来源:remote 时 diff 的"定位文件"改为下载缓存副本后定位。
   const fileCtx = useChatSessionFile();
   const [isVisible, setIsVisible] = useState(false);
-  const [draftText, setDraftText] = useState(() =>
-    payload.kind === 'text' ? payload.text : '',
-  );
+  const [draftText, setDraftText] = useState(() => (payload.kind === 'text' ? payload.text : ''));
   const isClosingRef = useRef(false);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const isEditingText = payload.kind === 'text' && textEdit !== undefined;
@@ -134,14 +138,36 @@ export function ToolPayloadLightbox({
     return () => cancelAnimationFrame(raf);
   }, []);
 
-  // Editable text opens with the primary input focused, per the dialog focus contract.
+  // Text payloads own focus while open so the native Edit > Select All command
+  // stays scoped to the pasted text instead of selecting the conversation behind it.
   useEffect(() => {
-    if (!isEditingText) return;
+    if (payload.kind !== 'text') return;
     const textarea = textareaRef.current;
     if (!textarea) return;
-    textarea.focus();
-    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
-  }, [isEditingText]);
+    textarea.focus({ preventScroll: true });
+    const caretPosition = isEditingText ? textarea.value.length : 0;
+    textarea.setSelectionRange(caretPosition, caretPosition);
+  }, [isEditingText, payload.kind]);
+
+  useEffect(() => {
+    if (payload.kind !== 'text') return;
+    const handler = (event: KeyboardEvent) => {
+      if (event.key.toLowerCase() !== 'a' || event.altKey || event.shiftKey) return;
+      const isMac = window.electronAPI?.platform === 'darwin';
+      const primaryModifier = isMac ? event.metaKey : event.ctrlKey;
+      const secondaryModifier = isMac ? event.ctrlKey : event.metaKey;
+      if (!primaryModifier || secondaryModifier || event.isComposing) return;
+
+      const textarea = textareaRef.current;
+      if (!textarea) return;
+      event.preventDefault();
+      event.stopPropagation();
+      textarea.focus({ preventScroll: true });
+      textarea.select();
+    };
+    document.addEventListener('keydown', handler, true);
+    return () => document.removeEventListener('keydown', handler, true);
+  }, [payload.kind]);
 
   const handleSaveText = useCallback(() => {
     if (!textEdit || payload.kind !== 'text') return;
@@ -180,7 +206,9 @@ export function ToolPayloadLightbox({
   async function copyTitle() {
     try {
       await navigator.clipboard.writeText(fullTitle);
-      toast.success(payload.kind === 'diff' ? t('chat.lightbox.pathCopied') : t('chat.lightbox.copied'));
+      toast.success(
+        payload.kind === 'diff' ? t('chat.lightbox.pathCopied') : t('chat.lightbox.copied'),
+      );
     } catch {
       toast.error(t('chat.media.copyFailed'));
     }
@@ -193,11 +221,12 @@ export function ToolPayloadLightbox({
         text = payload.files
           .map((file) => {
             const fileHead = payload.files.length > 1 ? `--- ${file.filePath} ---\n` : '';
-            const body = file.diffs
+            const copiedDiffs = file.copyDiffs ?? file.diffs;
+            const body = copiedDiffs
               .map((diff, index) => {
                 const diffHead =
-                  file.diffs.length > 1
-                    ? `--- ${diff.label ?? `Edit ${index + 1}/${file.diffs.length}`} ---\n`
+                  copiedDiffs.length > 1
+                    ? `--- ${diff.label ?? `Edit ${index + 1}/${copiedDiffs.length}`} ---\n`
                     : '';
                 if ('rawDiff' in diff) return `${diffHead}${diff.rawDiff}`;
                 return `${diffHead}--- old\n${diff.oldString}\n+++ new\n${diff.newString}`;
@@ -305,7 +334,7 @@ export function ToolPayloadLightbox({
                 <FileText size={16} className="shrink-0 text-[var(--msg-tool-card-chevron)]" />
                 <span
                   className={cn(
-                    'font-semibold text-[14px]',
+                    'font-semibold text-14',
                     'text-[var(--msg-tool-card-text)]',
                     'truncate',
                   )}
@@ -315,7 +344,9 @@ export function ToolPayloadLightbox({
               </button>
             </Tooltip.Trigger>
             <Tooltip.Content>
-              {payload.kind === 'diff' ? t('chat.lightbox.clickToCopyPath') : t('chat.lightbox.clickToCopy')}
+              {payload.kind === 'diff'
+                ? t('chat.lightbox.clickToCopyPath')
+                : t('chat.lightbox.clickToCopy')}
             </Tooltip.Content>
           </Tooltip.Root>
 
@@ -377,7 +408,7 @@ export function ToolPayloadLightbox({
         <div
           className={cn(
             'flex-1 px-5 py-4 select-text',
-            isEditingText ? 'flex overflow-hidden' : 'overflow-auto',
+            payload.kind === 'text' ? 'flex overflow-hidden' : 'overflow-auto',
             'text-[var(--msg-tool-card-text)]',
           )}
         >
@@ -392,13 +423,13 @@ export function ToolPayloadLightbox({
                   {payload.files.length > 1 && (
                     <div
                       title={file.filePath}
-                      className="truncate text-[14px] font-medium text-[var(--msg-tool-card-text)]"
+                      className="truncate text-14 font-medium text-[var(--msg-tool-card-text)]"
                     >
                       {basename(file.filePath)}
                     </div>
                   )}
                   {file.diffs.length === 0 ? (
-                    <span className="text-[13px] text-[var(--msg-tool-card-chevron)]">
+                    <span className="text-13 text-[var(--msg-tool-card-chevron)]">
                       {t('chat.agentActionRow.noContent')}
                     </span>
                   ) : (
@@ -416,41 +447,50 @@ export function ToolPayloadLightbox({
                         {'rawDiff' in diff ? (
                           <MarkdownDiffBlock raw={diff.rawDiff} />
                         ) : (
-                          <DiffView oldString={diff.oldString} newString={diff.newString} />
+                          <DiffView
+                            oldString={diff.oldString}
+                            newString={diff.newString}
+                            analysis={diff.analysis}
+                          />
                         )}
                       </div>
                     ))
                   )}
+                  {file.omittedDiffCount ? (
+                    <span
+                      data-diff-omitted-count={file.omittedDiffCount}
+                      className="text-12 text-[var(--msg-tool-card-chevron)]"
+                      aria-label={t('chat.lightbox.omittedDiffSegments', {
+                        count: file.omittedDiffCount,
+                      })}
+                    >
+                      {t('chat.lightbox.omittedDiffSegments', {
+                        count: file.omittedDiffCount,
+                      })}
+                    </span>
+                  ) : null}
                 </div>
               ))}
             </div>
           )}
 
-          {payload.kind === 'text' &&
-            (isEditingText ? (
-              <textarea
-                ref={textareaRef}
-                value={draftText}
-                onChange={(event) => setDraftText(event.target.value)}
-                spellCheck={false}
-                className={cn(
-                  'h-full min-h-0 w-full resize-none rounded-lg border',
-                  'border-[var(--msg-code-block-border)] bg-[var(--msg-code-block-bg)]',
-                  'p-3 font-mono text-[length:calc(var(--app-code-font-size)_-_1px)] leading-[1.5]',
-                  'text-[var(--msg-tool-card-text)] outline-none',
-                )}
-              />
-            ) : (
-              <pre
-                className={cn(
-                  'overflow-x-auto rounded-[12px] border border-[var(--msg-code-block-border)]',
-                  'bg-[var(--msg-code-block-bg)] p-3 font-mono text-[length:calc(var(--app-code-font-size)_-_1px)] leading-[1.5]',
-                  'text-[var(--msg-tool-card-text)] select-text whitespace-pre-wrap break-words',
-                )}
-              >
-                {payload.text}
-              </pre>
-            ))}
+          {payload.kind === 'text' && (
+            <textarea
+              ref={textareaRef}
+              aria-label={payload.title}
+              value={isEditingText ? draftText : payload.text}
+              onChange={isEditingText ? (event) => setDraftText(event.target.value) : undefined}
+              readOnly={!isEditingText}
+              spellCheck={false}
+              wrap="soft"
+              className={cn(
+                'h-full min-h-0 w-full resize-none rounded-lg border',
+                'border-[var(--msg-code-block-border)] bg-[var(--msg-code-block-bg)]',
+                'p-3 font-mono text-[length:calc(var(--app-code-font-size)_-_1px)] leading-[1.5]',
+                'text-[var(--msg-tool-card-text)] outline-none',
+              )}
+            />
+          )}
 
           {payload.kind === 'json' && (
             <div className="flex flex-col gap-4">
@@ -499,7 +539,7 @@ export function ToolPayloadLightbox({
               type="button"
               onClick={handleClose}
               className={cn(
-                'h-8 rounded-full border px-4 text-[12px] font-medium',
+                'h-8 rounded-full border px-4 text-12 font-medium',
                 'border-[var(--border-default)] bg-[var(--surface-elevated)]',
                 'text-[var(--text-secondary)] hover:bg-[var(--surface-hover)] transition-colors',
                 'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-soft)]',
@@ -511,7 +551,7 @@ export function ToolPayloadLightbox({
               type="button"
               onClick={handleSaveText}
               className={cn(
-                'h-8 rounded-full px-4 text-[12px] font-medium',
+                'h-8 rounded-full px-4 text-12 font-medium',
                 'bg-[var(--accent-cta-bg)] text-[var(--accent-pure-cta-fg)]',
                 'hover:opacity-90 transition-opacity',
                 'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-soft)]',
@@ -536,7 +576,7 @@ export function ToolPayloadLightbox({
         >
           Esc
         </span>
-        <span className="text-12 text-white/40">or click backdrop to close</span>
+        <span className="text-12 text-white/40">{t('chat.textLightbox.closeHint')}</span>
       </div>
     </div>
   );

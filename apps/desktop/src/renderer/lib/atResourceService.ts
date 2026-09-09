@@ -27,6 +27,7 @@ export type AtResourceType =
   | 'browser-tab'
   | 'desktop-window'
   | 'session'
+  | 'bot'
   | 'plugin-command'
   | 'plugin-resource';
 
@@ -517,6 +518,10 @@ export async function scanAtResources(
  *
  * Length tiebreak: shorter names score slightly higher (closer to prefix).
  */
+export function scoreAtResourceItem(item: AtResourceItem, q: string): number {
+  return scoreItem(item, q);
+}
+
 function scoreItem(item: AtResourceItem, q: string): number {
   if (!q) return 1; // empty query = everything matches with baseline score
   const name = item._nameLower ?? item.name.toLowerCase();

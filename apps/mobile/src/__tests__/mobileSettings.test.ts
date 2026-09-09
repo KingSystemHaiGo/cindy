@@ -15,6 +15,82 @@ const readTextLf = (...args: Parameters<typeof readFileSync>): string =>
   String(readFileSync(...args)).replace(/\r\n/g, '\n');
 
 describe('mobile settings overview', () => {
+  it('surfaces durable logout failures instead of dropping the promise', () => {
+    const settingsSource = readTextLf(
+      resolve(process.cwd(), 'app/settings.tsx'),
+      'utf8',
+    );
+    const logoutStart = settingsSource.indexOf('const logout = useCallback');
+    const logoutBody = settingsSource.slice(
+      logoutStart,
+      settingsSource.indexOf('const switchDevServerEnvironment', logoutStart),
+    );
+
+    expect(logoutBody).toContain('await auth.logout();');
+    expect(logoutBody).toContain("t('devices.list.alert.actionFailed')");
+    expect(logoutBody).toContain('formatRemoteError(error)');
+  });
+
+  it('renders language as one expandable picker instead of a fixed option list', () => {
+    const source = readTextLf(resolve(process.cwd(), 'app/settings.tsx'), 'utf8');
+
+    expect(source).toContain('testID="settings.language.picker"');
+    expect(source).toContain('<SheetModal');
+    expect(source).toContain('<MobileChoicePickerList');
+    expect(source).not.toContain('LanguageOptionRow');
+  });
+
+  it('shows the server switch only in CindyDev and clears the old session before reloading', () => {
+    const settingsSource = readTextLf(
+      resolve(process.cwd(), 'app/settings.tsx'),
+      'utf8',
+    );
+    const environmentSource = readTextLf(
+      resolve(process.cwd(), 'src/config/devServerEnvironment.ts'),
+      'utf8',
+    );
+    const switchStart = settingsSource.indexOf(
+      'const switchDevServerEnvironment = useCallback(',
+    );
+    const logoutIndex = settingsSource.indexOf(
+      'await auth.logout();',
+      switchStart,
+    );
+    const reloadUnavailableIndex = settingsSource.indexOf(
+      'if (!reload) {',
+      switchStart,
+    );
+    const transactionalReloadIndex = settingsSource.indexOf(
+      'await switchDevServerEnvironmentAndReload({',
+      switchStart,
+    );
+    const reloadIndex = settingsSource.indexOf(
+      '? () => DevSettings.reload()',
+      switchStart,
+    );
+
+    expect(settingsSource).toContain(
+      '...(DEV_SERVER_ENVIRONMENT_SWITCH_ENABLED',
+    );
+    expect(settingsSource).toContain(
+      'testID="settings.devServerEnvironment"',
+    );
+    expect(environmentSource).toContain(
+      "process.env.EXPO_PUBLIC_CINDY_AUTH_REGION === 'dev'",
+    );
+    expect(environmentSource).not.toContain('TextInput');
+    expect(switchStart).toBeGreaterThan(-1);
+    expect(reloadUnavailableIndex).toBeGreaterThan(switchStart);
+    expect(reloadUnavailableIndex).toBeLessThan(logoutIndex);
+    expect(logoutIndex).toBeGreaterThan(switchStart);
+    expect(transactionalReloadIndex).toBeGreaterThan(logoutIndex);
+    expect(reloadIndex).toBeGreaterThan(switchStart);
+    expect(reloadIndex).toBeLessThan(reloadUnavailableIndex);
+    expect(settingsSource).not.toContain(
+      'settings.devServerEnvironment.restartRequired',
+    );
+  });
+
   it('keeps the device-link hello name and settings device name on one source', () => {
     expect(buildMobileDeviceName({ constantsDeviceName: ' Carol iPhone ', platform: 'ios' })).toBe('Carol iPhone');
     expect(buildMobileDeviceName({ constantsDeviceName: '   ', platform: 'android' })).toBe('Cindy android');
@@ -170,6 +246,26 @@ describe('mobile settings overview', () => {
     expect(source).not.toContain('clearManualName');
   });
 
+  it('hydrates the voice dictionary after the async desktop list arrives', () => {
+    const source = readTextLf(resolve(process.cwd(), 'app/settings.tsx'), 'utf8');
+    const dictionaryEffectIndex = source.indexOf(
+      'if (!dictionaryScreenOpen || desktopDevices.length === 0) return;',
+    );
+    const dictionaryOpenIndex = source.indexOf('const openVoiceDictionary = useCallback(() => {');
+    const hydrateIndex = source.indexOf(
+      'Promise.all(desktopDevices.map((host) => hydrateMobileVoiceDictionary(host.deviceId)))',
+      dictionaryEffectIndex,
+    );
+
+    expect(dictionaryEffectIndex).toBeGreaterThan(-1);
+    expect(dictionaryOpenIndex).toBeGreaterThan(-1);
+    expect(hydrateIndex).toBeGreaterThan(dictionaryEffectIndex);
+    expect(source).toContain('[desktopDevices, dictionaryScreenOpen, refreshVoiceDictionary]');
+    expect(source).toContain('[desktopDevices, invoke]');
+    expect(source).not.toContain('[desktopDevices, deviceLink]');
+    expect(source).toContain('subscribeMobileVoiceDictionaryCache(() => {');
+  });
+
   it('always shows privacy policy + user agreement (regional links via legalLinks) above the cn-only App filing number', () => {
     const source = readTextLf(resolve(process.cwd(), 'app/settings.tsx'), 'utf8');
     const filingCardIndex = source.indexOf("<SettingsGroup title={t('settings.legal.sectionTitle')}>");
@@ -208,6 +304,9 @@ describe('mobile settings overview', () => {
     expect(source).not.toContain('settings.checkBundleUpdateButton');
     expect(source).not.toContain('testID="settings.bundleUpdate"');
     expect(source).toContain('runManualUpdateCheck({');
+    expect(source).toContain('...(IS_OTA_SELFHOST');
+    expect(source).toContain('withOtaClient: (operation) => runSelfHostedOtaRequest(');
+    expect(source).toContain(': { isConsented: hasPrivacyConsent })');
     expect(source).toContain('isTestFlightBuild: IS_TESTFLIGHT_BUILD');
     expect(source).toContain('const updateCheckEnabled = bundleCheckEnabled || updatesEnabled');
     expect(source).toContain('checkBundleUpdate: bundleCheckEnabled ? checkBundleUpdate : undefined');
@@ -221,6 +320,11 @@ describe('mobile settings overview', () => {
     expect(source).toContain("testID=\"settings.testFlightUpdateHint\"");
     expect(source).toContain("{t('settings.version.testFlightUpdateManaged')}");
     expect(source).toContain("{t('settings.version.bundleVersion', { version: appVersion })}");
+    expect(source).toContain('const showBetaBadge = betaReady && betaEnabled;');
+    expect(source).toContain('testID="settings.betaChannelBadge"');
+    expect(source).toContain("{t('settings.betaChannel.badge')}");
+    expect(source).toContain('backgroundColor: colors.betaChannelBadgeBackground');
+    expect(source).toContain('color: colors.betaChannelBadgeForeground');
     expect(source).toContain(
       "testID=\"settings.otaVersion\">{t('settings.version.otaVersion', { version: otaVersion })}",
     );
@@ -230,5 +334,15 @@ describe('mobile settings overview', () => {
     expect(source).not.toContain("'settings.version.desktopVersion'");
     expect(i18n.t('settings.version.pairedDesktopVersion', { version: '0.1.18' }))
       .toBe('配套桌面版本 0.1.18');
+  });
+
+  it('整包版本读原生真值 APP_BINARY_VERSION,不读会被 OTA 覆盖的 expoConfig.version', () => {
+    const source = readTextLf(resolve(process.cwd(), 'app/settings.tsx'), 'utf8');
+
+    // 整包版本必须取原生烧进的 CFBundleShortVersionString / versionName(APP_BINARY_VERSION),
+    // 热更后不漂移;绝不能读 Constants.expoConfig.version —— 它会被 OTA manifest 内嵌的
+    // expoClient.version(打热更时主仓 app.json 的旧值)覆盖,导致整包版本回退。
+    expect(source).toContain("const appVersion = APP_BINARY_VERSION || '0.0.0';");
+    expect(source).not.toContain("const appVersion = Constants.expoConfig?.version");
   });
 });

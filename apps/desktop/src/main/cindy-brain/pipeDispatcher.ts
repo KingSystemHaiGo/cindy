@@ -28,6 +28,7 @@ import type {
 } from '../../shared/ghost.js';
 import { GHOST_PIPE_CALL_MAX_TOTAL_MS, isGhostPluginErrorCode } from '../../shared/ghost.js';
 import type { GhostRuntimeState } from './runtime/GhostRuntime.js';
+import { isGhostOwnerScopeUsable, type GhostOwnerScope } from './ghostOwnerScope.js';
 
 export interface PipeDispatcherDeps {
   /** 按 id 取已装意识(未装 → null)。 */
@@ -38,6 +39,7 @@ export interface PipeDispatcherDeps {
   spawn(ghost: InstalledGhost): Promise<{ ok: true } | { ok: false; reason: string }>;
   /** 把下行消息发到该意识的电子脑逻辑页;false = 逻辑页不在线。 */
   sendToGhost(ghostId: string, payload: GhostPipeToolCall): boolean;
+  ownerScope?: GhostOwnerScope;
   /** 单次调用超时(默认 330s,见 DEFAULT_TIMEOUT_MS 注释)。 */
   timeoutMs?: number;
   setTimeoutFn?: typeof setTimeout;
@@ -48,9 +50,20 @@ export interface PipeDispatcherDeps {
   };
 }
 
+interface PendingBindingClaim {
+  callerTool: string;
+  requestKey: string;
+  attempts: number;
+  active: boolean;
+  consumed: boolean;
+}
+
 interface PendingCall {
   ghostId: string;
   tool: string;
+  ownerScopeSnapshot: unknown;
+  /** 宿主能力按用途绑定，允许同请求一次受控重试，禁止换参或无限消费。 */
+  claimedBindings: Map<string, PendingBindingClaim>;
   resolve: (result: GhostToolCallResult) => void;
   timer: ReturnType<typeof setTimeout> | undefined;
   /** 派发时刻(续命天花板从这里起算)。 */
@@ -115,6 +128,13 @@ export class GhostPipeDispatcher {
     return this.pending.size;
   }
 
+  hasPendingCallsFor(ghostId: string): boolean {
+    for (const entry of this.pending.values()) {
+      if (entry.ghostId === ghostId) return true;
+    }
+    return false;
+  }
+
   /**
    * 派活主入口(ghost 总机的 callGhostTool 回调)。
    * 永不 reject——一切失败都折叠成结构化 GhostToolCallResult。
@@ -148,6 +168,12 @@ export class GhostPipeDispatcher {
     if (this.deps.runtimeStateOf(ghostId) === 'fused') {
       return { ok: false, errorCode: 'GHOST_CRASHED', message: `插件 ${ghostId} 已熔断(反复崩溃),重载或重新启用后再试` };
     }
+    let ownerScopeSnapshot: unknown;
+    try {
+      ownerScopeSnapshot = this.deps.ownerScope?.capture();
+    } catch {
+      return this.ownerBoundaryResult();
+    }
 
     // ── 按需拉起 ────────────────────────────────────────────────────────
     if (this.deps.runtimeStateOf(ghostId) !== 'running') {
@@ -155,6 +181,9 @@ export class GhostPipeDispatcher {
       if (!spawned.ok) {
         return { ok: false, errorCode: 'GHOST_CRASHED', message: `插件启动失败:${spawned.reason}` };
       }
+    }
+    if (!this.ownerScopeUsable(ghostId, ownerScopeSnapshot)) {
+      return this.ownerBoundaryResult();
     }
 
     // ── 派发 + 配对等待 ────────────────────────────────────────────────
@@ -167,6 +196,8 @@ export class GhostPipeDispatcher {
       const entry: PendingCall = {
         ghostId,
         tool,
+        ownerScopeSnapshot,
+        claimedBindings: new Map(),
         resolve,
         timer: undefined,
         startedAt,
@@ -178,11 +209,82 @@ export class GhostPipeDispatcher {
       this.pending.set(callId, entry);
       this.armTimer(callId, entry);
 
+      if (!this.ownerScopeUsable(ghostId, ownerScopeSnapshot)) {
+        this.settle(callId, this.ownerBoundaryResult());
+        return;
+      }
       if (!this.deps.sendToGhost(ghostId, payload)) {
         // 逻辑页不在线(拉起后瞬时死亡等):立即收卷。
         this.settle(callId, { ok: false, errorCode: 'GHOST_CRASHED', message: '电子脑离线,派发失败' });
       }
     });
+  }
+
+  /**
+   * 认领真实在途 tool-call 的宿主能力绑定。
+   *
+   * callerTool 必须与派发器事实表逐字匹配；同一 binding 只允许同 requestKey
+   * 在暂态失败后重试一次，禁止换查询借用同一 callId 或无限消费付费通道。
+   */
+  claimPendingCall(
+    ghostId: string,
+    callId: string,
+    callerTool: string,
+    binding: string,
+    requestKey: string,
+  ): boolean {
+    const entry = this.pending.get(callId);
+    if (!entry || entry.ghostId !== ghostId || entry.tool !== callerTool) return false;
+    const existing = entry.claimedBindings.get(binding);
+    if (!existing) {
+      entry.claimedBindings.set(binding, {
+        callerTool,
+        requestKey,
+        attempts: 1,
+        active: true,
+        consumed: false,
+      });
+      return true;
+    }
+    if (
+      existing.callerTool !== callerTool ||
+      existing.requestKey !== requestKey ||
+      existing.active ||
+      existing.consumed ||
+      existing.attempts >= 2
+    ) {
+      return false;
+    }
+    existing.attempts += 1;
+    existing.active = true;
+    return true;
+  }
+
+  /** 收束一次能力尝试；仅首次暂态失败可重新认领同一请求。 */
+  settlePendingCallClaim(
+    ghostId: string,
+    callId: string,
+    callerTool: string,
+    binding: string,
+    requestKey: string,
+    allowRetry: boolean,
+  ): boolean {
+    const entry = this.pending.get(callId);
+    const claim = entry?.claimedBindings.get(binding);
+    if (
+      !entry ||
+      entry.ghostId !== ghostId ||
+      entry.tool !== callerTool ||
+      !claim ||
+      claim.callerTool !== callerTool ||
+      claim.requestKey !== requestKey ||
+      !claim.active
+    ) {
+      return false;
+    }
+    claim.active = false;
+    if (!allowRetry || claim.attempts >= 2) claim.consumed = true;
+    return true;
   }
 
   /** 基础超时档(注入值钳到天花板内,保证初始 deadline 不越过绝对上限)。 */
@@ -283,6 +385,10 @@ export class GhostPipeDispatcher {
     if (entry.ghostId !== senderGhostId) {
       return { accepted: false, reason: '不是你的卷子' };
     }
+    if (!this.ownerScopeUsable(senderGhostId, entry.ownerScopeSnapshot)) {
+      this.settle(p.callId, this.ownerBoundaryResult());
+      return { accepted: false, reason: '账号边界已变化' };
+    }
     if (entry.timeoutExtensionsAllowed) {
       this.extendDeadline(p.callId, entry, Date.now() + entry.baseTimeoutMs);
     }
@@ -317,6 +423,10 @@ export class GhostPipeDispatcher {
         actual: senderGhostId,
       });
       return { accepted: false, reason: '不是你的卷子' };
+    }
+    if (!this.ownerScopeUsable(senderGhostId, entry.ownerScopeSnapshot)) {
+      this.settle(p.callId, this.ownerBoundaryResult());
+      return { accepted: false, reason: '账号边界已变化' };
     }
     const result: GhostToolCallResult = p.ok
       ? { ok: true, result: p.result ?? null }
@@ -361,5 +471,19 @@ export class GhostPipeDispatcher {
       totalMs: Date.now() - entry.startedAt,
     });
     entry.resolve(result);
+  }
+
+  private ownerScopeUsable(ghostId: string, captured: unknown): boolean {
+    if (isGhostOwnerScopeUsable(this.deps.ownerScope, captured)) return true;
+    this.deps.ownerScope?.onInvalidated?.(ghostId);
+    return false;
+  }
+
+  private ownerBoundaryResult(): GhostToolCallResult {
+    return {
+      ok: false,
+      errorCode: 'GHOST_ASLEEP',
+      message: 'Plugin owner boundary changed before dispatch; retry after the active session settles.',
+    };
   }
 }

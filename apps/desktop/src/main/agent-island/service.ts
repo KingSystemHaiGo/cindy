@@ -10,6 +10,11 @@ import {
 } from '@cindy/maker-core';
 import type { SchedulerEvent } from '@cindy/maker-scheduler';
 import { BRAND_NAME } from '@cindy/maker-shared/branding';
+import {
+  projectSessionActivity,
+  type SessionActivitySnapshot,
+  type SessionActivityTransition,
+} from '@cindy/maker-shared/session-activity';
 import { isDefaultDraftSessionTitle } from '@cindy/maker-shared/session-title';
 import {
   isProductTurnCompletionTailEvent,
@@ -18,6 +23,7 @@ import {
 import type { ApplicationMenuCommand } from '../../shared/applicationMenuCommands.js';
 
 import { hasSessionAttention as hasAppBadgeSessionAttention } from '../appBadgeService.js';
+import { openMainWindowSession } from '../deepLink.js';
 import {
   AGENT_ISLAND_MAX_RESIZABLE_WIDTH,
   AGENT_ISLAND_GET_DISPLAY_OPTIONS_CHANNEL,
@@ -52,6 +58,7 @@ import {
   type AgentIslandDisplayState,
   type AgentIslandPillSnapshot,
   type AgentIslandSessionActivity,
+  type AgentIslandSessionSnapshot,
   type AgentIslandDisplayTarget,
   type AgentIslandMascotSkin,
   type AgentIslandStrings,
@@ -81,6 +88,7 @@ import {
   hasAgentIslandSessionAttention,
   isAgentIslandPendingFocusAck,
   markAgentIslandSessionAttention,
+  requestAgentIslandManualCollapse,
   requestAgentIslandManualExpand,
   patchAgentIslandMetadata,
   removeAgentIslandSession,
@@ -98,6 +106,7 @@ import {
 } from './state.js';
 import { createLocalizedToolRowWording } from './toolWording.js';
 import {
+  type AgentIslandDisplayIdentity,
   type AgentIslandLayoutPreference,
   computeAgentIslandCarrierSize,
   computeAgentIslandWindowBounds,
@@ -109,8 +118,10 @@ import {
 } from './MacAgentIslandNativeHost.js';
 import { AGENT_ISLAND_DISPLAY_CONFIG } from './displayConfig.js';
 import {
+  readAgentIslandDetachedLayoutPreferences,
   readAgentIslandLayoutPreferences,
   writeAgentIslandLayoutPreference,
+  writeAgentIslandLayoutPreferences,
 } from './layoutPreferenceStore.js';
 import { throwIpcError } from '../utils/ipcValidate.js';
 import { tapWindowBroadcast } from '../device-link/broadcast-tap.js';
@@ -161,6 +172,8 @@ export interface AgentIslandServiceDeps {
   nativeHost?: AgentIslandNativeRenderer;
   /** Main-process upgrade window used to classify remote daemon shutdowns. */
   isPlannedRemoteDaemonClose?: (sessionId: string) => boolean;
+  /** Optional process-local consumer for task activity, such as hardware status lighting. */
+  onSessionActivityChange?: (activity: readonly AgentIslandSessionActivity[]) => void;
 }
 
 interface AgentIslandNativeRenderer {
@@ -214,12 +227,64 @@ export function getAgentIslandService(): AgentIslandService | null {
   return serviceSingleton;
 }
 
+function sessionActivitySnapshotsEqual(
+  left: AgentIslandSessionActivity,
+  right: AgentIslandSessionActivity,
+): boolean {
+  return left.sessionId === right.sessionId
+    && left.phase === right.phase
+    && left.currentTurnActive === right.currentTurnActive
+    && left.recordStatus === right.recordStatus
+    && left.startedAtMs === right.startedAtMs
+    && left.lastActivityAtMs === right.lastActivityAtMs
+    && left.currentActionSummary === right.currentActionSummary
+    && left.interactionKind === right.interactionKind
+    && left.attention === right.attention
+    && left.workflow?.key === right.workflow?.key
+    && left.workflow?.label === right.workflow?.label
+    && left.workflow?.waitingOn === right.workflow?.waitingOn
+    && left.turnGeneration === right.turnGeneration
+    && left.gracefulStopState === right.gracefulStopState
+    && left.source === right.source;
+}
+
+function safeSessionActionSummary(snapshot: AgentIslandSessionSnapshot): string {
+  if (snapshot.phase === 'needs-interaction') {
+    if (snapshot.interactionKind === 'permission') return '等待权限确认';
+    if (snapshot.interactionKind === 'ask_user_question') return '等待用户回答';
+    if (snapshot.interactionKind === 'plan_review') return '等待计划确认';
+    if (snapshot.interactionKind === 'plugin_setup') return '等待插件配置';
+    return '等待用户确认';
+  }
+  if (snapshot.phase === 'completed') return '运行已正常结束';
+  if (snapshot.phase === 'error') return '运行出错';
+  const latestKind = snapshot.activityLines.at(-1)?.kind;
+  if (latestKind === 'tool') return '正在运行工具';
+  if (latestKind === 'assistant') return '正在生成回复';
+  if (latestKind === 'user') return '正在处理新消息';
+  return '正在运行';
+}
+
+function canonicalSessionActivity(
+  activity: AgentIslandSessionActivity,
+): SessionActivitySnapshot {
+  const { compactDetail: _compactDetail, ...snapshot } = activity;
+  return {
+    ...snapshot,
+    workflow: snapshot.workflow ? { ...snapshot.workflow } : null,
+  };
+}
+
 /**
  * Owns Agent Island display arbitration in main. Rendering is macOS-native:
  * the Swift/AppKit helper owns the system-level panel, shape, shadow and hover
  * tracking while TypeScript owns product state and session prioritization.
  */
 export class AgentIslandService {
+  private readonly sessionActivityListeners = new Set<
+    (transition: SessionActivityTransition) => void
+  >();
+  private sessionActivitySubscriptionCursor = new Map<string, AgentIslandSessionActivity>();
   private readonly state = createAgentIslandState();
   private readonly nativeHost: AgentIslandNativeRenderer;
   private readonly headless: boolean;
@@ -231,6 +296,7 @@ export class AgentIslandService {
   }>();
   private readonly metadataLoading = new Set<string>();
   private readonly layoutPreferencesByDisplayId: Map<number, AgentIslandLayoutPreference>;
+  private readonly detachedLayoutPreferences: AgentIslandLayoutPreference[];
   private nativeFailureLogged = false;
   private enabled = false;
   private enabledSynced = false;
@@ -254,6 +320,11 @@ export class AgentIslandService {
   private readonly stoppedProviderTurnIdBySession = new Map<string, string>();
   private readonly interactionEpochBySession = new Map<string, number>();
   private interactionEpochSequence = 0;
+  /**
+   * 每条会话的未读代。新一轮 completed/error 未读会自增;异步 not-found 回执带着
+   * 入队时的代,回来后对不上就作废,避免清掉后来才挂上的绿点/红点。
+   */
+  private unreadAttentionGenerationBySession = new Map<string, number>();
   private readonly sessionHadAttentionAtRunStart = new Map<string, boolean>();
   private readonly userPromptRollbackTokens = new Map<string, {
     state: AgentIslandUserPromptRollbackToken;
@@ -286,9 +357,11 @@ export class AgentIslandService {
     // lazy t() 闭包跟随 locale 运行时切换,注入一次即可(strings 仍每次 publish 重建)。
     setAgentIslandToolWording(this.state, createLocalizedToolRowWording());
     this.layoutPreferencesByDisplayId = readAgentIslandLayoutPreferences();
+    this.detachedLayoutPreferences = readAgentIslandDetachedLayoutPreferences();
     this.nativeHost = deps.nativeHost ?? new MacAgentIslandNativeHost({
       onPointerZones: (zones) => this.handleNativePointerZones(zones),
       onExpand: (displayId) => this.handleNativeExpand(displayId),
+      onCollapse: () => this.handleNativeCollapse(),
       onFocusSession: (sessionId) => this.focusSession(sessionId),
       onOpenSettings: () => this.dispatchMainWindowCommand('open-agent-island-settings', { playSelectSound: true }),
       onNewMessage: () => this.dispatchMainWindowCommand('new-maker', { playSelectSound: true }),
@@ -358,7 +431,6 @@ export class AgentIslandService {
       });
       if (!changed) return;
       this.mutedCompletionSoundSessionIds.add(sessionId);
-      this.scheduleSilencedRunClearForSession(sessionId, SILENCED_COMPLETION_CLEAR_MS);
       this.ensureMetadata(sessionId);
       this.clearStreamingPreviewPublishTimer();
       this.publish();
@@ -515,8 +587,9 @@ export class AgentIslandService {
     this.hiddenPublished = false;
     if (!wasSynced && !enabled) {
       this.mutedCompletionSoundSessionIds.clear();
-      this.clearPublishTimer();
       this.hiddenPublished = true;
+      // Windows / headless 永远走这条:岛 UI 关着,但远程未读 TTL 仍要自己触发。
+      this.publish();
       return;
     }
     if (enabled) {
@@ -561,6 +634,7 @@ export class AgentIslandService {
       this.clearSilencedRunTimer(runId);
     }
     resetAgentIslandState(this.state);
+    this.emitSessionActivityTransitions([], Date.now());
     this.metadataCache.clear();
     this.metadataLoading.clear();
     this.lastSoundDisplayState = null;
@@ -575,6 +649,7 @@ export class AgentIslandService {
     this.stoppedProviderTurnIdBySession.clear();
     this.interactionEpochBySession.clear();
     this.sessionHadAttentionAtRunStart.clear();
+    this.unreadAttentionGenerationBySession.clear();
     this.userPromptRollbackTokens.clear();
     this.deferredCompletions.clear();
     for (const sessionId of this.deferredRemoteAuthErrors.keys()) {
@@ -589,6 +664,7 @@ export class AgentIslandService {
     } else {
       this.publishHidden(Date.now());
     }
+    this.notifySessionActivityConsumer([]);
   }
 
   setAppFocused(focused: boolean): void {
@@ -675,10 +751,9 @@ export class AgentIslandService {
       this.shouldDeferCompletion?.(hydrated.sessionId) === true &&
       // Thread 2 fix: silenced completions carry no attention/sound regardless of
       // queue state, so there is no need to defer them — apply with no-attention
-      // immediately.  Deferring a silenced event risks silencedSessionRunIds being
-      // cleared (after SILENCED_COMPLETION_CLEAR_MS) before notifyQueueEmptied
-      // fires, which would cause the replayed event to be treated as normal and
-      // show attention / play sound for a run that was explicitly silenced.
+      // immediately. Linger 只挂 scheduler 的 completed && silenced;中间 agent done
+      // 不得开 linger,否则续 turn 会清掉标记。这里仍跳过 defer,免得 completed 先到
+      // 排了 linger 后,队列排空重放时标记已退场、被当成普通完成。
       !this.isCompletionEventSilenced(hydrated.sessionId, event)
     ) {
       if (event.type === 'done') {
@@ -716,12 +791,14 @@ export class AgentIslandService {
     });
     if (suppressCompletionAttention) {
       this.mutedCompletionSoundSessionIds.add(hydrated.sessionId);
-      this.scheduleSilencedRunClearForSession(hydrated.sessionId, SILENCED_COMPLETION_CLEAR_MS);
     }
     if (!changed) return;
     this.ensureMetadata(hydrated.sessionId);
     if (!suppressCompletionAttention) {
       this.syncSessionAttention(hydrated.sessionId);
+    }
+    if (this.state.remoteUnreadTerminals.has(hydrated.sessionId)) {
+      this.bumpUnreadAttentionGeneration(hydrated.sessionId);
     }
     if (isStreamingPreviewEvent(event)) {
       this.scheduleStreamingPreviewPublish();
@@ -748,6 +825,7 @@ export class AgentIslandService {
           preserveAttention: hadPreviousAttention,
         })
         : false;
+      if (event.sessionId && hadPreviousAttention) this.bumpUnreadAttentionGeneration(event.sessionId);
       if (event.sessionId) this.sessionHadAttentionAtRunStart.delete(event.sessionId);
       // 若该会话有延后完成事件(之前因队列非空被推迟),标记为应压制注意力,
       // 防止队列排空后 notifyQueueEmptied 重放时 silencedSessionRunIds 已被清除、
@@ -770,6 +848,12 @@ export class AgentIslandService {
   handleUserPrompt(meta: AgentIslandSessionMeta, prompt: string, debugMeta: AgentIslandUserPromptDebugMeta = {}): boolean {
     const receivedAt = Date.now();
     const hydrated = this.hydrateMeta(meta);
+    const rollbackKey = this.userPromptRollbackKey(hydrated.sessionId, debugMeta.clientId);
+    // 入队预览和 persist 预览共用 clientId。已经预览过的第二次只确认,不再追加
+    // activity、不推进 epoch,否则岛上同一条消息出现两遍、开始音效对应的回滚基线也会被冲掉。
+    if (rollbackKey && this.userPromptRollbackTokens.has(rollbackKey)) {
+      return true;
+    }
     const previousInteractionEpoch = this.interactionEpochBySession.get(hydrated.sessionId);
     const wasStopped = this.stoppedSessionIds.has(hydrated.sessionId);
     const wasReplacementTurnPending = this.replacementTurnPendingSessionIds.has(hydrated.sessionId);
@@ -790,7 +874,6 @@ export class AgentIslandService {
     if (deferInteractionEpochUntilDispatch) {
       this.replacementTurnDispatchingSessionIds.delete(hydrated.sessionId);
     }
-    const rollbackKey = this.userPromptRollbackKey(hydrated.sessionId, debugMeta.clientId);
     if (rollbackKey) {
       this.userPromptRollbackTokens.set(rollbackKey, {
         state: createAgentIslandUserPromptRollbackToken(this.state, hydrated.sessionId),
@@ -1023,6 +1106,7 @@ export class AgentIslandService {
     if (options.reason === 'process-closed') {
       closeAgentIslandSessionPreservingUnread(this.state, sessionId, Date.now());
     } else {
+      this.unreadAttentionGenerationBySession.delete(sessionId);
       removeAgentIslandSession(this.state, sessionId);
     }
     this.deletePermissionRequestsForSession(sessionId);
@@ -1045,6 +1129,7 @@ export class AgentIslandService {
     this.replacementTurnDispatchingSessionIds.delete(sessionId);
     this.clearSilencedRunForSession(sessionId);
     this.sessionHadAttentionAtRunStart.delete(sessionId);
+    this.unreadAttentionGenerationBySession.delete(sessionId);
     for (const key of this.userPromptRollbackTokens.keys()) {
       if (key.startsWith(`${sessionId}:`)) {
         this.userPromptRollbackTokens.delete(key);
@@ -1054,8 +1139,9 @@ export class AgentIslandService {
     this.clearDeferredRemoteAuthError(sessionId);
     this.deletePermissionRequestsForSession(sessionId);
     const hadSession = this.state.sessions.has(sessionId);
+    const hadUnread = this.state.remoteUnreadTerminals.has(sessionId);
     removeAgentIslandSession(this.state, sessionId);
-    if (hadSession) this.publish();
+    if (hadSession || hadUnread) this.publish();
   }
 
   private advanceInteractionEpoch(sessionId: string): number {
@@ -1080,26 +1166,22 @@ export class AgentIslandService {
    */
   handleSessionAttentionCleared(sessionId: string, source: 'explicit' | 'passive' = 'passive'): void {
     const ack = acknowledgeAgentIslandSessionRead(this.state, sessionId, Date.now(), { source });
-    // 未读 error 对 passive 免疫:state 未动,也**不能**给远端发收尾包 —— 否则手机
-    // 列表行的 error 红点会被导航级被动信号清掉,破坏「未处置就不消失」。
+    // 未读 error 对 passive 免疫:state / 独立账本都未动,也**不能**给远端发收尾包。
     if (ack === 'error-immune') return;
     if (ack === 'not-found') {
-      // not-found(典型:重启后 state / relay 条目丢失,远端仍挂着旧未读)只对
-      // **本机拥有**的会话补收尾包(localDb 有行 = 本机是 owner)。本机只是控制端
-      // 时(查看别台设备的会话),该会话不在本机 localDb —— 不得替 owner 设备向
-      // 本机 sessions topic 广播否定帧,否则同时订阅本机的第三方控制端会误删
-      // owner 正在发布的 live / 未读条目;远程收敛由 renderer 的隧道回执直达
-      // owner 设备负责。异步查行期间若会话恢复活跃,ensure 的「entries 有条目
-      // 即不插手」语义天然防误清。
-      //
-      // passive 与 explicit 同权放行:重启后 error kind 的记忆(state / 角标)已
-      // 丢失,owner 侧无从做 kind 级免疫;而到达这里的 passive 回执几乎只来自
-      // 远程控制端,发起侧(sessionAttentionStore.flushPendingRemoteReceipt)已
-      // 做过 error 免疫——error 未读时 passive 回执按下不发,镜像缺失时还有消息层
-      // 终止错误探针兜底。若这里再扣发,桌面控制端的正常阅读路径(passive)将
-      // 永远清不掉 owner 重启前留下的完成绿点,恰是本兜底要修的挂死场景。
+      // 内存账本没有这条:典型是进程重启。只对**本机拥有**的会话补收尾包。
+      // 查询是异步的,必须带入队时代;回来时若已有新一轮未读或 live 条目,旧回执作废。
+      const generation = this.unreadAttentionGenerationBySession.get(sessionId) ?? 0;
       void getSessionRowSnapshot(sessionId)
         .then((row) => {
+          if ((this.unreadAttentionGenerationBySession.get(sessionId) ?? 0) !== generation) {
+            log.debug(`session read ack: session=${sessionId} source=${source} state=not-found; superseded`);
+            return;
+          }
+          if (this.state.sessions.has(sessionId) || this.state.remoteUnreadTerminals.has(sessionId)) {
+            log.debug(`session read ack: session=${sessionId} source=${source} state=not-found; live-or-unread returned, withheld`);
+            return;
+          }
           if (!row) {
             log.debug(`session read ack: session=${sessionId} source=${source} state=not-found; no local row, withheld`);
             return;
@@ -1113,12 +1195,9 @@ export class AgentIslandService {
     if (this.sessionHadAttentionAtRunStart.has(sessionId)) {
       this.sessionHadAttentionAtRunStart.set(sessionId, false);
     }
-    // 收尾包兜底必须在 publish() **之前**:桌面重启(state / relay 条目丢失)或
-    // 收尾包推送丢失后,远端列表行可能仍挂着 attention=true 的旧条目,而 relay
-    // entries 已无记录,publish() 的隐式收敛不会为它发出任何帧,绿点永久挂死 ——
-    // ensure 在 entries 无条目时补发一帧可重放的收尾包。entries 有条目(live 会话
-    // 或活跃未读)时 ensure 不插手,由紧随的 publish() 正常收敛:live 帧继续、
-    // 已读的未读终态走 clear 发收尾包,不产生误清与重复帧。
+    this.unreadAttentionGenerationBySession.delete(sessionId);
+    // 收尾包兜底必须在 publish() **之前**。ensure 只在 relay 没有该会话条目时补发;
+    // 已有 entry(live 或刚发出的未读终态)不动,由 publish() 把账本投影出去。
     this.sessionActivityRelay.ensureSessionTerminalClear(sessionId);
     if (ack === 'cleared') this.publish();
     log.debug(`session read ack: session=${sessionId} source=${source} state=${ack}`);
@@ -1306,12 +1385,6 @@ export class AgentIslandService {
     return this.silencedSessionRunIds.has(sessionId);
   }
 
-  private scheduleSilencedRunClearForSession(sessionId: string, delayMs: number): void {
-    const runId = this.silencedSessionRunIds.get(sessionId);
-    if (!runId) return;
-    this.scheduleSilencedRunClear(runId, delayMs);
-  }
-
   private hadAttentionBeforeSilencedRun(sessionId: string): boolean {
     const runId = this.silencedSessionRunIds.get(sessionId);
     return runId ? this.silencedRunHadAttention.get(runId) === true : false;
@@ -1328,7 +1401,7 @@ export class AgentIslandService {
 
   private scheduleSilencedRunClear(runId: string, delayMs: number): void {
     if (!this.silencedRunSessionIds.has(runId)) return;
-    this.clearSilencedRunTimer(runId);
+    if (this.silencedRunClearTimers.has(runId)) return;
     const timer = setTimeout(() => {
       this.silencedRunClearTimers.delete(runId);
       this.clearSilencedScheduleRun(runId);
@@ -1377,29 +1450,94 @@ export class AgentIslandService {
     }
   }
 
+  private bumpUnreadAttentionGeneration(sessionId: string): void {
+    const next = (this.unreadAttentionGenerationBySession.get(sessionId) ?? 0) + 1;
+    this.unreadAttentionGenerationBySession.set(sessionId, next);
+  }
+
   /**
    * 把 per-session 活动快照(轻量子集)广播给 renderer,供侧栏置顶卡片/列表显示
    * 任务执行中的逐步活动 + 等待交互态。与原生灵动岛同源数据,enabled/disabled 都发。
    *
-   * 数据取 state.sessions **全集**(buildAllSessionActivitySnapshots),不是灵动岛展示面
-   * displayState.sessions —— 后者在展示 transient 完成/错误卡时会过滤掉运行中/等待中的
-   * 会话,而 renderer store 是整体替换,用子集会把这些会话从活动 map 丢掉、卡片回退陈旧
-   * summary(PR #246 review)。两个调用方均在 buildAgentIslandDisplayState(已裁剪过期
-   * session)之后调用本方法。
+   * 数据取 live sessions ∪ 独立未读账本(buildAllSessionActivitySnapshots),不是
+   * 灵动岛展示面 displayState.sessions。过了岛面 TTL 的完成/出错未读仍从账本带
+   * attention=true 投给远程侧栏,直到真正已读。
    */
   private buildSessionActivityPayload(): AgentIslandSessionActivity[] {
     return buildAllSessionActivitySnapshots(this.state).map((s) => ({
-      sessionId: s.sessionId,
+      ...projectSessionActivity({
+        sessionId: s.sessionId,
+        recordStatus: 'active',
+        title: s.title,
+        source: 'live',
+        livePhase: s.phase,
+        startedAtMs: s.startedAt,
+        lastActivityAtMs: s.lastActivityAt,
+        currentActionSummary: safeSessionActionSummary(s),
+        interactionKind: s.interactionKind,
+        attention: s.attention,
+      }),
       phase: s.phase,
-      compactDetail: s.compactDetail,
       interactionKind: s.interactionKind,
-      attention: s.attention,
+      compactDetail: s.compactDetail,
     }));
+  }
+
+  /** Read the same canonical snapshot used by sidebar and device-list relays. */
+  getSessionActivitySnapshot(sessionId: string): SessionActivitySnapshot | null {
+    const activity = this.buildSessionActivityPayload()
+      .find((item) => item.sessionId === sessionId);
+    return activity ? canonicalSessionActivity(activity) : null;
+  }
+
+  /**
+   * Subscribe to canonical activity transitions. Future Bot consumers attach here;
+   * this service remains unaware of Bot/runtime implementations.
+   */
+  subscribeSessionActivity(
+    listener: (transition: SessionActivityTransition) => void,
+  ): () => void {
+    this.sessionActivityListeners.add(listener);
+    return () => this.sessionActivityListeners.delete(listener);
+  }
+
+  private emitSessionActivityTransitions(
+    list: readonly AgentIslandSessionActivity[],
+    changedAtMs: number,
+  ): void {
+    const next = new Map(list.map((snapshot) => [snapshot.sessionId, snapshot]));
+    const sessionIds = new Set([
+      ...this.sessionActivitySubscriptionCursor.keys(),
+      ...next.keys(),
+    ]);
+    for (const sessionId of sessionIds) {
+      const previous = this.sessionActivitySubscriptionCursor.get(sessionId) ?? null;
+      const current = next.get(sessionId) ?? null;
+      if (previous && current && sessionActivitySnapshotsEqual(previous, current)) continue;
+      for (const listener of this.sessionActivityListeners) {
+        try {
+          listener({
+            sessionId,
+            previous: previous ? canonicalSessionActivity(previous) : null,
+            current: current ? canonicalSessionActivity(current) : null,
+            changedAtMs,
+          });
+        } catch (error) {
+          log.warn('session activity listener failed', {
+            sessionId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+    }
+    this.sessionActivitySubscriptionCursor = next;
   }
 
   private emitSessionActivityToRenderer(): void {
     const payload = this.buildSessionActivityPayload();
     this.sessionActivityRelay.publish(payload);
+    this.emitSessionActivityTransitions(payload, Date.now());
+    this.notifySessionActivityConsumer(payload);
     // 广播给所有 app content window(含「在新窗口打开」的副窗),不只主窗 —— 副窗也有侧栏、
     // 也订阅同一频道,只发主窗会让副窗卡片预览停在陈旧 summary(PR #246 review)。
     const windows = BrowserWindow.getAllWindows().filter(isAppContentWindow);
@@ -1407,6 +1545,16 @@ export class AgentIslandService {
     for (const win of windows) {
       const wc = win.webContents;
       if (wc && !wc.isDestroyed()) wc.send(AGENT_ISLAND_SESSION_SNAPSHOTS_CHANNEL, payload);
+    }
+  }
+
+  private notifySessionActivityConsumer(activity: readonly AgentIslandSessionActivity[]): void {
+    try {
+      this.deps.onSessionActivityChange?.(activity);
+    } catch (error) {
+      log.warn('process-local session activity consumer failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -1428,7 +1576,9 @@ export class AgentIslandService {
       );
       // 侧栏卡片的逐步活动不依赖灵动岛开关:即便岛 UI 关闭,状态机仍累积,照常广播给 renderer。
       this.emitSessionActivityToRenderer();
-      this.clearPublishTimer();
+      // Windows / headless / 用户关掉岛面时,仍要按 TTL 把完整会话迁到轻量未读账本。
+      // 不排 timer 的话,终态后再无事件,活动文本会无限留在 state.sessions。
+      this.scheduleNextPublish(now);
       if (!this.hiddenPublished) {
         if (this.nativeHost.suspend) {
           this.nativeHost.suspend();
@@ -1554,6 +1704,13 @@ export class AgentIslandService {
     }
   }
 
+  private handleNativeCollapse(): void {
+    const now = Date.now();
+    if (!requestAgentIslandManualCollapse(this.state, now)) return;
+    this.playConfiguredSound('select', now);
+    this.publish();
+  }
+
   private handleNativeLayoutDragActive(active: boolean): void {
     if (!active) {
       this.flushLayoutPreferenceWrites();
@@ -1578,11 +1735,19 @@ export class AgentIslandService {
   }
 
   private handleNativeLayoutPreference(preference: AgentIslandLayoutPreference): void {
-    const displayId = typeof preference.displayId === 'number' && Number.isFinite(preference.displayId)
+    const displays = this.getAvailableDisplays();
+    this.reconcileLayoutPreferencesForDisplays(displays);
+    const nativeDisplayId = typeof preference.displayId === 'number' && Number.isFinite(preference.displayId)
       ? preference.displayId
-      : this.getTargetDisplay().id;
+      : this.getTargetDisplay(displays).id;
+    const display = this.displayForNativeId(nativeDisplayId, displays);
+    if (!display) return;
+    const displayId = display.id;
     const current = this.layoutPreferencesByDisplayId.get(displayId) ?? {};
-    const next: AgentIslandLayoutPreference = { ...current };
+    const next: AgentIslandLayoutPreference = {
+      ...current,
+      ...(display ? this.displayIdentityForDisplay(display, displays) : {}),
+    };
     if (typeof preference.centerXRatio === 'number' && Number.isFinite(preference.centerXRatio)) {
       next.centerXRatio = preference.centerXRatio;
     }
@@ -1596,6 +1761,10 @@ export class AgentIslandService {
       next.centerXRatio === current.centerXRatio
       && next.compactContentWidth === current.compactContentWidth
       && next.expandedContentWidth === current.expandedContentWidth
+      && next.displayName === current.displayName
+      && next.displayIndex === current.displayIndex
+      && next.displayInternal === current.displayInternal
+      && sameDisplayBounds(next.displayBounds, current.displayBounds)
     ) {
       return;
     }
@@ -1673,7 +1842,9 @@ export class AgentIslandService {
     frames: AgentIslandNativeFrame[];
     statesByDisplayId?: Record<string, AgentIslandDisplayState>;
   } {
-    const displays = this.getTargetDisplays();
+    const availableDisplays = this.getAvailableDisplays();
+    this.reconcileLayoutPreferencesForDisplays(availableDisplays);
+    const displays = this.getTargetDisplays(availableDisplays);
     const statesByDisplayId = this.computeDisplayStatesByDisplayId(displayState, displays);
     const frames = displays.map((display) => {
       const stateForDisplay = statesByDisplayId?.[String(display.id)] ?? displayState;
@@ -1705,7 +1876,7 @@ export class AgentIslandService {
 
   private computeNativeFrame(displayState: AgentIslandDisplayState, display: Display): AgentIslandNativeFrame {
     const rawScreenMetrics = this.getScreenLayoutMetrics(display);
-    const layoutPreference = this.layoutPreferencesByDisplayId.get(display.id) ?? {};
+    const layoutPreference = this.getLayoutPreferenceForDisplay(display);
     const expanded = displayState.notchStatus === 'expanded';
     const hasSession = displayState.totalCount > 0;
     const screenMetrics = this.getEffectiveScreenLayoutMetrics({
@@ -1784,8 +1955,7 @@ export class AgentIslandService {
     };
   }
 
-  private getTargetDisplays(): Display[] {
-    const displays = this.getAvailableDisplays();
+  private getTargetDisplays(displays = this.getAvailableDisplays()): Display[] {
     if (this.displayTarget.mode === 'display') {
       const selectedDisplay = this.resolveSelectedDisplay(displays);
       if (!selectedDisplay) {
@@ -1800,6 +1970,178 @@ export class AgentIslandService {
       return [selectedDisplay];
     }
     return displays;
+  }
+
+  private getLayoutPreferenceForDisplay(display: Display): AgentIslandLayoutPreference {
+    const preference = this.layoutPreferencesByDisplayId.get(display.id);
+    if (!preference) return {};
+    if (hasPersistedLayoutIdentity(preference)) return preference;
+
+    // 0.1.31 and earlier stored only the runtime display id. On a multi-display
+    // setup that id can be reused by another monitor, so an old wide compact
+    // width and center are unsafe to apply to a centered hardware-notch
+    // display. Preserve the expanded preference, but let compact layout derive
+    // its current notch-safe defaults until the next native drag records identity.
+    const displays = this.getAvailableDisplays();
+    const metrics = this.getScreenLayoutMetrics(display);
+    if (displays.length > 1 && metrics?.hasNotch) {
+      return {
+        ...preference,
+        centerXRatio: undefined,
+        compactContentWidth: undefined,
+      };
+    }
+    return preference;
+  }
+
+  private reconcileLayoutPreferencesForDisplays(displays: Display[]): void {
+    const entries = Array.from(this.layoutPreferencesByDisplayId.entries());
+    if (
+      (entries.length === 0 && this.detachedLayoutPreferences.length === 0) ||
+      displays.length === 0
+    )
+      return;
+
+    const next = new Map<number, AgentIslandLayoutPreference>();
+    const nextDetached: AgentIslandLayoutPreference[] = [];
+    const claimedDisplayIds = new Set<number>();
+    const assignedPreferences = new Set<AgentIslandLayoutPreference>();
+    const identityEntries = [
+      ...entries
+        .filter(([, preference]) => hasPersistedLayoutIdentity(preference))
+        .map(([storedDisplayId, preference]) => ({ storedDisplayId, preference })),
+      ...this.detachedLayoutPreferences.map((preference) => ({
+        storedDisplayId: null,
+        preference,
+      })),
+    ];
+
+    // Keep an identity-bearing preference on its current id when the identity
+    // still resolves there. This is the common case and also makes collisions
+    // deterministic before looking for migrated ids.
+    for (const { storedDisplayId, preference } of identityEntries) {
+      if (storedDisplayId === null) continue;
+      const direct = this.displayById(displays, storedDisplayId);
+      const resolved = findDisplayByIdentity(displays, preference);
+      if (!direct || !resolved || resolved.id !== direct.id) continue;
+      next.set(direct.id, {
+        ...preference,
+        ...this.displayIdentityForDisplay(direct, displays),
+      });
+      claimedDisplayIds.add(direct.id);
+      assignedPreferences.add(preference);
+    }
+
+    // Resolve the remaining identity-bearing entries as a one-to-one batch.
+    // Do not mutate the live map while iterating: two exchanged runtime ids
+    // must be able to swap without one migration overwriting the other.
+    for (const { preference } of identityEntries) {
+      if (assignedPreferences.has(preference)) continue;
+      const resolved = findDisplayByIdentity(displays, preference);
+      if (!resolved || claimedDisplayIds.has(resolved.id)) continue;
+      next.set(resolved.id, {
+        ...preference,
+        ...this.displayIdentityForDisplay(resolved, displays),
+      });
+      claimedDisplayIds.add(resolved.id);
+      assignedPreferences.add(preference);
+    }
+
+    // Identity-bearing preferences that cannot currently resolve remain
+    // detached from runtime ids. This preserves a disconnected display even
+    // when another online display reuses its previous id.
+    for (const { preference } of identityEntries) {
+      if (!assignedPreferences.has(preference)) {
+        nextDetached.push(preference);
+      }
+    }
+
+    // Keep old id-only entries for backwards compatibility when their id still
+    // names an unclaimed display. If an identity-bearing entry already claims
+    // that id, the ambiguous legacy value must not overwrite the safer match.
+    for (const [storedDisplayId, preference] of entries) {
+      if (hasPersistedLayoutIdentity(preference)) continue;
+      const direct = this.displayById(displays, storedDisplayId);
+      if (direct && !claimedDisplayIds.has(direct.id)) {
+        next.set(direct.id, preference);
+        claimedDisplayIds.add(direct.id);
+        continue;
+      }
+      // Keep disconnected legacy entries so a future display with the same id
+      // can still use the old preference; no physical identity exists to do a
+      // safer reconnect migration yet.
+      if (!direct && !next.has(storedDisplayId)) {
+        next.set(storedDisplayId, preference);
+      }
+    }
+
+    if (
+      sameLayoutPreferenceMap(this.layoutPreferencesByDisplayId, next) &&
+      sameLayoutPreferenceList(this.detachedLayoutPreferences, nextDetached)
+    ) {
+      return;
+    }
+    this.clearPendingLayoutPreferenceWrites();
+    this.layoutPreferencesByDisplayId.clear();
+    for (const [displayId, preference] of next) {
+      this.layoutPreferencesByDisplayId.set(displayId, preference);
+    }
+    this.detachedLayoutPreferences.splice(
+      0,
+      this.detachedLayoutPreferences.length,
+      ...nextDetached,
+    );
+    this.writeLayoutPreferencesSafely(next, nextDetached);
+  }
+
+  private clearPendingLayoutPreferenceWrites(): void {
+    this.pendingLayoutPreferenceWrites.clear();
+    if (this.layoutPreferenceWriteTimer) {
+      clearTimeout(this.layoutPreferenceWriteTimer);
+      this.layoutPreferenceWriteTimer = null;
+    }
+  }
+
+  private writeLayoutPreferencesSafely(
+    preferences: Map<number, AgentIslandLayoutPreference>,
+    detachedPreferences: readonly AgentIslandLayoutPreference[],
+  ): void {
+    try {
+      writeAgentIslandLayoutPreferences(preferences, detachedPreferences);
+    } catch (error) {
+      log.warn('agent island layout preferences migration write failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private displayForNativeId(displayId: number | null, displays: Display[]): Display | null {
+    if (typeof displayId !== 'number' || !Number.isFinite(displayId)) return null;
+    const direct = this.displayById(displays, displayId);
+    // AppKit and Electron expose the same system display id, while their frame
+    // coordinates use different vertical origins. A matching id is therefore
+    // stronger evidence than a full-bounds comparison.
+    if (direct) return direct;
+    const metrics = this.screenMetricsByDisplayId.get(displayId);
+    if (!metrics) return null;
+    const exactBounds = displays.filter((display) => sameDisplayBounds(display.bounds, metrics.frame));
+    if (exactBounds.length === 1) return exactBounds[0] ?? null;
+    const sameSize = displays.filter((display) => (
+      display.bounds.width === metrics.frame.width
+      && display.bounds.height === metrics.frame.height
+    ));
+    return sameSize.length === 1 ? (sameSize[0] ?? null) : null;
+  }
+
+  private displayIdentityForDisplay(display: Display, displays: Display[]): AgentIslandDisplayIdentity {
+    return {
+      displayName: typeof display.label === 'string' && display.label.trim()
+        ? display.label.trim()
+        : undefined,
+      displayIndex: displays.findIndex((item) => item.id === display.id) + 1,
+      displayInternal: Boolean(display.internal),
+      displayBounds: { ...display.bounds },
+    };
   }
 
   private resolveSelectedDisplay(displays: Display[]): Display | null {
@@ -1832,44 +2174,7 @@ export class AgentIslandService {
     displays: Display[],
     target: Extract<AgentIslandDisplayTarget, { mode: 'display' }>,
   ): Display | null {
-    let candidates = displays;
-    const name = target.displayName?.trim();
-    if (name) {
-      candidates = candidates.filter((display) => (
-        typeof display.label === 'string' && display.label.trim() === name
-      ));
-    }
-
-    if (typeof target.displayInternal === 'boolean') {
-      candidates = candidates.filter((display) => (
-        Boolean(display.internal) === target.displayInternal
-      ));
-    }
-
-    const persistedBounds = target.displayBounds;
-    if (persistedBounds) {
-      const exactBounds = candidates.filter((display) => (
-        sameDisplayBounds(display.bounds, persistedBounds)
-      ));
-      if (exactBounds.length === 1) return exactBounds[0] ?? null;
-      if (exactBounds.length > 1) {
-        candidates = exactBounds;
-      } else {
-        const sameSize = candidates.filter((display) => (
-          display.bounds.width === persistedBounds.width
-          && display.bounds.height === persistedBounds.height
-        ));
-        if (sameSize.length === 1) return sameSize[0] ?? null;
-        if (sameSize.length > 1) candidates = sameSize;
-      }
-    }
-
-    if (typeof target.displayIndex === 'number' && target.displayIndex >= 1) {
-      const byIndex = displays[target.displayIndex - 1];
-      if (byIndex && candidates.includes(byIndex)) return byIndex;
-    }
-
-    return candidates.length === 1 ? (candidates[0] ?? null) : null;
+    return findDisplayByIdentity(displays, target);
   }
 
   private normalizePreferredContentWidth(input: {
@@ -1905,7 +2210,7 @@ export class AgentIslandService {
     const mainWindowDisplay = mainWindow && !mainWindow.isDestroyed()
       ? screen.getDisplayMatching(mainWindow.getBounds())
       : null;
-    const nativePreferred = this.displayById(displays, this.nativePreferredDisplayId);
+    const nativePreferred = this.displayForNativeId(this.nativePreferredDisplayId, displays);
     if (AGENT_ISLAND_DISPLAY_CONFIG.selectionMode === 'native-preferred-then-xdmaker-window') {
       if (nativePreferred) return nativePreferred;
       if (mainWindowDisplay) return mainWindowDisplay;
@@ -1915,7 +2220,7 @@ export class AgentIslandService {
       if (nativePreferred) return nativePreferred;
     }
     if (AGENT_ISLAND_DISPLAY_CONFIG.preferHardwareNotchFallback) {
-      const notchDisplay = displays.find((display) => this.screenMetricsByDisplayId.get(display.id)?.hasNotch);
+      const notchDisplay = displays.find((display) => this.screenMetricsForDisplay(display)?.hasNotch);
       if (notchDisplay) return notchDisplay;
     }
     if (AGENT_ISLAND_DISPLAY_CONFIG.preferInternalDisplayFallback) {
@@ -1953,12 +2258,27 @@ export class AgentIslandService {
   }
 
   private getScreenLayoutMetrics(display: Display): AgentIslandScreenLayoutMetrics | null {
-    const metrics = this.screenMetricsByDisplayId.get(display.id);
+    const metrics = this.screenMetricsForDisplay(display);
     if (!metrics) return null;
     return {
       hasNotch: metrics.hasNotch,
       notchWidth: metrics.notchWidth,
     };
+  }
+
+  private screenMetricsForDisplay(display: Display): AgentIslandNativeScreenMetrics | null {
+    const direct = this.screenMetricsByDisplayId.get(display.id);
+    if (direct) return direct;
+    const exactBounds = Array.from(this.screenMetricsByDisplayId.values()).filter((metrics) => (
+      sameDisplayBounds(display.bounds, metrics.frame)
+    ));
+    if (exactBounds.length === 1) return exactBounds[0] ?? null;
+    const sameSize = Array.from(this.screenMetricsByDisplayId.values()).filter((metrics) => (
+      metrics.frame.width === display.bounds.width
+      && metrics.frame.height === display.bounds.height
+    ));
+    if (sameSize.length === 1) return sameSize[0] ?? null;
+    return null;
   }
 
   private getEffectiveScreenLayoutMetrics(input: {
@@ -2006,14 +2326,12 @@ export class AgentIslandService {
       return;
     }
 
-    const mainWindow = this.deps.getMainWindow();
-    if (!mainWindow || mainWindow.isDestroyed()) return;
     const focusChanged = requestAgentIslandSessionFocus(this.state, nextSessionId, now);
-    if (mainWindow.isMinimized()) mainWindow.restore();
-    mainWindow.show();
-    mainWindow.focus();
-    mainWindow.webContents.send('notification:focus-session', nextSessionId);
     if (focusChanged) this.publish();
+    // Reuse the primary-window handoff: it retains navigation while the
+    // renderer reloads and restores macOS app focus. A one-shot notification
+    // sent during loading is lost before MainLayout can acknowledge the task.
+    openMainWindowSession(nextSessionId);
   }
 
   private dispatchMainWindowCommand(
@@ -2164,10 +2482,97 @@ function hasPersistedDisplayIdentity(
     || target.displayBounds !== undefined;
 }
 
-function sameDisplayBounds(
-  a: { x: number; y: number; width: number; height: number },
-  b: { x: number; y: number; width: number; height: number },
+function hasPersistedLayoutIdentity(preference: AgentIslandLayoutPreference): boolean {
+  return Boolean(preference.displayName?.trim())
+    || typeof preference.displayIndex === 'number'
+    || typeof preference.displayInternal === 'boolean'
+    || preference.displayBounds !== undefined;
+}
+
+function findDisplayByIdentity(
+  displays: Display[],
+  identity: AgentIslandDisplayIdentity,
+): Display | null {
+  let candidates = displays;
+  const name = identity.displayName?.trim();
+  if (name) {
+    candidates = candidates.filter((display) => (
+      typeof display.label === 'string' && display.label.trim() === name
+    ));
+  }
+
+  if (typeof identity.displayInternal === 'boolean') {
+    candidates = candidates.filter((display) => (
+      Boolean(display.internal) === identity.displayInternal
+    ));
+  }
+
+  const persistedBounds = identity.displayBounds;
+  if (persistedBounds) {
+    const exactBounds = candidates.filter((display) => (
+      sameDisplayBounds(display.bounds, persistedBounds)
+    ));
+    if (exactBounds.length === 1) return exactBounds[0] ?? null;
+    if (exactBounds.length > 1) {
+      candidates = exactBounds;
+    } else {
+      const sameSize = candidates.filter((display) => (
+        display.bounds.width === persistedBounds.width
+        && display.bounds.height === persistedBounds.height
+      ));
+      if (sameSize.length === 1) return sameSize[0] ?? null;
+      if (sameSize.length > 1) candidates = sameSize;
+    }
+  }
+
+  // Display enumeration order is runtime-local and may change after reconnect,
+  // reboot, or topology changes. An index must never break an otherwise
+  // ambiguous physical-identity match; failing closed keeps the preference
+  // detached instead of assigning it to the wrong monitor.
+  return candidates.length === 1 ? (candidates[0] ?? null) : null;
+}
+
+function sameLayoutPreferenceMap(
+  a: Map<number, AgentIslandLayoutPreference>,
+  b: Map<number, AgentIslandLayoutPreference>,
 ): boolean {
+  if (a.size !== b.size) return false;
+  for (const [displayId, preference] of a) {
+    const other = b.get(displayId);
+    if (!other || !sameLayoutPreference(preference, other)) return false;
+  }
+  return true;
+}
+
+function sameLayoutPreferenceList(
+  a: readonly AgentIslandLayoutPreference[],
+  b: readonly AgentIslandLayoutPreference[],
+): boolean {
+  return (
+    a.length === b.length &&
+    a.every((preference, index) => sameLayoutPreference(preference, b[index] ?? {}))
+  );
+}
+
+function sameLayoutPreference(
+  a: AgentIslandLayoutPreference,
+  b: AgentIslandLayoutPreference,
+): boolean {
+  return a.displayId === b.displayId
+    && a.centerXRatio === b.centerXRatio
+    && a.compactContentWidth === b.compactContentWidth
+    && a.expandedContentWidth === b.expandedContentWidth
+    && a.displayName === b.displayName
+    && a.displayIndex === b.displayIndex
+    && a.displayInternal === b.displayInternal
+    && sameDisplayBounds(a.displayBounds, b.displayBounds);
+}
+
+function sameDisplayBounds(
+  a: { x: number; y: number; width: number; height: number } | null | undefined,
+  b: { x: number; y: number; width: number; height: number } | null | undefined,
+): boolean {
+  if (!a || !b) return a === b;
   return a.x === b.x
     && a.y === b.y
     && a.width === b.width
@@ -2221,7 +2626,7 @@ function getAgentIslandSoundEventForTransition(
 }
 
 function isCompletionDoneEvent(event: AgentEvent): boolean {
-  return isProductTurnCompletionTailEvent(event);
+  return event.turnScope !== 'background' && isProductTurnCompletionTailEvent(event);
 }
 
 function isCancelledTerminalEvent(event: AgentEvent): boolean {
@@ -2232,7 +2637,7 @@ function isCancelledTerminalEvent(event: AgentEvent): boolean {
 }
 
 function isRunningStatusEvent(event: AgentEvent): boolean {
-  if (event.type !== 'status') return false;
+  if (event.type !== 'status' || event.turnScope === 'background') return false;
   const data = event.data as { isRunning?: unknown } | undefined;
   return data?.isRunning === true;
 }

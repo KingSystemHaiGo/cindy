@@ -1,18 +1,19 @@
 import {
   describeRemoteError as describeRemoteErrorShared,
+  formatRemoteError as formatRemoteErrorShared,
   humanizeRemoteError as humanizeRemoteErrorShared,
   isDeviceUnresponsiveRemoteError,
+  isTransientRemoteError,
 } from '@cindy/maker-shared/device-link-contract';
-import type { DeviceLinkConnectionIssueKind } from '@cindy/device-link';
+import type { DeviceLinkConnectionIssueKind, DeviceLinkStatus } from '@cindy/device-link';
 import { i18n } from '@/i18n';
 
 export {
-  describeAgentAuthError,
   formatRemoteError,
   isPreconditionFailedRemoteError,
-  relayStatusHint,
-  relayStatusLabel,
 } from '@cindy/maker-shared/device-link-contract';
+
+const AGENT_NOT_AUTHENTICATED_RE = /^(?:\[[A-Z_]+\] )?(claude-code|codex|pi) not authenticated: ?(.*)$/;
 
 const CONNECTION_ISSUE_COPY_KEYS: Record<
   DeviceLinkConnectionIssueKind,
@@ -40,24 +41,141 @@ export function connectionIssueHint(kind: DeviceLinkConnectionIssueKind): string
   return i18n.t(CONNECTION_ISSUE_COPY_KEYS[kind].hint);
 }
 
+export function relayStatusLabel(status: DeviceLinkStatus): string {
+  return i18n.t(`deviceLink.relay.label.${status}`);
+}
+
+export function relayStatusHint(status: DeviceLinkStatus, lastSyncedAt: number | null): string {
+  if (status === 'online') {
+    if (!lastSyncedAt) return i18n.t('deviceLink.relay.hint.online');
+    const time = new Intl.DateTimeFormat(i18n.resolvedLanguage || i18n.language, {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    }).format(new Date(lastSyncedAt));
+    return i18n.t('deviceLink.relay.hint.lastSynced', { time });
+  }
+  return i18n.t(`deviceLink.relay.hint.${status}`);
+}
+
+export function describeAgentAuthError(error: string | null | undefined): string | null {
+  if (!error) return null;
+  const matched = AGENT_NOT_AUTHENTICATED_RE.exec(error.trim());
+  if (!matched) return null;
+  const agent = matched[1] === 'claude-code' ? 'Claude' : matched[1] === 'pi' ? 'Pi' : 'Codex';
+  const reason = matched[2] || 'unknown';
+  const reasonKey: Record<string, string> = {
+    no_key: 'noKey',
+    no_oauth: 'noOauth',
+    no_credentials: 'noCredentials',
+    no_encryption: 'noEncryption',
+    proxy_not_ready: 'proxyNotReady',
+  };
+  return i18n.t(`deviceLink.agentAuth.${reasonKey[reason] ?? 'default'}`, {
+    agent,
+    reason,
+  });
+}
+
+/** 自动恢复类连接错误保留结构化 marker 做状态分类，展示文案则复用 Mobile i18n。 */
+function localizedConnectionRecoveryCopy(error: unknown): string | null {
+  const formatted = typeof error === 'string' ? error : formatRemoteErrorShared(error);
+  if (formatted.includes('DEVICE_OFFLINE')) return i18n.t('session.menu.aiRenameOffline');
+  if (formatted.includes('NOT_CONNECTED')) return i18n.t('session.screen.networkReconnecting');
+  return null;
+}
+
 /**
- * mobile 侧的 humanizeRemoteError / describeRemoteError:熔断快速失败
- * (DEVICE_UNRESPONSIVE)先走四语言 i18n(与 ConnectionBanner 同一组文案),
- * 其余委托 maker-shared 原实现。共享层的文案是中文硬编码(历史现状),直接
- * 透出会让 en/ja/ko 用户在 Alert / banner 里看到中文(review P1 两轮)——
- * 本 PR 新增的错误码不再走那条老路。mobile 代码一律从本文件 import,
- * 不要直接 import 共享层的这两个函数。
+ * mobile 侧的 humanizeRemoteError / describeRemoteError:熔断快速失败与 Stop
+ * 会主动产生的自动恢复错误先走 Mobile i18n,其余委托 maker-shared 原实现。
+ * 共享层的文案是中文硬编码(历史现状),新接入的错误出口不能直接透给其它语言
+ * 用户。mobile 代码一律从本文件 import,不要直接 import 共享层的这两个函数。
  */
 export function humanizeRemoteError(error: unknown): string {
   if (isDeviceUnresponsiveRemoteError(error)) {
     return i18n.t('deviceLink.deviceUnresponsiveHint');
   }
+  const recoveryCopy = localizedConnectionRecoveryCopy(error);
+  if (recoveryCopy) return recoveryCopy;
+  const formatted = typeof error === 'string' ? error : formatRemoteErrorShared(error);
+  const localized = localizedStableRemoteError(formatted);
+  if (localized) return localized;
   return humanizeRemoteErrorShared(error);
 }
 
+/**
+ * 连接恢复中的错误不会转成用户手动处理的失败态。
+ *
+ * DEVICE_UNRESPONSIVE 在通用 retry helper 里故意归为 permanent（避免熔断 open
+ * 时原地重试风暴），但对消息 outbox 来说仍是自动探测可恢复状态，必须留在本地
+ * 等熔断关闭，而不是让用户重发。
+ */
+export function isAutoRecoveringRemoteError(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  const message = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
+  return code === 'SESSION_REFERENCE_OFFLINE'
+    || message.includes('SESSION_REFERENCE_OFFLINE')
+    // 桌面端 fail-closed：持久消息 / input coordinator 暂时无法完成 clientId
+    // 去重核验。原消息必须留在 outbox 等状态恢复，不能让用户换 id 重发。
+    || message.includes('REMOTE_OPTIMISTIC_SESSION_STATE_UNAVAILABLE')
+    || isTransientRemoteError(error)
+    || isDeviceUnresponsiveRemoteError(error);
+}
+
+/**
+ * 权威同步的一轮内置瞬态重试耗尽后，页面继续自动恢复所用的外层退避。
+ * 900ms 尽快吃掉短抖动，随后指数放缓并封顶 30s，避免电脑长期离线时形成请求风暴。
+ */
+export function connectionRecoverySyncRetryDelayMs(attempt: number): number {
+  return Math.min(900 * 2 ** Math.max(0, Math.floor(attempt)), 30_000);
+}
+
 export function describeRemoteError(error: string | null): string | null {
-  if (error?.includes('DEVICE_UNRESPONSIVE')) {
+  if (!error) return null;
+  if (error.includes('DEVICE_UNRESPONSIVE')) {
     return i18n.t('deviceLink.deviceUnresponsiveHint');
   }
+  const recoveryCopy = localizedConnectionRecoveryCopy(error);
+  if (recoveryCopy) return recoveryCopy;
+  const agentAuth = describeAgentAuthError(error);
+  if (agentAuth) return agentAuth;
+  const localized = localizedStableRemoteError(error);
+  if (localized) return localized;
   return describeRemoteErrorShared(error);
+}
+
+function localizedStableRemoteError(error: string): string | null {
+  const simpleMarkers: Array<[string, string]> = [
+    ['REMOTE_DISABLED', 'remoteDisabled'],
+    ['CHANNEL_NOT_ALLOWED', 'channelNotAllowed'],
+    ['ACCESS_REVOKED', 'accessRevoked'],
+    ['DEVICE_UNRESPONSIVE', 'deviceUnresponsive'],
+    ['VERSION_MISMATCH', 'versionMismatch'],
+    ['PAYLOAD_TOO_LARGE', 'payloadTooLarge'],
+    ['MEDIA_FETCH_FAILED', 'mediaFetchFailed'],
+    ['VOICE_TRANSCRIBE_FAILED', 'voiceTranscribeFailed'],
+    ['LINK_NOT_OPEN', 'linkNotOpen'],
+  ];
+  for (const [marker, key] of simpleMarkers) {
+    if (error.includes(marker)) return i18n.t(`deviceLink.remoteError.${key}`);
+  }
+  if (error.includes('PRECONDITION_FAILED')) {
+    if (error.includes('ACCOUNT_CHANGED')) return i18n.t('deviceLink.remoteError.accountChanged');
+    if (error.includes('OFFER_EXPIRED')) return i18n.t('deviceLink.remoteError.offerExpired');
+    return i18n.t('deviceLink.remoteError.preconditionFailed');
+  }
+  if (isTransientRemoteError(error)) return i18n.t('deviceLink.remoteError.transient');
+  if (error.includes('BAD_REQUEST') || error.includes('INTERNAL')) {
+    return i18n.t('deviceLink.remoteError.callFailed', { error });
+  }
+  return null;
+}
+
+/**
+ * 只有确定性远端错误才锁 composer；断线、弱网、超时与熔断由本地 outbox 接住，
+ * 恢复后自动派发。返回 null 表示 composer 可以继续收消息。
+ */
+export function describeRemoteComposerBlockingError(error: string | null): string | null {
+  if (!error || isAutoRecoveringRemoteError(error)) return null;
+  return describeRemoteError(error);
 }

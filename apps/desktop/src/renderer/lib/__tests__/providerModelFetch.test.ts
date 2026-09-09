@@ -2,10 +2,13 @@ import { describe, expect, it } from 'vitest';
 
 import {
   areProviderRequestUrlsAllowed,
+  canSendHydratedApiKey,
   connectionTestCanUseSaved,
   modelFetchCanReuseSavedCredentials,
   providerConnectionTestRequestSignature,
   providerModelFetchRequestSignature,
+  resolveProviderConnectionProbeRoute,
+  restoreHydratedApiKey,
   type SavedProviderProbeBaseline,
 } from '../providerModelFetch';
 
@@ -69,7 +72,7 @@ describe('providerModelFetchRequestSignature', () => {
 describe('providerConnectionTestRequestSignature', () => {
   const connectionFields = {
     ...fields,
-    wireProtocol: 'openai-responses',
+    wireProtocol: 'openai-responses' as const,
     models: [{ id: ' model-a ' }, { id: 'model-b' }],
   };
 
@@ -94,6 +97,74 @@ describe('providerConnectionTestRequestSignature', () => {
       ),
     ).not.toBe(original);
     expect(providerConnectionTestRequestSignature(connectionFields, 'none')).not.toBe(original);
+    expect(
+      providerConnectionTestRequestSignature(
+        { ...connectionFields, models: [{ id: 'model-a', piApi: 'anthropic-messages' }] },
+        'apiKey',
+      ),
+    ).not.toBe(original);
+    expect(
+      providerConnectionTestRequestSignature(
+        {
+          ...connectionFields,
+          models: [
+            {
+              id: 'model-a',
+              route: {
+                baseUrl: 'https://api.example/anthropic',
+                wireProtocol: 'anthropic-messages',
+              },
+            },
+          ],
+        },
+        'apiKey',
+      ),
+    ).not.toBe(original);
+  });
+});
+
+describe('resolveProviderConnectionProbeRoute', () => {
+  it.each(['claude-code', 'codex'] as const)(
+    'uses the first model route for %s instead of the provider default',
+    (agent) => {
+      const modelWireProtocol =
+        agent === 'claude-code' ? ('anthropic-messages' as const) : ('openai-responses' as const);
+      expect(
+        resolveProviderConnectionProbeRoute(agent, {
+          baseUrl: 'https://api.example/provider',
+          requestPath: '/provider-path',
+          wireProtocol: agent === 'claude-code' ? 'anthropic-messages' : 'openai-chat',
+          models: [
+            {
+              id: 'model-a',
+              route: {
+                baseUrl: 'https://api.example/model',
+                wireProtocol: modelWireProtocol,
+                requestPath: '/model-responses',
+              },
+            },
+          ],
+        }),
+      ).toEqual({
+        baseUrl: 'https://api.example/model',
+        wireProtocol: modelWireProtocol,
+        requestPath: '/model-responses',
+      });
+    },
+  );
+
+  it('keeps Pi on its explicit per-model protocol resolver', () => {
+    expect(
+      resolveProviderConnectionProbeRoute('pi', {
+        baseUrl: 'https://api.example/provider',
+        requestPath: '/ignored',
+        wireProtocol: 'openai-chat',
+        models: [{ id: 'model-a', piApi: 'openai-responses' }],
+      }),
+    ).toEqual({
+      baseUrl: 'https://api.example/provider',
+      wireProtocol: 'openai-responses',
+    });
   });
 });
 
@@ -167,6 +238,133 @@ describe('modelFetchCanReuseSavedCredentials', () => {
       ),
     ).toBe(false);
   });
+
+  it('keeps saved credentials when only the inference request path changes', () => {
+    expect(
+      modelFetchCanReuseSavedCredentials(
+        {
+          baseUrl: headerAuthBaseline.baseUrl,
+          requestPath: '/tenant/acme/models',
+          modelsUrl: headerAuthBaseline.modelsUrl,
+        },
+        headerAuthBaseline,
+        'none',
+      ),
+    ).toBe(true);
+  });
+});
+
+describe('canSendHydratedApiKey', () => {
+  const apiKeyBaseline: SavedProviderProbeBaseline = {
+    ...headerAuthBaseline,
+    authMode: 'apiKey',
+    apiKey: 'saved-key',
+  };
+  const requestTarget = {
+    baseUrl: apiKeyBaseline.baseUrl,
+    requestPath: apiKeyBaseline.requestPath,
+    modelsUrl: apiKeyBaseline.modelsUrl,
+  };
+
+  it('keeps an untouched hydrated key on the saved base/models endpoint', () => {
+    expect(canSendHydratedApiKey(requestTarget, apiKeyBaseline, 'apiKey', 0)).toBe(true);
+    expect(
+      canSendHydratedApiKey(
+        { ...requestTarget, baseUrl: 'https://new.example/v1' },
+        apiKeyBaseline,
+        'apiKey',
+        0,
+      ),
+    ).toBe(false);
+    expect(
+      canSendHydratedApiKey(
+        { ...requestTarget, modelsUrl: 'https://new.example/models' },
+        apiKeyBaseline,
+        'apiKey',
+        0,
+      ),
+    ).toBe(false);
+  });
+
+  it('allows a key after the user explicitly edits it', () => {
+    expect(
+      canSendHydratedApiKey(
+        { ...requestTarget, baseUrl: 'https://new.example/v1' },
+        apiKeyBaseline,
+        'apiKey',
+        1,
+      ),
+    ).toBe(true);
+  });
+  it('allows the hydrated key when only requestPath changes', () => {
+    expect(
+      canSendHydratedApiKey(
+        {
+          baseUrl: apiKeyBaseline.baseUrl,
+          requestPath: '/tenant/acme/models',
+          modelsUrl: apiKeyBaseline.modelsUrl,
+        },
+        apiKeyBaseline,
+        'apiKey',
+        0,
+      ),
+    ).toBe(true);
+  });
+
+  it('still blocks a changed model-discovery endpoint until the key is edited', () => {
+    expect(
+      canSendHydratedApiKey(
+        { baseUrl: 'https://new.example/v1', modelsUrl: apiKeyBaseline.modelsUrl },
+        apiKeyBaseline,
+        'apiKey',
+        0,
+      ),
+    ).toBe(false);
+    expect(
+      canSendHydratedApiKey(
+        { baseUrl: 'https://new.example/v1', modelsUrl: apiKeyBaseline.modelsUrl },
+        apiKeyBaseline,
+        'apiKey',
+        1,
+      ),
+    ).toBe(true);
+  });
+});
+
+describe('restoreHydratedApiKey', () => {
+  const baseline: SavedProviderProbeBaseline = {
+    ...headerAuthBaseline,
+    authMode: 'apiKey',
+    apiKey: 'saved-key',
+  };
+
+  it('restores a cleared hydrated key after returning to the saved endpoint', () => {
+    const reverted = {
+      baseUrl: baseline.baseUrl,
+      modelsUrl: baseline.modelsUrl,
+      apiKey: '',
+    };
+    expect(restoreHydratedApiKey(reverted, baseline, 'apiKey', 0).apiKey).toBe('saved-key');
+  });
+
+  it('does not overwrite an explicit key edit or a different endpoint', () => {
+    expect(
+      restoreHydratedApiKey(
+        { baseUrl: baseline.baseUrl, modelsUrl: baseline.modelsUrl, apiKey: '' },
+        baseline,
+        'apiKey',
+        1,
+      ).apiKey,
+    ).toBe('');
+    expect(
+      restoreHydratedApiKey(
+        { baseUrl: 'https://new.example/v1', modelsUrl: baseline.modelsUrl, apiKey: '' },
+        baseline,
+        'apiKey',
+        0,
+      ).apiKey,
+    ).toBe('');
+  });
 });
 
 describe('connectionTestCanUseSaved', () => {
@@ -176,7 +374,7 @@ describe('connectionTestCanUseSaved', () => {
     modelsUrl: 'https://gw.example/v1/models',
     apiKey: '',
     headers: [] as ReadonlyArray<{ name: string; value: string }>,
-    wireProtocol: 'openai-responses',
+    wireProtocol: 'openai-responses' as const,
     models: [{ id: 'm-1' }],
   };
 
@@ -184,21 +382,79 @@ describe('connectionTestCanUseSaved', () => {
     expect(connectionTestCanUseSaved(connForm, headerAuthBaseline, 'none')).toBe(true);
   });
 
+  it('falls back to adhoc when the first model protocol override changed', () => {
+    expect(
+      connectionTestCanUseSaved(
+        { ...connForm, models: [{ id: 'm-1', piApi: 'anthropic-messages' }] },
+        headerAuthBaseline,
+        'none',
+      ),
+    ).toBe(false);
+    expect(
+      connectionTestCanUseSaved(
+        { ...connForm, models: [{ id: 'm-1', piApi: 'anthropic-messages' }] },
+        { ...headerAuthBaseline, modelPiApi: 'anthropic-messages' },
+        'none',
+      ),
+    ).toBe(true);
+  });
+
+  it('falls back to adhoc when the first model route changed', () => {
+    const modelRoute = {
+      baseUrl: 'https://gw.example/anthropic',
+      wireProtocol: 'anthropic-messages' as const,
+    };
+    expect(
+      connectionTestCanUseSaved(
+        { ...connForm, models: [{ id: 'm-1', route: modelRoute }] },
+        { ...headerAuthBaseline, modelRoute },
+        'none',
+      ),
+    ).toBe(true);
+    expect(
+      connectionTestCanUseSaved(
+        {
+          ...connForm,
+          models: [
+            {
+              id: 'm-1',
+              route: { ...modelRoute, baseUrl: 'https://gw.example/anthropic-v2' },
+            },
+          ],
+        },
+        { ...headerAuthBaseline, modelRoute },
+        'none',
+      ),
+    ).toBe(false);
+  });
+
   it('falls back to adhoc when endpoint, protocol or auth mode changed', () => {
     expect(
-      connectionTestCanUseSaved({ ...connForm, baseUrl: 'https://gw.example/v2' }, headerAuthBaseline, 'none'),
+      connectionTestCanUseSaved(
+        { ...connForm, baseUrl: 'https://gw.example/v2' },
+        headerAuthBaseline,
+        'none',
+      ),
     ).toBe(false);
     expect(
       connectionTestCanUseSaved({ ...connForm, requestPath: '/chat' }, headerAuthBaseline, 'none'),
     ).toBe(false);
     expect(
-      connectionTestCanUseSaved({ ...connForm, wireProtocol: 'openai-chat' }, headerAuthBaseline, 'none'),
+      connectionTestCanUseSaved(
+        { ...connForm, wireProtocol: 'openai-chat' },
+        headerAuthBaseline,
+        'none',
+      ),
     ).toBe(false);
     expect(connectionTestCanUseSaved(connForm, headerAuthBaseline, 'apiKey')).toBe(false);
   });
 
   it('falls back to adhoc when the user changed the api key so the new key is what gets tested', () => {
-    const apiKeyBaseline: SavedProviderProbeBaseline = { ...headerAuthBaseline, authMode: 'apiKey', apiKey: 'saved-key' };
+    const apiKeyBaseline: SavedProviderProbeBaseline = {
+      ...headerAuthBaseline,
+      authMode: 'apiKey',
+      apiKey: 'saved-key',
+    };
     expect(
       connectionTestCanUseSaved({ ...connForm, apiKey: 'saved-key' }, apiKeyBaseline, 'apiKey'),
     ).toBe(true);

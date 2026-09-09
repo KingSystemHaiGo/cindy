@@ -10,7 +10,8 @@ import type { PluginMarketItem } from '../../../shared/pluginMarket';
 import {
   filterGhostPluginItems,
   ghostFallbackIconKind,
-  ghostPanelOwnerKey,
+  ghostWebviewOwnerKey,
+  ghostPrimaryAction,
   marketPresentationForInstalledGhost,
   nextOpenPanelIdForOwner,
   sortGhostPluginItemsByRecentUse,
@@ -32,7 +33,7 @@ function manifest(overrides: Partial<GhostManifest> = {}): GhostManifest {
     whenToUse: 'When the user needs media generation.',
     kind: 'chip',
     entry: 'main.js',
-    slots: ['tool', 'network', 'card'],
+    card: {},
     tools: [
       { name: 'submit_gen_image', description: 'Generate an image.' },
       { name: 'download_file', description: 'Download a file.' },
@@ -58,6 +59,7 @@ function installed(overrides: Partial<InstalledGhost> = {}): InstalledGhost {
     manifest: manifest(),
     dir: '/tmp/cindy-brain/xd-mivo',
     enabled: true,
+    approval: { state: 'approved', revision: '00000000-0000-4000-8000-000000000001' },
     ...overrides,
   };
 }
@@ -107,7 +109,12 @@ describe('ghostPluginViewModel', () => {
         version: '1',
         enabled: true,
         canUse: true,
+        approvalState: 'approved',
+        builtin: false,
         tabPanel: false,
+        hasMainView: false,
+        mainViewTitle: null,
+        hostCapability: null,
       },
       {
         id: 'lizi-mivo',
@@ -116,7 +123,12 @@ describe('ghostPluginViewModel', () => {
         version: '1',
         enabled: true,
         canUse: true,
+        approvalState: 'approved',
+        builtin: false,
         tabPanel: false,
+        hasMainView: false,
+        mainViewTitle: null,
+        hostCapability: null,
       },
       {
         id: 'slack',
@@ -125,7 +137,12 @@ describe('ghostPluginViewModel', () => {
         version: '1',
         enabled: true,
         canUse: true,
+        approvalState: 'approved',
+        builtin: false,
         tabPanel: false,
+        hasMainView: false,
+        mainViewTitle: null,
+        hostCapability: null,
       },
     ] satisfies GhostPluginListItem[];
 
@@ -216,8 +233,43 @@ describe('ghostPluginViewModel', () => {
       name: 'XD Mivo',
       enabled: true,
       canUse: true,
+      hostCapability: null,
       version: '1.5.10',
     });
+  });
+
+  it('projects the iOS Simulator declaration as an explicit Host capability action', () => {
+    const item = toGhostPluginListItem(
+      installed({
+        manifest: manifest({
+          command: undefined,
+          iosSimulator: true,
+          tools: undefined,
+          network: undefined,
+        }),
+      }),
+    );
+
+    expect(item.hostCapability).toBe('ios-simulator');
+    expect(ghostPrimaryAction(item)).toBe('capability');
+  });
+
+  it('projects main-view metadata without overriding the existing panel action', () => {
+    const item = toGhostPluginListItem(
+      installed({
+        enabled: false,
+        approval: { state: 'invalid' },
+        manifest: manifest({
+          slots: ['main-view', 'panel'],
+          minCindyVersion: '1.2.3',
+          mainView: { html: 'main-view.html', title: 'Workspace' },
+          panel: { html: 'panel.html', position: 'tab' },
+        }),
+      }),
+    );
+
+    expect(item).toMatchObject({ hasMainView: true, mainViewTitle: 'Workspace', enabled: false });
+    expect(ghostPrimaryAction(item)).toBe('panel');
   });
 
   it('overlays exact installed market presentation without changing runtime facts', () => {
@@ -249,12 +301,31 @@ describe('ghostPluginViewModel', () => {
     ]);
   });
 
-  it('treats a market null icon as an explicit presentation override', () => {
+  it('treats a server market null icon as an explicit presentation override', () => {
     const ghost = installed({ iconDataUrl: 'data:image/png;base64,OLD' });
     const presentation = marketPresentationForInstalledGhost(ghost, marketItem({ icon: null }));
 
     expect(presentation).not.toBeNull();
     expect(toGhostPluginListItem(ghost, presentation)).not.toHaveProperty('iconDataUrl');
+  });
+
+  it('uses the installed package icon for an exact Git market mapping', () => {
+    const ghost = installed({ iconDataUrl: 'data:image/png;base64,LOCAL' });
+    const presentation = marketPresentationForInstalledGhost(
+      ghost,
+      marketItem({
+        sourceType: 'git-market',
+        sourceMarketName: 'community-plugins',
+        icon: null,
+      }),
+    );
+
+    expect(toGhostPluginListItem(ghost, presentation)).toMatchObject({
+      iconDataUrl: 'data:image/png;base64,LOCAL',
+    });
+    expect(toGhostPluginDetail(ghost, presentation)).toMatchObject({
+      iconDataUrl: 'data:image/png;base64,LOCAL',
+    });
   });
 
   it.each([
@@ -287,10 +358,20 @@ describe('ghostPluginViewModel', () => {
     expect(item).not.toHaveProperty('whenToUse');
   });
 
+  it('carries the Host approval state so the list can explain an unrunnable install', () => {
+    expect(toGhostPluginListItem(installed()).approvalState).toBe('approved');
+    expect(
+      toGhostPluginListItem(installed({ approval: { state: 'legacy-unapproved' } })).approvalState,
+    ).toBe('legacy-unapproved');
+    expect(toGhostPluginDetail(installed({ approval: { state: 'invalid' } })).approvalState).toBe(
+      'invalid',
+    );
+  });
+
   it('derives detail permissions and runtime declarations from the manifest', () => {
     const detail = toGhostPluginDetail(installed());
 
-    expect(detail.contents).toEqual(['code', 'slotTool', 'slotNetwork', 'slotCard']);
+    expect(detail.contents).toEqual(['code', 'slotTool', 'slotCard', 'slotNetwork']);
     expect(detail.tools.map((tool) => tool.name)).toEqual(['submit_gen_image', 'download_file']);
     expect(detail.panelMinWidth).toBeNull();
     expect(detail.installDir).toBe('/tmp/cindy-brain/xd-mivo');
@@ -316,7 +397,7 @@ describe('ghostPluginViewModel', () => {
           tools: undefined,
           network: undefined,
           command: undefined,
-          slots: ['tool'],
+          card: undefined,
         }),
       }),
     );
@@ -332,7 +413,6 @@ describe('ghostPluginViewModel', () => {
     const detail = toGhostPluginDetail(
       installed({
         manifest: manifest({
-          slots: ['panel', 'cindy'],
           panel: { html: 'panel.html', minWidth: 360 },
           cindy: { image: ['generate', 'edit'], video: ['generate'] },
         }),
@@ -344,27 +424,29 @@ describe('ghostPluginViewModel', () => {
   });
 });
 
-describe('plugin panel owner isolation', () => {
-  it('gives each data owner its own panel host key and stays stable within one', () => {
-    const cloudA = ghostPanelOwnerKey('cloud', 'owner-a');
-    const cloudB = ghostPanelOwnerKey('cloud', 'owner-b');
-    const local = ghostPanelOwnerKey('local', null);
+describe('plugin webview owner isolation', () => {
+  it('gives each data owner its own webview host key and stays stable within one', () => {
+    const cloudA = ghostWebviewOwnerKey('cloud', 'owner-a');
+    const cloudB = ghostWebviewOwnerKey('cloud', 'owner-b');
+    const local = ghostWebviewOwnerKey('local', null);
 
     // 账号 A 与 B 即便装了同 id / 同版本 / 同入口的插件,宿主 key 也必须不同——
     // 否则 React 复用同一 webview 实例,A 的 DOM 与内存态会留在 B 面前。
     expect(new Set([cloudA, cloudB, local]).size).toBe(3);
     // 同一身份内稳定,不会无谓重挂面板。
-    expect(ghostPanelOwnerKey('cloud', 'owner-a')).toBe(cloudA);
+    expect(ghostWebviewOwnerKey('cloud', 'owner-a')).toBe(cloudA);
   });
 
   it('closes an open panel when the data owner changes, keeps it otherwise', () => {
-    const a = ghostPanelOwnerKey('cloud', 'owner-a');
-    const b = ghostPanelOwnerKey('cloud', 'owner-b');
+    const a = ghostWebviewOwnerKey('cloud', 'owner-a');
+    const b = ghostWebviewOwnerKey('cloud', 'owner-b');
 
     // A 打开着面板 → 切到 B:必须关掉,不许因为 B 也装了同 id 的插件就留着。
     expect(nextOpenPanelIdForOwner(a, b, 'ghost-shared')).toBeNull();
     // 云 → 本地同样算换身份。
-    expect(nextOpenPanelIdForOwner(a, ghostPanelOwnerKey('local', null), 'ghost-shared')).toBeNull();
+    expect(
+      nextOpenPanelIdForOwner(a, ghostWebviewOwnerKey('local', null), 'ghost-shared'),
+    ).toBeNull();
     // 身份没变则原样保留(别把用户正在用的面板关掉)。
     expect(nextOpenPanelIdForOwner(a, a, 'ghost-shared')).toBe('ghost-shared');
     expect(nextOpenPanelIdForOwner(a, a, null)).toBeNull();

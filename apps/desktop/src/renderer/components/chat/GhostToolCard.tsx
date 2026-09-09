@@ -98,7 +98,7 @@ function buildAudioRowHtml(durationLabel: string): string {
     'flex-shrink:0;font-size:11px;font-weight:500;font-variant-numeric:tabular-nums;color:var(--msg-tool-card-chevron,#525252)';
   return (
     '<div data-x-row style="display:flex;align-items:center;gap:12px;user-select:none">' +
-    '<button type="button" data-x-play aria-label="Play" style="display:flex;width:28px;height:28px;flex:0 0 auto;align-items:center;justify-content:center;border-radius:9999px;border:0;padding:0;cursor:pointer;background:var(--msg-tool-card-text,#262626);color:var(--msg-tool-card-bg,#ffffff)">' +
+    '<button type="button" data-x-play aria-label="" style="display:flex;width:28px;height:28px;flex:0 0 auto;align-items:center;justify-content:center;border-radius:9999px;border:0;padding:0;cursor:pointer;background:var(--msg-tool-card-text,#262626);color:var(--msg-tool-card-bg,#ffffff)">' +
     AUDIO_PLAY_SVG +
     '</button>' +
     `<span data-x-cur style="${timeStyle}">0:00</span>` +
@@ -297,7 +297,10 @@ function GhostCardCanvas({
         curEl.textContent = formatAudioClock(a.currentTime);
         durEl.textContent = formatAudioClock(d);
         btn.innerHTML = a.paused ? AUDIO_PLAY_SVG : AUDIO_PAUSE_SVG;
-        btn.setAttribute('aria-label', a.paused ? 'Play' : 'Pause');
+        btn.setAttribute(
+          'aria-label',
+          a.paused ? t('chat.media.audioPlay') : t('chat.media.audioPause'),
+        );
       };
       const onEnded = (): void => {
         // 与 ChatAudioCard 同观感:播完回 0:00 待重播。
@@ -353,7 +356,7 @@ function GhostCardCanvas({
       });
       render();
     },
-    [],
+    [t],
   );
 
   // 组件卸载:解绑 audio 监听、注销互斥总线、停播并释放媒体资源。
@@ -754,7 +757,7 @@ function GhostCardCanvas({
               boxShadow: 'var(--shadow-menu)',
             }}
           >
-            <div className="text-[13px] font-semibold" style={{ color: 'var(--text-primary)' }}>
+            <div className="text-13 font-semibold" style={{ color: 'var(--text-primary)' }}>
               {t('chat.ghostCall.linkConfirmTitle')}
             </div>
             <div className="mt-1.5 text-xs" style={{ color: 'var(--text-secondary)' }}>
@@ -762,14 +765,14 @@ function GhostCardCanvas({
             </div>
             {linkAskHost ? (
               <div
-                className="mt-1.5 break-all text-[13px] font-semibold"
+                className="mt-1.5 break-all text-13 font-semibold"
                 style={{ color: 'var(--text-primary)' }}
               >
                 {linkAskHost}
               </div>
             ) : null}
             <div
-              className="mt-1 max-h-24 overflow-y-auto break-all font-mono text-[11px] leading-relaxed"
+              className="mt-1 max-h-24 overflow-y-auto break-all font-mono text-11 leading-relaxed"
               style={{ color: 'var(--text-tertiary)' }}
             >
               {linkAsk}
@@ -807,6 +810,7 @@ function GhostCardCanvas({
           <DropdownMenuTrigger asChild>
             <span
               aria-hidden
+              data-fixed-menu-anchor
               style={{
                 position: 'fixed',
                 left: imgMenu.x,
@@ -836,6 +840,7 @@ function GhostCardCanvas({
           <DropdownMenuTrigger asChild>
             <span
               aria-hidden
+              data-fixed-menu-anchor
               style={{
                 position: 'fixed',
                 left: audioMenu.x,
@@ -974,7 +979,7 @@ export function GhostToolCard({
             <Ghost size={11} style={{ color: 'var(--text-secondary)' }} />
           )}
         </span>
-        <span className="min-w-0 truncate text-[11px] font-medium" style={{ color: 'var(--text-secondary)' }}>
+        <span className="min-w-0 truncate text-11 font-medium" style={{ color: 'var(--text-secondary)' }}>
           {name}
         </span>
         <span className="flex h-3.5 w-3.5 items-center justify-center">
@@ -1008,20 +1013,20 @@ export function GhostToolCard({
         >
           {toolName ? (
             <div
-              className="mb-1 inline-block rounded px-1.5 py-px font-mono text-[10px]"
+              className="mb-1 inline-block rounded px-1.5 py-px font-mono text-10"
               style={{ backgroundColor: 'var(--surface-chip)', color: 'var(--text-secondary)' }}
             >
               {toolName}
             </div>
           ) : null}
           <div
-            className="mb-1 text-[10px] font-medium tracking-[0.5px]"
+            className="mb-1 text-10 font-medium tracking-[0.5px]"
             style={{ color: 'var(--text-tertiary)' }}
           >
             {t('chat.ghostCall.cardParams')}
           </div>
           <pre
-            className="max-h-48 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed"
+            className="max-h-48 overflow-auto whitespace-pre-wrap break-all font-mono text-11 leading-relaxed"
             style={{ color: 'var(--text-secondary)' }}
           >
             {paramsJson}
@@ -1060,7 +1065,7 @@ export function GhostToolCard({
                   <Ghost size={11} style={{ color: 'var(--text-secondary)' }} />
                 )}
               </span>
-              <span className="min-w-0 truncate text-[11px] font-medium" style={{ color: 'var(--text-secondary)' }}>
+              <span className="min-w-0 truncate text-11 font-medium" style={{ color: 'var(--text-secondary)' }}>
                 {name}
               </span>
               <span className="flex h-3.5 w-3.5 items-center justify-center">

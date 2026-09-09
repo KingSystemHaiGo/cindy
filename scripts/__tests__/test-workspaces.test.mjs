@@ -31,6 +31,7 @@ import {
 	discoverTestFiles,
 	expandWorkspacePatterns,
 	filterRunsByWorkspace,
+	isIgnoredFile,
 	mapWithConcurrency,
 	normalizeRelPath,
 	parseWorkspacePatterns,
@@ -52,6 +53,7 @@ import {
 	resolvePnpmInvocation,
 	usablePnpmExecPath,
 } from "../shared/pnpm-invocation.mjs";
+import { findSymlinkPlatformSkips } from "../shared/symlink-test-guard.mjs";
 
 const ROOT = path.resolve(fileURLToPath(new URL("../..", import.meta.url)));
 
@@ -81,9 +83,15 @@ test("parseWorkspacePatterns reads pnpm-workspace.yaml package globs", () => {
 
 test("root unit and all scripts run runner self-tests before workspace sweep", () => {
 	const scripts = readRootScripts();
+	// CI uses the package lifecycle to propagate npm_execpath without duplicating self-tests.
+	assert.equal(scripts["test:workspaces"], "node scripts/test-workspaces.mjs");
 	assert.match(
 		scripts["test:unit"],
 		/^pnpm test:runner && node scripts\/test-workspaces\.mjs --tier unit$/,
+	);
+	assert.equal(
+		scripts["test:unit:related"],
+		"node scripts/test-workspaces.mjs --tier unit --related",
 	);
 	assert.match(
 		scripts["test:all"],
@@ -93,6 +101,12 @@ test("root unit and all scripts run runner self-tests before workspace sweep", (
 
 test("root db and guard delegate to the workspace runner", () => {
 	const scripts = readRootScripts();
+	for (const tier of ["integration", "e2e"]) {
+		assert.equal(
+			scripts[`test:${tier}`],
+			`pnpm test:runner && node scripts/test-workspaces.mjs --tier ${tier}`,
+		);
+	}
 	assert.equal(
 		scripts["test:git-integration"],
 		"pnpm test:runner && node scripts/test-workspaces.mjs --tier git-integration",
@@ -115,6 +129,14 @@ test("client CI owns the complete Desktop Git integration tier", () => {
 		job[1],
 		/^\s{6}- name: Run Desktop Git integration tests\n\s{8}run: pnpm test:git-integration$/m,
 	);
+});
+
+test("client CI no longer builds model-access protocol for consumers", () => {
+	const workflow = fs.readFileSync(
+		path.join(ROOT, ".github", "workflows", "ci.yml"),
+		"utf8",
+	).replace(/\r\n/g, "\n");
+	assert.doesNotMatch(workflow, /pnpm --filter @cindy\/model-access-protocol build/);
 });
 
 test("help groups copyable desktop, binary, and Mobile workflows", async () => {
@@ -191,11 +213,60 @@ test("unit workspace concurrency reserves the full worker budget for heavy works
 		...unitTestShardArgs(),
 	]);
 	assert.equal(makerCore.tiers.unit.execution, undefined);
+	assert.deepEqual(makerCore.tiers.unit.exclude, [
+		"**/*.integration.test.ts",
+		"**/*.e2e.test.ts",
+	]);
 	assert.deepEqual(makerCore.tiers.unit.command, {
 		type: "packageBin",
 		bin: "vitest",
 		args: ["run", "--pool=forks", "--maxWorkers=1", ...unitTestShardArgs()],
 	});
+});
+
+test("real agent integration tests are explicit tiers outside unit", () => {
+	const makerCore = manifest.workspaces.find(
+		(workspace) => workspace.cwd === "packages/maker-core",
+	);
+	const piManager = manifest.workspaces.find(
+		(workspace) => workspace.cwd === "packages/maker-pi-manager",
+	);
+	const desktop = manifest.workspaces.find(
+		(workspace) => workspace.cwd === "apps/desktop",
+	);
+	assert.equal(makerCore.tiers.integration.status, "manual");
+	assert.equal(makerCore.tiers.integration.execution, "exclusive");
+	assert.equal(makerCore.tiers.integration.coverage, "allowlist");
+	assert.deepEqual(makerCore.tiers.integration.include, [
+		"src/agents/codex/*.integration.test.ts",
+		"src/agents/claude-code/__tests__/*.integration.test.ts",
+		"src/agents/pi/__tests__/*.integration.test.ts",
+	]);
+	assert.deepEqual(piManager.tiers.unit.exclude, [
+		"src/__tests__/pi-manager.integration.test.ts",
+	]);
+	assert.deepEqual(piManager.tiers.integration.include, [
+		"src/__tests__/pi-manager.integration.test.ts",
+	]);
+	assert.deepEqual(desktop.tiers.e2e.include, [
+		"src/main/maker-host/__tests__/*.e2e.test.ts",
+	]);
+});
+
+test("Pi RPC lifecycle stays in unit while binary resource discovery stays in integration", () => {
+	const makerCore = manifest.workspaces.find(
+		(workspace) => workspace.cwd === "packages/maker-core",
+	);
+	const testDir = "packages/maker-core/src/agents/pi/__tests__";
+	const files = fs.readdirSync(path.join(ROOT, testDir))
+		.filter((file) => file.startsWith("pi-rpc-"))
+		.map((file) => `${testDir}/${file}`);
+	assert.deepEqual(selectFilesForTier(makerCore, makerCore.tiers.unit, files), [
+		`${testDir}/pi-rpc-harness.test.ts`,
+	]);
+	assert.deepEqual(selectFilesForTier(makerCore, makerCore.tiers.integration, files), [
+		`${testDir}/pi-rpc-resource-discovery.integration.test.ts`,
+	]);
 });
 
 test("unit tier pins an explicit vitest pool, forks only by documented exception", () => {
@@ -277,6 +348,41 @@ test("discoverTestFiles ignores generated and nested non-workspace directories",
 		"apps/server/src/__tests__/services/oss.spec.ts",
 		"apps/desktop/src/renderer/__tests__/automationGeneratedSessions.test.ts",
 	]);
+});
+
+test("isIgnoredFile ignores the git-ignored tmp/ product directory", () => {
+	// .gitignore 忽略 tmp/（会话工具临时产物）。readAllFiles 若递归进去，
+	// 遇到沙箱/工具遗留的不可读子目录会 EPERM 让整个门禁失败（#3353）。
+	assert.equal(isIgnoredFile("tmp/blocked"), true);
+	assert.equal(isIgnoredFile("tmp/nested/deep/file.ts"), true);
+	assert.equal(isIgnoredFile("packages/orca-workflow/tmp/x.test.ts"), true);
+	// 含 "tmp" 的合法包名/文件名不应被误杀（按路径段精确匹配）。
+	assert.equal(isIgnoredFile("packages/tmp-adapter/src/index.ts"), false);
+});
+
+test("readAllFiles tolerates an unreadable directory instead of crashing the gate", () => {
+	// 平台不支持把目录 chmod 成不可读时（Windows）跳过：EPERM 容错分支在
+	// POSIX 上由 chmod 0o000 覆盖，逻辑本身是平台无关的 try/catch。
+	if (process.platform === "win32") return;
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "read-all-files-"));
+	try {
+		fs.mkdirSync(path.join(root, "src"), { recursive: true });
+		fs.writeFileSync(path.join(root, "src", "a.test.ts"), "// ok\n");
+		// 一个当前进程无权 scandir 的目录（模拟沙箱遗留物）。
+		const locked = path.join(root, "tmp", "locked");
+		fs.mkdirSync(locked, { recursive: true });
+		fs.writeFileSync(path.join(locked, "secret.txt"), "x");
+		fs.chmodSync(path.join(root, "tmp", "locked"), 0o000);
+		try {
+			const files = readAllFiles(root);
+			assert.deepEqual(files.map(normalizeRelPath).sort(), ["src/a.test.ts"]);
+		} finally {
+			// 必须先恢复权限才能在 Windows/POSIX 清理临时目录。
+			fs.chmodSync(path.join(root, "tmp", "locked"), 0o700);
+		}
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
 });
 
 test("checkTestFiles fails runnable tiers with no selected tests", () => {
@@ -371,12 +477,14 @@ test("single-level include pattern matches orca workflow test file", () => {
 	);
 });
 
-test("desktop unit excludes migration, direct db-tier, and source-contract guard tests while keeping normal unit tests", () => {
+test("desktop unit excludes integration, migration, direct db-tier, and source-contract guard tests while keeping normal unit tests", () => {
 	const workspace = { cwd: "apps/desktop", status: "required" };
 	const tier = {
 		status: "required",
 		exclude: [
 			"**/*.git-integration.test.ts",
+			"**/*.integration.test.ts",
+			"**/*.e2e.test.ts",
 			"src/main/localDb/**",
 			"src/main/__tests__/*Migration.test.ts",
 			"src/main/__tests__/schemaDriftRepair.test.ts",
@@ -478,6 +586,65 @@ test("tests never bind a fixed numeric port", () => {
 			for (const match of source.matchAll(pattern)) {
 				if (Number(match[1]) !== 0) violations.push(`${file}:${match[1]}`);
 			}
+		}
+	}
+	assert.deepEqual(violations, []);
+});
+
+test("symlink platform-skip guard detects hard skips without flagging capability probes", () => {
+	assert.deepEqual(
+		findSymlinkPlatformSkips(`
+			it.skipIf(process.platform === "win32")("rejects escape", async () => {
+				await fs.symlink(outside, link);
+			});
+		`),
+		[{ line: 2 }],
+	);
+	assert.deepEqual(
+		findSymlinkPlatformSkips(`
+			it.skipIf(!canCreateSymlink)("rejects escape", async () => {
+				await fs.symlink(outside, link);
+			});
+			it.skipIf(process.platform === "win32")("sends SIGTERM", async () => {
+				await stopProcess();
+			});
+		`),
+		[],
+	);
+	assert.deepEqual(
+		findSymlinkPlatformSkips(`
+			it("rejects escape", async () => {
+				if (process.platform === "win32") return;
+				await fs.symlink(outside, link);
+			});
+		`),
+		[{ line: 3 }],
+	);
+});
+
+test("symlink platform-skip guard requires a concrete POSIX-only exception", () => {
+	const skippedTest = `
+		// symlink-platform-skip: Windows cannot represent non-UTF-8 link target bytes.
+		it.skipIf(process.platform === "win32")("hashes raw link bytes", async () => {
+			await fs.symlink(Buffer.from([0xff]), link);
+		});
+	`;
+	assert.deepEqual(findSymlinkPlatformSkips(skippedTest), []);
+	assert.deepEqual(
+		findSymlinkPlatformSkips(skippedTest.replace(
+			"Windows cannot represent non-UTF-8 link target bytes.",
+			"POSIX only",
+		)),
+		[{ line: 3 }],
+	);
+});
+
+test("symlink tests never skip solely because the host is Windows", () => {
+	const violations = [];
+	for (const file of discoverTestFiles(readAllFiles(ROOT))) {
+		const source = fs.readFileSync(path.join(ROOT, file), "utf8");
+		for (const violation of findSymlinkPlatformSkips(source)) {
+			violations.push(`${file}:${violation.line}`);
 		}
 	}
 	assert.deepEqual(violations, []);
@@ -751,14 +918,14 @@ test("filterRunsByWorkspace selects by manifest name or cwd and supports exclude
 	);
 });
 
-test("expandWorkspacePatterns supports nested submodule package roots", () => {
+test("expandWorkspacePatterns supports nested workspace package roots", () => {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "workspace-patterns-"));
 	try {
-		const pkg = path.join(root, "cindy-protocol", "packages", "protocol-a");
+		const pkg = path.join(root, "vendor", "protocols", "protocol-a");
 		fs.mkdirSync(pkg, { recursive: true });
 		fs.writeFileSync(path.join(pkg, "package.json"), '{"name":"protocol-a"}\n');
-		assert.deepEqual(expandWorkspacePatterns(root, ["cindy-protocol/packages/*"]), [
-			"cindy-protocol/packages/protocol-a",
+		assert.deepEqual(expandWorkspacePatterns(root, ["vendor/protocols/*"]), [
+			"vendor/protocols/protocol-a",
 		]);
 	} finally {
 		fs.rmSync(root, { recursive: true, force: true });
@@ -777,6 +944,7 @@ test("parseCliOptions rejects --tier without a value", () => {
 		excludeWorkspaces: [],
 		workspaceConcurrency: undefined,
 		noLock: false,
+		related: false,
 	});
 });
 
@@ -799,6 +967,7 @@ test("parseCliOptions supports workspace include and exclude selectors", () => {
 			excludeWorkspaces: ["packages/orca-workflow"],
 			workspaceConcurrency: undefined,
 			noLock: false,
+			related: false,
 		},
 	);
 	assert.deepEqual(parseWorkspaceSelectorValue(" desktop, apps/server "), [
@@ -836,6 +1005,11 @@ test("workspace concurrency defaults to a bounded CPU count and accepts both CLI
 		/requires a positive integer/,
 	);
 	assert.equal(parseCliOptions(["--no-lock"]).noLock, true);
+	assert.equal(parseCliOptions(["--related"]).related, true);
+	assert.throws(
+		() => parseCliOptions(["--related", "--all"]),
+		/--related cannot be combined with --all/,
+	);
 });
 
 test("unit CI shard arguments cover valid halves and reject malformed input", () => {
@@ -848,7 +1022,7 @@ test("unit CI shard arguments cover valid halves and reject malformed input", ()
 });
 
 test("test gate lock covers heavy local tiers but skips guard, CI, and explicit bypass", () => {
-	for (const tier of ["unit", "db", "git-integration"]) {
+	for (const tier of ["unit", "db", "git-integration", "integration", "e2e"]) {
 		assert.equal(shouldUseTestGateLock({ tier, env: {} }), true);
 	}
 	assert.equal(shouldUseTestGateLock({ all: true, env: {} }), true);
@@ -938,6 +1112,20 @@ test("test gate lock decision prefers an existing owner over an earlier free por
 	assert.equal(classifyTestGateLockProbeError("ETIMEDOUT"), "collision");
 });
 
+test("test gate lock rejects invalid port counts before deriving candidates", async () => {
+	for (const lockPortCount of [0, -1, 1.5, Number.NaN]) {
+		await assert.rejects(
+			() =>
+				acquireTestGateLock({
+					repoRoot: "unused",
+					owner: { pid: 99, tier: "unit", cwd: "unused" },
+					lockPortCount,
+				}),
+			/lockPortCount must be a positive integer/,
+		);
+	}
+});
+
 test("test gate lock reports the holder, waits, and acquires after release", async () => {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "test-gate-lock-"));
 	let probeRound = 0;
@@ -994,6 +1182,12 @@ test("test gate lock reports the holder, waits, and acquires after release", asy
 // fails for reasons unrelated to the lock protocol.
 const REAL_LOCK_WAIT_WINDOW_MS = 30_000;
 const REAL_LOCK_ACQUIRE_TIMEOUT_MS = 60_000;
+// Windows assigns 49152+ as its default dynamic client-port range. Keep this
+// real socket test outside that range so unrelated CI network traffic cannot
+// occupy all deterministic candidates while preserving the production range.
+const REAL_LOCK_TEST_PORT_START = 10_000;
+const REAL_LOCK_TEST_PORT_COUNT = 30_000;
+const REAL_LOCK_TEST_PORT_STRIDE = 997;
 
 function raceWithDeadline(candidates, deadlineMs, deadlineValue) {
 	let timer;
@@ -1017,11 +1211,17 @@ test("two real test gate lock holders serialize on the same identity", async () 
 		firstLock = await acquireTestGateLock({
 			repoRoot: root,
 			owner: { pid: 41, tier: "unit", cwd: path.join(root, "first") },
+			lockPortStart: REAL_LOCK_TEST_PORT_START,
+			lockPortCount: REAL_LOCK_TEST_PORT_COUNT,
+			lockPortStride: REAL_LOCK_TEST_PORT_STRIDE,
 			output: () => {},
 		});
 		secondLockPromise = acquireTestGateLock({
 			repoRoot: root,
 			owner: { pid: 42, tier: "db", cwd: path.join(root, "second") },
+			lockPortStart: REAL_LOCK_TEST_PORT_START,
+			lockPortCount: REAL_LOCK_TEST_PORT_COUNT,
+			lockPortStride: REAL_LOCK_TEST_PORT_STRIDE,
 			timeoutMs: REAL_LOCK_ACQUIRE_TIMEOUT_MS,
 			retryDelayMs: 10,
 			output: reportWaiting,
@@ -1043,7 +1243,10 @@ test("two real test gate lock holders serialize on the same identity", async () 
 		await firstLock.release();
 		firstLock = undefined;
 		const secondLock = await secondLockPromise;
-		assert.ok(secondLock.port >= 49_152);
+		assert.ok(secondLock.port >= REAL_LOCK_TEST_PORT_START);
+		assert.ok(
+			secondLock.port < REAL_LOCK_TEST_PORT_START + REAL_LOCK_TEST_PORT_COUNT,
+		);
 	} finally {
 		// Order matters: releasing the first lock lets the second acquisition
 		// settle immediately instead of waiting out its own timeout.
@@ -1796,15 +1999,24 @@ test("runPlannedTests passes selected include files to packageBin commands", asy
 		allFiles: ["packages/orca-workflow/src/__tests__/orca-bridge-mcp.test.ts"],
 		manifest,
 		tier: "unit",
-		runCommandImpl: async (command, args) => {
-			calls.push({ command, args });
+		runCommandImpl: async (command, args, options) => {
+			calls.push({ command, args, options });
 			return { exitCode: 0, output: "PASS" };
 		},
 	});
-	assert.deepEqual(calls[0].args.slice(-1), [
+	// Windows 上 resolvePnpmInvocation 会通过 cmd.exe 包装，实际 pnpm 参数
+	// 放在 env 的 CINDY_PNPM_CMD_ARG_N 里。其他平台参数直接在 args 里。
+	const call = calls[0];
+	const pnpmArgs = call.options?.env
+		? Object.keys(call.options.env)
+				.filter((k) => k.startsWith("CINDY_PNPM_CMD_ARG_"))
+				.sort()
+				.map((k) => call.options.env[k])
+		: call.args;
+	assert.deepEqual(pnpmArgs.slice(-1), [
 		"src/__tests__/orca-bridge-mcp.test.ts",
 	]);
-	assert.equal(calls[0].args.includes("src/__tests__/**/*.test.ts"), false);
+	assert.equal(pnpmArgs.includes("src/__tests__/**/*.test.ts"), false);
 });
 
 test("buildPnpmArgs rejects selected files outside the workspace", () => {
@@ -1819,6 +2031,32 @@ test("buildPnpmArgs rejects selected files outside the workspace", () => {
 			),
 		/Selected test file is outside workspace packages\/orca-workflow: packages\/other\/src\/foo\.test\.ts/,
 	);
+});
+
+test("buildPnpmArgs switches vitest to related mode when related files are provided", () => {
+	const args = buildPnpmArgs(
+		"F:/repo",
+		{ cwd: "apps/desktop" },
+		{
+			type: "packageBin",
+			bin: "vitest",
+			args: ["run", "--pool=threads", "--maxWorkers=1"],
+		},
+		{ exclude: ["**/*.bench.ts"] },
+		["apps/desktop/src/main/foo.test.ts"],
+		["apps/desktop/src/main/foo.ts"],
+	);
+	assert.equal(args[3], "vitest");
+	assert.deepEqual(args.slice(4, 9), [
+		"related",
+		"--run",
+		"--pool=threads",
+		"--maxWorkers=1",
+		"--passWithNoTests",
+	]);
+	assert.equal(args.includes("src/main/foo.ts"), true);
+	assert.equal(args.includes("src/main/foo.test.ts"), false);
+	assert.deepEqual(args.slice(-2), ["--exclude", "**/*.bench.ts"]);
 });
 
 test("buildPnpmArgs only loosens Vitest sharding for undersized workspaces", () => {

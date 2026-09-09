@@ -25,6 +25,8 @@ import { CURRENT_CINDY_REGION } from '../../shared/brandRegion.js';
 import {
   CodexResumePreparationBlockedError,
   finalizeCodexCitationText,
+  isOversizedLiveTailStats,
+  measureRolloutLiveTailStats,
 } from '@cindy/maker-core';
 
 import { getCurrentDbClientUserId, getDbClient } from '../localDb/client/current.js';
@@ -314,6 +316,8 @@ interface CodexThreadSummary {
 
 interface CodexSessionIndexEntry {
   title: string;
+  /** 用户真实自定义标题(thread_name > title,无 fallback);无则 null(#3482)。 */
+  customTitle: string | null;
   updatedAt: number | null;
 }
 
@@ -1376,7 +1380,7 @@ function acceptStateBackedWinnerAfterRecovery(
   return winner;
 }
 
-/** 当前区域的全部历史品牌 Codex HOME;不包含当前 Cindy/CindyGlobal HOME。 */
+/** 当前区域的全部历史品牌 Codex HOME;不包含当前区域正在使用的 HOME。 */
 function legacyBrandedCodexHomes(targetHome: string): string[] {
   const userDataParent = path.dirname(path.dirname(targetHome));
   return allUserDataDirNames(CURRENT_CINDY_REGION)
@@ -1562,6 +1566,68 @@ export async function dumpCodexThreadStateRows(threadId: string): Promise<CodexT
   return dump;
 }
 
+/** Capture only a newly forked thread's exact private DB row and rollout identity. */
+export function reserveCodexForkCleanup(
+  threadId: string,
+  sourceThreadId: string,
+): (() => Promise<void>) | null {
+  if (!isLikelyThreadId(threadId) || threadId === sourceThreadId) return null;
+  const home = getDesktopCodexHome();
+  const stateDbPath = findLatestStateDb(home);
+  if (!stateDbPath || !isPathInside(home, stateDbPath)) return null;
+  const row = readRawThreadRow(stateDbPath, threadId);
+  const rolloutPath = stringValue(row?.rollout_path);
+  if (
+    !rolloutPath ||
+    !isPathInside(home, rolloutPath) ||
+    threadIdFromRolloutPath(rolloutPath) !== threadId
+  ) return null;
+  try {
+    const stateDb = fs.lstatSync(stateDbPath);
+    const rollout = fs.lstatSync(rolloutPath);
+    if (!stateDb.isFile() || !rollout.isFile()) return null;
+    return async () => {
+      let db: Database.Database | null = null;
+      try {
+        const currentDb = fs.lstatSync(stateDbPath);
+        const currentRollout = fs.lstatSync(rolloutPath);
+        if (
+          !currentDb.isFile() || currentDb.dev !== stateDb.dev || currentDb.ino !== stateDb.ino ||
+          !currentRollout.isFile() || currentRollout.dev !== rollout.dev || currentRollout.ino !== rollout.ino
+        ) return;
+        db = createBetterSqliteDatabase(stateDbPath);
+        db.pragma(`busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
+        const targetDb = db;
+        let stateRemoved = false;
+        targetDb.transaction(() => {
+          const current = targetDb.prepare('SELECT rollout_path FROM threads WHERE id = ? LIMIT 1')
+            .get(threadId) as { rollout_path?: string } | undefined;
+          if (current?.rollout_path !== rolloutPath) return;
+          if (tableExists(targetDb, 'thread_dynamic_tools')) {
+            targetDb.prepare('DELETE FROM thread_dynamic_tools WHERE thread_id = ?').run(threadId);
+          }
+          if (tableExists(targetDb, 'thread_spawn_edges')) {
+            targetDb.prepare('DELETE FROM thread_spawn_edges WHERE parent_thread_id = ?').run(threadId);
+          }
+          stateRemoved = targetDb.prepare('DELETE FROM threads WHERE id = ? AND rollout_path = ?')
+            .run(threadId, rolloutPath).changes > 0;
+        })();
+        if (stateRemoved) await fsp.rm(rolloutPath, { force: true });
+      } catch (error) {
+        log.warn('forked Codex thread cleanup failed', {
+          threadId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      } finally {
+        closeDbQuietly(db);
+      }
+    };
+  } catch {
+    return null;
+  }
+}
+
 /** 只读取一个 state DB 里该 thread 的三表行并转成 JSON 可序列化形态。 */
 function readThreadStateRows(
   dbPath: string,
@@ -1634,6 +1700,14 @@ export interface ImportSharedCodexThreadResult {
    */
   stateWritten: boolean;
   /**
+   * 复用既有 thread 时，本次刷新前的可变字段快照。后续 Maker DB 事务失败时
+   * 必须恢复，不能让失败的覆盖导入把旧任务的 cwd / rollout_path 改到新目录。
+   */
+  previousState: {
+    dbPath: string;
+    values: Record<string, SqlScalar>;
+  } | null;
+  /**
    * 调用结束后该 thread 的 state 行是否在 desktop state DB 里(本次写入或原本
    * 就在都算)。false = B 机无 state DB 或写入失败,调用方据此降档提示——
    * 不能用 stateWritten 判断:复用场景 stateWritten=false 但 state 完好。
@@ -1684,6 +1758,7 @@ export async function importSharedCodexThread(
   }
 
   let stateWritten = false;
+  let previousState: ImportSharedCodexThreadResult['previousState'] = null;
   const dbPath = findLatestStateDb(home);
   if (dbPath && params.stateRows.threads.length > 0) {
     // thread 行已存在(典型是删除 Maker 会话后重导同一分享包——软删不清 state)时
@@ -1691,8 +1766,8 @@ export async function importSharedCodexThread(
     // thread_spawn_edges 无唯一约束,重复 INSERT 会翻倍;stateWritten 保持 false,
     // 让回滚不去误删既有行。但既有 threads 行的可变字段(cwd / rollout_path)必须
     // 刷新为本次导入值——codex resume 从 state DB 读这两列,不刷新会让重导会话
-    // 跑回旧目录 / 指向失效 rollout(review bot P2)。该 UPDATE 不登记回滚:把
-    // 指向收敛到盘上真实存在的文件是单调修正,导入失败后残留新值无害。
+    // 跑回旧目录 / 指向失效 rollout(review bot P2)。UPDATE 前保留原值，若后续
+    // Maker DB 事务失败则由 removeSharedCodexThread 恢复，避免失败导入污染旧任务。
     const preExisting = readRawThreadRow(dbPath, params.threadId) !== null;
     let db: Database.Database | null = null;
     try {
@@ -1713,6 +1788,21 @@ export async function importSharedCodexThread(
             args.rollout_path = rolloutPath;
           }
           if (sets.length > 0) {
+            const previousRow = targetDb
+              .prepare(
+                `SELECT ${sets.map((set) => quoteIdent(set.slice(0, set.indexOf(' =')))).join(', ')} FROM threads WHERE id = @id`,
+              )
+              .get({ id: params.threadId }) as SqlRow | undefined;
+            if (previousRow) {
+              previousState = {
+                dbPath,
+                values: Object.fromEntries(
+                  Object.entries(previousRow).filter(
+                    (entry): entry is [string, SqlScalar] => entry[1] !== undefined,
+                  ),
+                ),
+              };
+            }
             targetDb.prepare(`UPDATE threads SET ${sets.join(', ')} WHERE id = @id`).run(args);
           }
         }
@@ -1758,16 +1848,38 @@ export async function importSharedCodexThread(
   } as CodexThreadSummary);
 
   const statePresent = dbPath ? readRawThreadRow(dbPath, params.threadId) !== null : false;
-  return { rolloutPath, rolloutWritten, stateWritten, statePresent };
+  return { rolloutPath, rolloutWritten, stateWritten, previousState, statePresent };
 }
 
-/** 会话分享导入失败的回滚:删本次**真实写入**的 rollout 与 state 三表行(best-effort);复用的既有文件/行不动。 */
+/** 会话分享导入失败的回滚:删本次真实写入的 rollout/state 行，或恢复复用 thread 的可变字段。 */
 export async function removeSharedCodexThread(
   threadId: string,
   written: ImportSharedCodexThreadResult,
 ): Promise<void> {
   if (written.rolloutPath && written.rolloutWritten) {
     await fsp.rm(written.rolloutPath, { force: true }).catch(() => undefined);
+  }
+  if (written.previousState) {
+    let db: Database.Database | null = null;
+    try {
+      db = createBetterSqliteDatabase(written.previousState.dbPath);
+      db.pragma(`busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
+      const entries = Object.entries(written.previousState.values);
+      if (entries.length > 0 && tableExists(db, 'threads')) {
+        const sets = entries.map(([column]) => `${quoteIdent(column)} = @${column}`);
+        db.prepare(`UPDATE threads SET ${sets.join(', ')} WHERE id = @id`).run({
+          id: threadId,
+          ...written.previousState.values,
+        });
+      }
+    } catch (err) {
+      log.warn('restore shared codex thread state failed', {
+        threadId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      closeDbQuietly(db);
+    }
   }
   if (!written.stateWritten) return;
   const dbPath = findLatestStateDb(getDesktopCodexHome());
@@ -3474,6 +3586,23 @@ function dropUndefined<T extends Record<string, unknown>>(obj: T): Partial<T> {
   return out;
 }
 
+export type CodexHistoryOversizedClass = 'oversized' | 'healthy' | 'unknown';
+
+/** 只读测量本地 Codex rollout 活尾巴。找不到文件或读失败归 unknown，不得当成健康。 */
+export async function classifyCodexHistoryOversized(
+  threadId: string,
+): Promise<CodexHistoryOversizedClass> {
+  if (!threadId) return 'unknown';
+  const rolloutPath = resolveRolloutPath(threadId);
+  if (!rolloutPath) return 'unknown';
+  try {
+    const stats = await measureRolloutLiveTailStats(rolloutPath);
+    return isOversizedLiveTailStats(stats) ? 'oversized' : 'healthy';
+  } catch {
+    return 'unknown';
+  }
+}
+
 /**
  * 为外部 Codex thread 创建的本地会话按需导入可读消息。
  * 源 rollout 文件未变化时直接短路；文件变化后按行号 upsert，刷新已导入行并追加新行。
@@ -3628,7 +3757,7 @@ function getDesktopCodexHome(): string {
     /* fallback for non-Electron test runners */
   }
 
-  // 兜底路径按区域取目录名(global 构建的 userData 是 CindyGlobal,同机双装分库)。
+  // 兜底路径按现有区域目录映射取值(global=CindyGlobal,cn=Cindy，同机双装分库)。
   const dirName = brandUserDataDirName(CURRENT_CINDY_REGION);
   if (process.platform === 'darwin') {
     return path.join(os.homedir(), 'Library', 'Application Support', dirName, 'codex-home');
@@ -3653,6 +3782,7 @@ function readThreads(
   try {
     db = openReadonlyDb(dbPath);
     if (!tableExists(db, 'threads')) return null;
+    const index = readSessionIndex(home);
     const orderSql = buildThreadOrderSql(db);
     const rows = db.prepare(`
       SELECT *
@@ -3667,7 +3797,7 @@ function readThreads(
         continue;
       }
       if (threads.length >= MAX_THREADS_PER_HOME) continue;
-      const thread = normalizeThreadRow(home, dbPath, row, projectlessThreadIds);
+      const thread = normalizeThreadRow(home, dbPath, row, projectlessThreadIds, index);
       if (thread) threads.push(thread);
     }
     return { threads, rejectedThreadIds: [...rejectedThreadIds] };
@@ -3707,16 +3837,50 @@ async function readThreadsFromRollouts(
       continue;
     }
     if (out.length >= MAX_THREADS_PER_HOME) continue;
-    const thread = normalizeThreadRow(home, null, row, projectlessThreadIds);
+    const thread = normalizeThreadRow(home, null, row, projectlessThreadIds, index);
     if (thread) out.push(thread);
   }
   return { threads: out, rejectedThreadIds: [...rejectedThreadIds] };
 }
 
+/**
+ * session_index.jsonl 解析缓存(review #3673 P2):按 ID 导入路径对每个所选
+ * 会话 × 每个候选 home 都要读一次索引,批量导入时主进程同步 IO 随会话数 ×
+ * home 数 × 索引大小线性增长。以 (mtimeMs, size) 做新鲜度判据 —— 索引是
+ * append-only jsonl,追加必然改变 size,同秒内 mtime 粒度不足由 size 兜住;
+ * appendSessionIndexEntry 写入后下一次读取自然失效重解析。命中时直接复用
+ * 解析结果,跨扫描/导入批次同样生效。返回的 Map 视为只读,调用方只做 .get()。
+ */
+const sessionIndexCache = new Map<
+  string,
+  { mtimeMs: number; size: number; entries: Map<string, CodexSessionIndexEntry> }
+>();
+
 function readSessionIndex(home: string): Map<string, CodexSessionIndexEntry> {
   const indexPath = path.join(home, 'session_index.jsonl');
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(indexPath);
+  } catch {
+    // 索引缺席(或不可 stat):行为与旧实现的 existsSync 早退一致。不缓存
+    // 空结果 —— 文件随时可能出现,缺席路径本身已是零解析成本。
+    sessionIndexCache.delete(home);
+    return new Map();
+  }
+  const cached = sessionIndexCache.get(home);
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+    return cached.entries;
+  }
+  const entries = parseSessionIndexFile(indexPath, home);
+  sessionIndexCache.set(home, { mtimeMs: stat.mtimeMs, size: stat.size, entries });
+  return entries;
+}
+
+function parseSessionIndexFile(
+  indexPath: string,
+  home: string,
+): Map<string, CodexSessionIndexEntry> {
   const out = new Map<string, CodexSessionIndexEntry>();
-  if (!fs.existsSync(indexPath)) return out;
   try {
     const lines = fs.readFileSync(indexPath, 'utf-8').split(/\r?\n/);
     for (const line of lines) {
@@ -3730,8 +3894,10 @@ function readSessionIndex(home: string): Map<string, CodexSessionIndexEntry> {
       if (!isRecord(obj)) continue;
       const id = stringValue(obj.id);
       if (!isLikelyThreadId(id)) continue;
+      const customTitle = firstNonEmpty(stringValue(obj.thread_name), stringValue(obj.title), '');
       out.set(id, {
-        title: firstNonEmpty(stringValue(obj.thread_name), stringValue(obj.title), 'Codex Session'),
+        title: customTitle || 'Codex Session',
+        customTitle: customTitle || null,
         updatedAt: timestampFromAny(obj.updated_at),
       });
     }
@@ -3868,7 +4034,7 @@ function normalizeRolloutFile(
 ): CodexThreadSummary | null {
   const row = readRolloutThreadRow(file, index);
   if (!row || !isTopLevelThreadRow(row)) return null;
-  return normalizeThreadRow(home, null, row, projectlessThreadIds);
+  return normalizeThreadRow(home, null, row, projectlessThreadIds, index);
 }
 
 function readRolloutThreadRow(
@@ -4507,7 +4673,8 @@ function findThreadByIdInHome(home: string, threadId: string): CodexThreadSummar
     if (!tableExists(db, 'threads')) return findExternalThreadByIdFromRollouts(home, threadId);
     const row = db.prepare('SELECT * FROM threads WHERE id = ? LIMIT 1').get(threadId) as SqlRow | undefined;
     if (!row || !isTopLevelThreadRow(row)) return findExternalThreadByIdFromRollouts(home, threadId);
-    return normalizeThreadRow(home, dbPath, row, projectlessThreadIds) ?? findExternalThreadByIdFromRollouts(home, threadId);
+    return normalizeThreadRow(home, dbPath, row, projectlessThreadIds, readSessionIndex(home))
+      ?? findExternalThreadByIdFromRollouts(home, threadId);
   } catch {
     return findExternalThreadByIdFromRollouts(home, threadId);
   } finally {
@@ -4628,17 +4795,27 @@ function normalizeThreadRow(
   dbPath: string | null,
   row: SqlRow,
   projectlessThreadIds: ReadonlySet<string>,
+  index?: ReadonlyMap<string, CodexSessionIndexEntry>,
 ): CodexThreadSummary | null {
   const threadId = stringValue(row.id);
   if (!isLikelyThreadId(threadId)) return null;
+  // #3482:session_index.jsonl 的 thread_name 是用户在 Codex 侧的重命名,
+  // state DB 行里的 title 可能仍是旧的自动标题;索引记录存在时按
+  // thread_name > title(index) > state DB/rollout 标题 兜底链取值,并把索引
+  // updated_at 合入有效更新时间(重命名要能通过导入 upsert 的时间门)。
+  const indexEntry = index?.get(threadId);
   const archived = numberValue(row.archived) === 1;
   const baseUpdatedAt = timestampMs(row.updated_at_ms, row.updated_at) ?? Date.now();
   const archivedAt = timestampFromAny(row.archived_at);
-  const updatedAt = archived && archivedAt ? Math.max(baseUpdatedAt, archivedAt) : baseUpdatedAt;
+  const rowUpdatedAt = archived && archivedAt ? Math.max(baseUpdatedAt, archivedAt) : baseUpdatedAt;
+  const updatedAt = indexEntry?.updatedAt
+    ? Math.max(rowUpdatedAt, indexEntry.updatedAt)
+    : rowUpdatedAt;
   const createdAt = timestampMs(row.created_at_ms, row.created_at) ?? updatedAt;
   const cwd = stringValue(row.cwd) || os.homedir();
   const rolloutPath = stringValue(row.rollout_path);
   const title = firstNonEmpty(
+    indexEntry?.customTitle ?? '',
     stringValue(row.title),
     stringValue(row.preview),
     stringValue(row.first_user_message).split(/\r?\n/)[0],
@@ -4697,20 +4874,26 @@ async function upsertLocalSession(thread: CodexThreadSummary): Promise<'inserted
       0, '[]', ?, ?, ?
     )
     ON CONFLICT(id) DO UPDATE SET
-      title = CASE WHEN sessions.updated_at <= excluded.updated_at THEN excluded.title ELSE sessions.title END,
-      working_dir = CASE WHEN sessions.updated_at <= excluded.updated_at THEN excluded.working_dir ELSE sessions.working_dir END,
+      -- 复活语义(#3548,与 claude 侧同口径):旧行已软删时按全新导入对待,
+      -- 元数据与 updated_at 一并收敛回源值,不残留删除时刻的旧快照。
+      title = CASE WHEN sessions.status = 'deleted' OR sessions.updated_at <= excluded.updated_at THEN excluded.title ELSE sessions.title END,
+      working_dir = CASE WHEN sessions.status = 'deleted' OR sessions.updated_at <= excluded.updated_at THEN excluded.working_dir ELSE sessions.working_dir END,
       -- Classification follows Codex global state, not local edit recency.
       -- This lets a re-import fix rows previously misclassified as projects
       -- while preserving newer local title/metadata via the CASE clauses.
       workspace_kind = excluded.workspace_kind,
-      model = CASE WHEN sessions.updated_at <= excluded.updated_at THEN excluded.model ELSE sessions.model END,
-      effort = CASE WHEN sessions.updated_at <= excluded.updated_at THEN excluded.effort ELSE sessions.effort END,
-      permission_mode = CASE WHEN sessions.updated_at <= excluded.updated_at THEN excluded.permission_mode ELSE sessions.permission_mode END,
-      status = CASE WHEN sessions.updated_at <= excluded.updated_at THEN excluded.status ELSE sessions.status END,
+      model = CASE WHEN sessions.status = 'deleted' OR sessions.updated_at <= excluded.updated_at THEN excluded.model ELSE sessions.model END,
+      effort = CASE WHEN sessions.status = 'deleted' OR sessions.updated_at <= excluded.updated_at THEN excluded.effort ELSE sessions.effort END,
+      permission_mode = CASE WHEN sessions.status = 'deleted' OR sessions.updated_at <= excluded.updated_at THEN excluded.permission_mode ELSE sessions.permission_mode END,
+      status = CASE
+        WHEN sessions.status = 'deleted' THEN excluded.status
+        WHEN sessions.updated_at <= excluded.updated_at THEN excluded.status
+        ELSE sessions.status
+      END,
       sdk_session_id = excluded.sdk_session_id,
-      total_token_usage = CASE WHEN sessions.updated_at <= excluded.updated_at THEN excluded.total_token_usage ELSE sessions.total_token_usage END,
+      total_token_usage = CASE WHEN sessions.status = 'deleted' OR sessions.updated_at <= excluded.updated_at THEN excluded.total_token_usage ELSE sessions.total_token_usage END,
       user_send_at = COALESCE(sessions.user_send_at, excluded.user_send_at),
-      updated_at = MAX(sessions.updated_at, excluded.updated_at)
+      updated_at = CASE WHEN sessions.status = 'deleted' THEN excluded.updated_at ELSE MAX(sessions.updated_at, excluded.updated_at) END
   `, [
     localId,
     thread.title,

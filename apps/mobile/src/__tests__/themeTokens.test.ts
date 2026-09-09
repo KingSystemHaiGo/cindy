@@ -44,8 +44,9 @@ describe('theme tokens', () => {
     expect(palettes.dark).toBe(darkColors);
   });
 
-  it('spinner 语义循环例外与 DESIGN.md §14.4 保持一致', () => {
+  it('语义动效例外与 DESIGN.md §14.4 保持一致', () => {
     expect(motionDuration.spinnerCycle).toBe(1000);
+    expect(motionDuration.sidebarTitleMarqueePerViewport).toBe(2400);
   });
 
   it('每个颜色 token 都是非空字符串(login 登录皮嵌套组下钻)', () => {
@@ -179,6 +180,17 @@ describe('theme tokens', () => {
     expect(darkColors.brandSplashMuted).toBe('rgba(255, 255, 255, 0.82)');
     expect(lightColors.cta).not.toBe(lightColors.brandSplashBackground);
     expect(darkColors.cta).not.toBe(darkColors.brandSplashBackground);
+  });
+
+  it('Beta 渠道状态徽标使用跨主题固定红底白字,且小字对比度 ≥4.5:1', () => {
+    expect(lightColors.betaChannelBadgeBackground).toBe('#DF0C27');
+    expect(darkColors.betaChannelBadgeBackground).toBe('#DF0C27');
+    expect(lightColors.betaChannelBadgeForeground).toBe('#FFFFFF');
+    expect(darkColors.betaChannelBadgeForeground).toBe('#FFFFFF');
+    expect(contrastRatio(
+      lightColors.betaChannelBadgeForeground,
+      lightColors.betaChannelBadgeBackground,
+    )).toBeGreaterThanOrEqual(4.5);
   });
 
   it('typeScale 严格单调递增', () => {

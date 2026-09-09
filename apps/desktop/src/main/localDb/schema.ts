@@ -32,8 +32,10 @@ const SESSION_SOURCES = [
   'wecom',
   'scheduler',
   'learn',
+  'review',
   'shared',
   'plugin',
+  'bot',
 ] as const satisfies readonly SessionSource[];
 
 export const sessions = sqliteTable(
@@ -88,9 +90,9 @@ export const sessions = sqliteTable(
     clearedAt: integer('cleared_at'), // unix ms
     pinnedAt: integer('pinned_at'), // unix ms
     /**
-     * 任务现状一句话摘要（sidebar-card-mode 卡片/rail flyout 展示）。
-     * 由 main/sessionTaskSummary.ts 在置顶会话 turn 结束时经 oneShot 生成,
-     * NULL = 尚未生成（非置顶会话不生成）。
+     * 任务现状一句话摘要（仅置顶段卡片模式展示/生成）。
+     * 由 main/sessionTaskSummary.ts 在置顶会话 turn 结束或置顶时经 oneShot 生成,
+     * 取消置顶时清空。NULL = 尚未生成或非卡片置顶。
      */
     summary: text('summary'),
     /**
@@ -182,6 +184,8 @@ export const sessions = sqliteTable(
      * "restore once if leaving proxy mode" by maker-core.
      */
     codexHistoryHasProductPrompt: integer('codex_history_has_product_prompt', { mode: 'boolean' }),
+    /** Codex-only: latest native update_plan snapshot. */
+    codexPlanJson: text('codex_plan_json'),
     /**
      * Session 附加只读引用目录列表(JSON 字符串数组,绝对路径)。
      * agent 在每 turn 透传：Claude Code 使用 options.additionalDirectories，
@@ -189,6 +193,8 @@ export const sessions = sqliteTable(
      * 反序列化由 mapper 兜底 (失败 fallback []), 不抛错。
      */
     extraDirs: text('extra_dirs').notNull().default('[]'),
+    /** Session 附加可读写目录(JSON 字符串数组)。旧会话默认空，不从 extra_dirs 提权。 */
+    writableDirs: text('writable_dirs').notNull().default('[]'),
     /**
      * 远端目标 host id (`@cindy/maker-remote-ssh` ConnectionPool 里的 alias)。
      * 非空 = 这个 session 跑在远端机器上 (agent 在远端、workingDir 是远端路径)。
@@ -216,6 +222,17 @@ export const sessions = sqliteTable(
      * sessionActiveTurn.ts 文件头。
      */
     lastTurnEndedAt: integer('last_turn_ended_at'),
+    /**
+     * 侧栏列表投影：已提炼的 preview 纯文本（最多 140 字）。NULL = 尚未回填，
+     * sessions:list 回落到 messages 相关子查询。不在 migration 里扫历史库。
+     */
+    listPreview: text('list_preview'),
+    listPreviewRole: text('list_preview_role'),
+    /**
+     * 侧栏「N 条消息」缓存。口径与历史 count(*) 相同（不过滤 role/rewind/clear）。
+     * 存精确总数；UI 把 ≥1001 显示成 1000+。NULL = 尚未回填。
+     */
+    listMessageCount: integer('list_message_count'),
     createdAt: integer('created_at').notNull(),
     updatedAt: integer('updated_at').notNull(),
   },
@@ -240,6 +257,277 @@ export const sessions = sqliteTable(
     ),
     // IM 通用标识查询(slack 等渠道按 (source, botContextId, userId) 找会话行)
     idxImLookup: index('idx_sessions_im_lookup').on(t.source, t.imBotContextId, t.imUserId),
+  }),
+);
+
+/**
+ * Cindy Bots 的 Profile 权威记录。
+ *
+ * Renderer 只能通过 local-db:bots:* 读取/修改，不能把 Bot 身份或 canonical
+ * Session 关系留在 localStorage。JSON 字段保留 Profile runtime 的版本化扩展空间；
+ * 具体 Skill/MCP/Memory 引用仍由各自能力系统解析，不在这里复制凭证。
+ */
+export const botProfiles = sqliteTable(
+  'bot_profiles',
+  {
+    id: text('id').primaryKey(),
+    displayName: text('display_name').notNull(),
+    description: text('description').notNull().default(''),
+    avatar: text('avatar').notNull().default('🤖'),
+    avatarColor: text('avatar_color').notNull().default('violet'),
+    status: text('status', { enum: ['active', 'paused', 'error', 'archived', 'deleting'] })
+      .notNull()
+      .default('active'),
+    /** Roster display only; hidden Bots continue running and remain addressable. */
+    hiddenAt: integer('hidden_at'),
+    /** Roster ordering only; canonical Session ownership is unchanged. */
+    pinnedAt: integer('pinned_at'),
+    /** Latest durable, user-actionable failure observed for this Bot. */
+    attentionReason: text('attention_reason'),
+    /** Monotonic observation time used to stop stale successes clearing newer failures. */
+    attentionAt: integer('attention_at'),
+    currentVersion: integer('current_version').notNull().default(1),
+    canonicalSessionId: text('canonical_session_id').references(() => sessions.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: integer('created_at').notNull(),
+    updatedAt: integer('updated_at').notNull(),
+  },
+  (t) => ({
+    idxStatusUpdated: index('idx_bot_profiles_status_updated').on(t.status, t.updatedAt),
+    idxCanonicalSession: index('idx_bot_profiles_canonical_session').on(t.canonicalSessionId),
+  }),
+);
+
+/** Immutable-ish Profile snapshots used for runtime binding, audit and rollback. */
+export const botProfileVersions = sqliteTable(
+  'bot_profile_versions',
+  {
+    id: text('id').primaryKey(),
+    botId: text('bot_id')
+      .notNull()
+      .references(() => botProfiles.id, { onDelete: 'cascade' }),
+    version: integer('version').notNull(),
+    identitySource: text('identity_source').notNull().default(''),
+    capabilitiesJson: text('capabilities_json').notNull().default('{}'),
+    createdAt: integer('created_at').notNull(),
+  },
+  (t) => ({
+    uniqBotVersion: uniqueIndex('uniq_bot_profile_versions_bot_version').on(t.botId, t.version),
+    idxBotCreated: index('idx_bot_profile_versions_bot_created').on(t.botId, t.createdAt),
+  }),
+);
+
+/** Canonical, delegation-linked and archived/history Session projections for a Bot. */
+export const botSessionLinks = sqliteTable(
+  'bot_session_links',
+  {
+    id: text('id').primaryKey(),
+    botId: text('bot_id')
+      .notNull()
+      .references(() => botProfiles.id, { onDelete: 'cascade' }),
+    sessionId: text('session_id')
+      .notNull()
+      .references(() => sessions.id, { onDelete: 'cascade' }),
+    /** ProfileVersion pinned when this Session became canonical/delegation-linked. */
+    profileVersion: integer('profile_version').notNull().default(1),
+    role: text('role', { enum: ['canonical', 'history', 'delegation'] }).notNull(),
+    routeKey: text('route_key'),
+    createdAt: integer('created_at').notNull(),
+    archivedAt: integer('archived_at'),
+  },
+  (t) => ({
+    uniqSession: uniqueIndex('uniq_bot_session_links_session').on(t.sessionId),
+    uniqCanonicalPerBot: uniqueIndex('uniq_bot_session_links_canonical_per_bot')
+      .on(t.botId)
+      .where(sql`${t.role} = 'canonical'`),
+    idxBotRole: index('idx_bot_session_links_bot_role').on(t.botId, t.role),
+  }),
+);
+
+/** Prepared and terminal native runtime capability snapshot for each Bot Session start. */
+export const botRuntimeSnapshots = sqliteTable(
+  'bot_runtime_snapshots',
+  {
+    id: text('id').primaryKey(),
+    botId: text('bot_id')
+      .notNull()
+      .references(() => botProfiles.id, { onDelete: 'cascade' }),
+    sessionId: text('session_id')
+      .notNull()
+      .references(() => sessions.id, { onDelete: 'cascade' }),
+    profileVersion: integer('profile_version').notNull(),
+    agentKind: text('agent_kind', { enum: ['claude-code', 'codex', 'pi'] }).notNull(),
+    workingDir: text('working_dir').notNull(),
+    memoryScopeKey: text('memory_scope_key'),
+    configuredJson: text('configured_json').notNull().default('{}'),
+    resolvedJson: text('resolved_json').notNull().default('{}'),
+    status: text('status', { enum: ['prepared', 'applied', 'degraded', 'failed'] }).notNull(),
+    /** Resolution finished and the exact Profile/runtime bytes were frozen. */
+    preparedAt: integer('prepared_at').notNull().default(0),
+    /** Agent startup returned and Session storage succeeded. */
+    appliedAt: integer('applied_at'),
+    /** Startup failed before the Session became visible. */
+    failedAt: integer('failed_at'),
+    /** Sanitized stage/error metadata only; never stores prompt or user content. */
+    failureJson: text('failure_json'),
+  },
+  (t) => ({
+    idxBotPrepared: index('idx_bot_runtime_snapshots_bot_prepared').on(t.botId, t.preparedAt),
+    idxSessionPrepared: index('idx_bot_runtime_snapshots_session_prepared').on(
+      t.sessionId,
+      t.preparedAt,
+    ),
+  }),
+);
+
+/** Lifecycle audit trail for renew/archive/recovery and future migration events. */
+export const botLifecycleEvents = sqliteTable(
+  'bot_lifecycle_events',
+  {
+    id: text('id').primaryKey(),
+    botId: text('bot_id')
+      .notNull()
+      .references(() => botProfiles.id, { onDelete: 'cascade' }),
+    sessionId: text('session_id').references(() => sessions.id, { onDelete: 'set null' }),
+    eventType: text('event_type').notNull(),
+    payloadJson: text('payload_json').notNull().default('{}'),
+    createdAt: integer('created_at').notNull(),
+  },
+  (t) => ({
+    idxBotCreated: index('idx_bot_lifecycle_events_bot_created').on(t.botId, t.createdAt),
+    idxSessionCreated: index('idx_bot_lifecycle_events_session_created').on(
+      t.sessionId,
+      t.createdAt,
+    ),
+  }),
+);
+
+/** Durable Bot-to-Bot handoff lineage using Cindy child Sessions as execution units. */
+export const botDelegations = sqliteTable(
+  'bot_delegations',
+  {
+    id: text('id').primaryKey(),
+    requestingBotId: text('requesting_bot_id')
+      .notNull()
+      .references(() => botProfiles.id, { onDelete: 'cascade' }),
+    // null = 委派给一条普通 Cindy 任务（非 Bot），卡片与完成信号同一条链路。
+    targetBotId: text('target_bot_id').references(() => botProfiles.id, {
+      onDelete: 'cascade',
+    }),
+    parentSessionId: text('parent_session_id').references(() => sessions.id, {
+      onDelete: 'set null',
+    }),
+    childSessionId: text('child_session_id').references(() => sessions.id, {
+      onDelete: 'set null',
+    }),
+    objective: text('objective').notNull(),
+    contextRefsJson: text('context_refs_json').notNull().default('[]'),
+    artifactRefsJson: text('artifact_refs_json').notNull().default('[]'),
+    permissionSnapshotJson: text('permission_snapshot_json').notNull().default('{}'),
+    lineageJson: text('lineage_json').notNull().default('[]'),
+    targetProfileVersion: integer('target_profile_version'),
+    depth: integer('depth').notNull().default(1),
+    budgetTokens: integer('budget_tokens'),
+    tokensUsed: integer('tokens_used').notNull().default(0),
+    status: text('status', {
+      enum: ['queued', 'running', 'waiting', 'completed', 'failed', 'cancelled', 'timed-out'],
+    })
+      .notNull()
+      .default('queued'),
+    resultSummary: text('result_summary'),
+    /** Output artifacts produced by the child task; never input authorization refs. */
+    outputArtifactsJson: text('output_artifacts_json').notNull().default('[]'),
+    /** User-visible waiting summary; the live resolver remains runtime-owned. */
+    pendingInteractionJson: text('pending_interaction_json'),
+    lastError: text('last_error'),
+    /** Stable task id, incrementing execution run. A terminal task may be continued in a new child Session. */
+    runSequence: integer('run_sequence').notNull().default(1),
+    createdAt: integer('created_at').notNull(),
+    acceptedAt: integer('accepted_at'),
+    completedAt: integer('completed_at'),
+    /** Set only after the terminal wake has been accepted by the requesting Bot task. */
+    completionDeliveredAt: integer('completion_delivered_at'),
+    updatedAt: integer('updated_at').notNull(),
+  },
+  (t) => ({
+    idxRequesterStatus: index('idx_bot_delegations_requester_status').on(
+      t.requestingBotId,
+      t.status,
+    ),
+    idxTargetStatus: index('idx_bot_delegations_target_status').on(t.targetBotId, t.status),
+    idxParentSession: index('idx_bot_delegations_parent_session').on(t.parentSessionId),
+    uniqChildSession: uniqueIndex('uniq_bot_delegations_child_session').on(t.childSessionId),
+  }),
+);
+
+/** Hidden, pair-scoped Bot conversation. It is projected into each Bot's canonical timeline. */
+export const botDirectMessageThreads = sqliteTable(
+  'bot_direct_message_threads',
+  {
+    id: text('id').primaryKey(),
+    /** Pair ids are always stored in lexical order so one pair has one active thread. */
+    botAId: text('bot_a_id')
+      .notNull()
+      .references(() => botProfiles.id, { onDelete: 'cascade' }),
+    botBId: text('bot_b_id')
+      .notNull()
+      .references(() => botProfiles.id, { onDelete: 'cascade' }),
+    status: text('status', { enum: ['active', 'closed'] })
+      .notNull()
+      .default('active'),
+    closeReason: text('close_reason', { enum: ['message-limit', 'idle-timeout'] }),
+    messageCount: integer('message_count').notNull().default(0),
+    maxMessages: integer('max_messages').notNull(),
+    expiresAt: integer('expires_at').notNull(),
+    blockedUntil: integer('blocked_until'),
+    createdAt: integer('created_at').notNull(),
+    updatedAt: integer('updated_at').notNull(),
+    closedAt: integer('closed_at'),
+  },
+  (t) => ({
+    uniqActivePair: uniqueIndex('uniq_bot_dm_threads_active_pair')
+      .on(t.botAId, t.botBId)
+      .where(sql`${t.status} = 'active'`),
+    idxPairUpdated: index('idx_bot_dm_threads_pair_updated').on(t.botAId, t.botBId, t.updatedAt),
+  }),
+);
+
+/** One explicit send_to_agent delivery inside a hidden Bot pair conversation. */
+export const botDirectMessages = sqliteTable(
+  'bot_direct_messages',
+  {
+    id: text('id').primaryKey(),
+    threadId: text('thread_id')
+      .notNull()
+      .references(() => botDirectMessageThreads.id, { onDelete: 'cascade' }),
+    sequence: integer('sequence').notNull(),
+    senderBotId: text('sender_bot_id')
+      .notNull()
+      .references(() => botProfiles.id, { onDelete: 'cascade' }),
+    recipientBotId: text('recipient_bot_id')
+      .notNull()
+      .references(() => botProfiles.id, { onDelete: 'cascade' }),
+    senderSessionId: text('sender_session_id').references(() => sessions.id, {
+      onDelete: 'set null',
+    }),
+    recipientSessionId: text('recipient_session_id').references(() => sessions.id, {
+      onDelete: 'set null',
+    }),
+    deliveryStatus: text('delivery_status', {
+      enum: ['pending', 'delivered', 'failed'],
+    })
+      .notNull()
+      .default('pending'),
+    content: text('content').notNull(),
+    createdAt: integer('created_at').notNull(),
+  },
+  (t) => ({
+    uniqThreadSequence: uniqueIndex('uniq_bot_direct_messages_thread_sequence').on(
+      t.threadId,
+      t.sequence,
+    ),
+    idxThreadCreated: index('idx_bot_direct_messages_thread_created').on(t.threadId, t.createdAt),
   }),
 );
 
@@ -337,7 +625,8 @@ export const messages = sqliteTable(
       // 的 onTurnErrorEvent)。drizzle 的 text enum 只是 TS 类型约束,SQLite 列
       // 无 CHECK,扩枚举不产生 migration(db:generate 应为 no-op)。
       // 'agent_switch':session 内 agent 引擎切换边界行(session-agent-switch),
-      // content 存 { fromAgentKind, toAgentKind, fromModel, toModel, handoff }。
+      // content 存 { fromAgentKind, toAgentKind, fromModel, toModel,
+      // fromProviderId?, toProviderId?, handoff }。
       // handoff 交接文本只进这里(供 UI 展开查看/debug),不作为可见消息渲染正文,
       // 也不落 user 消息——wire 注入与显示分离。
       // 'context_rebuild':消息内容删除后的内部重建标记。rewind_at 固定非 NULL,
@@ -390,6 +679,136 @@ export const messages = sqliteTable(
     // 游标分页先用 createdAt 过滤；同毫秒次序在 IPC 层用 SQLite rowid 保持写入顺序。
     idxCreatedAtId: index('idx_messages_created_at').on(t.createdAt, t.id),
     idxRewindAt: index('idx_messages_rewind_at').on(t.rewindAt),
+    idxActiveErrorTail: index('idx_messages_active_error_tail')
+      .on(t.sessionId, t.createdAt)
+      .where(sql`${t.role} = 'error' AND ${t.rewindAt} IS NULL`),
+  }),
+);
+
+/**
+ * messages_fts 的稳定整数行号映射。
+ *
+ * messages 使用 TEXT 主键，其隐藏 rowid 可能在 VACUUM 后变化，不能直接作为 FTS 的
+ * 持久关联键。这里为曾进入全文索引的消息分配独立整数键，让触发器可以通过普通 B-tree
+ * 按 message_id 找到 FTS rowid，再做定点更新或删除。
+ */
+export const messagesFtsRows = sqliteTable(
+  'messages_fts_rows',
+  {
+    ftsRowid: integer('fts_rowid').primaryKey({ autoIncrement: true }),
+    messageId: text('message_id').notNull(),
+  },
+  (t) => ({
+    byMessageId: uniqueIndex('messages_fts_rows_message_id_idx').on(t.messageId),
+  }),
+);
+
+/**
+ * Cindy-owned durable Subagent records.
+ *
+ * This table is intentionally harness-neutral. `logical_agent_id` is the
+ * user-visible child identity inside the parent task; native PI session ids,
+ * Codex thread ids and future Claude handles live in the opaque JSON arrays.
+ * The renderer never receives filesystem-backed provider session references.
+ *
+ * `activity` is a bounded projection of lifecycle/progress observations. Full
+ * native transcripts are a separate capability and may be supplied by later
+ * harness adapters without changing this record shape.
+ * Rows live for the parent task's lifetime and cascade with the session; list
+ * IPC is cursor-paginated, while activity/text fields are bounded per row.
+ */
+export const subagentRuns = sqliteTable(
+  'subagent_runs',
+  {
+    id: text('id').primaryKey(),
+    sessionId: text('session_id')
+      .notNull()
+      .references((): AnySQLiteColumn => sessions.id, { onDelete: 'cascade' }),
+    provider: text('provider', { enum: ['claude-code', 'codex', 'pi'] }).notNull(),
+    logicalAgentId: text('logical_agent_id').notNull(),
+    parentToolUseId: text('parent_tool_use_id'),
+    /** JSON string[] containing task/tool aliases observed for this logical child. */
+    aliases: text('aliases').notNull().default('[]'),
+    /** JSON string[] containing opaque harness-native child run/thread ids. */
+    providerRunIds: text('provider_run_ids').notNull().default('[]'),
+    status: text('status', {
+      enum: ['running', 'completed', 'failed', 'stopped'],
+    })
+      .notNull()
+      .default('running'),
+    title: text('title'),
+    description: text('description'),
+    summary: text('summary'),
+    /** Complete bounded terminal return; kept separate from the short summary. */
+    returnedResult: text('returned_result'),
+    returnedResultEmpty: integer('returned_result_empty'),
+    returnedResultTruncated: integer('returned_result_truncated'),
+    model: text('model'),
+    reasoningEffort: text('reasoning_effort'),
+    totalTokens: integer('total_tokens'),
+    toolUses: integer('tool_uses'),
+    durationMs: integer('duration_ms'),
+    costUsd: real('cost_usd'),
+    /** JSON SubagentCapabilities; optional fields are fail-closed by readers. */
+    capabilities: text('capabilities').notNull().default('{}'),
+    /** JSON SubagentActivityEntry[]; writer enforces count/text bounds. */
+    activity: text('activity').notNull().default('[]'),
+    startedAt: integer('started_at').notNull(),
+    updatedAt: integer('updated_at').notNull(),
+    endedAt: integer('ended_at'),
+    /** Future/repair visibility markers; normal reads fail closed when set. */
+    rewindAt: integer('rewind_at'),
+    deletedAt: integer('deleted_at'),
+  },
+  (t) => ({
+    // Logical/native ids may legally be reused after a task clear or rewind.
+    // Lookup uniqueness lives in the visible generation, not across all audit rows.
+    byLogicalAgent: index('subagent_runs_logical_idx').on(
+      t.sessionId,
+      t.provider,
+      t.logicalAgentId,
+    ),
+    bySession: index('subagent_runs_session_idx').on(
+      t.sessionId,
+      t.rewindAt,
+      t.deletedAt,
+      t.startedAt,
+    ),
+    byParentToolUse: index('subagent_runs_parent_tool_use_idx').on(t.sessionId, t.parentToolUseId),
+  }),
+);
+
+/**
+ * Indexed identity projection for Subagent observations.
+ *
+ * A harness may report the same logical child first by task id and later by
+ * parent tool id or native thread id. Keeping the bounded alias array on the
+ * run makes the record self-contained; this table makes matching O(log n)
+ * instead of parsing every historical run on each progress event. Alias reuse
+ * across clear/rewind generations is intentional, hence runId is part of the
+ * primary key and readers select the newest visible run.
+ */
+export const subagentRunAliases = sqliteTable(
+  'subagent_run_aliases',
+  {
+    sessionId: text('session_id')
+      .notNull()
+      .references((): AnySQLiteColumn => sessions.id, { onDelete: 'cascade' }),
+    provider: text('provider', { enum: ['claude-code', 'codex', 'pi'] }).notNull(),
+    alias: text('alias').notNull(),
+    runId: text('run_id')
+      .notNull()
+      .references((): AnySQLiteColumn => subagentRuns.id, { onDelete: 'cascade' }),
+    createdAt: integer('created_at').notNull(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.runId, t.alias] }),
+    byAlias: index('subagent_run_aliases_lookup_idx').on(
+      t.sessionId,
+      t.provider,
+      t.alias,
+      t.createdAt,
+    ),
   }),
 );
 
@@ -432,6 +851,7 @@ export const sessionPrRefs = sqliteTable(
  *   - schema_version                       (string，"0" / "1" / ...)
  *   - codex_history_has_product_prompt_initialized_v1 ('done')
  *   - codex_history_cindy_memory_prompt_reset_v2 ('done')
+ *   - codex_history_product_prompt_revision (current explicit revision)
  *
  * 历史 keys（只读遗留，不再写入）：cloud_migration_*——chat-data 云端迁移已随
  * 主 server 退役（2026-07），存量库里可能残留这组键，无消费方。
@@ -725,6 +1145,8 @@ export const schedules = sqliteTable(
      */
     intervalMs: integer('interval_ms'),
     agentKind: text('agent_kind', { enum: ['claude-code', 'codex', 'pi'] }).notNull(),
+    /** NULL preserves legacy bound-task Harness inheritance. */
+    modelAgentKind: text('model_agent_kind', { enum: ['claude-code', 'codex', 'pi'] }),
     model: text('model'),
     /**
      * 显式选定的供应商(来源)id。NULL = 回落该 agent 原生默认来源(no-break,
@@ -953,6 +1375,39 @@ export const scheduleRuns = sqliteTable(
   },
   (t) => ({
     idxBySchedule: index('idx_schedule_runs_schedule').on(t.scheduleId, t.firedAt),
+    idxRunningSchedule: index('idx_schedule_runs_running_schedule')
+      .on(t.scheduleId)
+      .where(sql`${t.status} = 'running'`),
+    idxRunningHeartbeat: index('idx_schedule_runs_running_heartbeat')
+      .on(t.heartbeatAt)
+      .where(sql`${t.status} = 'running' AND ${t.heartbeatAt} IS NOT NULL`),
+    idxRunningLegacy: index('idx_schedule_runs_running_legacy')
+      .on(t.firedAt)
+      .where(sql`${t.status} = 'running' AND ${t.heartbeatAt} IS NULL`),
+    idxUnreadTerminal: index('idx_schedule_runs_unread_terminal')
+      .on(t.scheduleId, t.status, t.firedAt)
+      .where(
+        sql`${t.readAt} IS NULL AND ${t.status} IN ('success', 'failed', 'aborted', 'interrupted')`,
+      ),
+    idxSessionLatest: index('idx_schedule_runs_session_latest')
+      .on(t.sessionId, t.firedAt, t.id)
+      .where(sql`${t.sessionId} IS NOT NULL`),
+  }),
+);
+
+export const scheduleSessionLatestRuns = sqliteTable(
+  'schedule_session_latest_runs',
+  {
+    sessionId: text('session_id')
+      .primaryKey()
+      .references(() => sessions.id, { onDelete: 'cascade' }),
+    runId: text('run_id')
+      .notNull()
+      .references(() => scheduleRuns.id, { onDelete: 'cascade' }),
+    firedAt: integer('fired_at').notNull(),
+  },
+  (t) => ({
+    idxRun: uniqueIndex('idx_schedule_session_latest_runs_run').on(t.runId),
   }),
 );
 
@@ -1073,10 +1528,10 @@ export const dailySpend = sqliteTable(
     costUsd: real('cost_usd').notNull().default(0),
     costAmount: real('cost_amount').notNull().default(0),
     /** 该行金额的币种。历史 NULL 行在迁移时按其 USD 口径填为 'USD'。 */
-    costCurrency: text('cost_currency', { enum: ['CNY', 'USD'] }).notNull().default('USD'),
-    costIsApproximate: integer('cost_is_approximate', { mode: 'boolean' })
+    costCurrency: text('cost_currency', { enum: ['CNY', 'USD'] })
       .notNull()
-      .default(false),
+      .default('USD'),
+    costIsApproximate: integer('cost_is_approximate', { mode: 'boolean' }).notNull().default(false),
     /** 最后一次更新的 unix ms。 */
     updatedAt: integer('updated_at').notNull(),
   },
@@ -1116,10 +1571,10 @@ export const dailyModelUsage = sqliteTable(
     costUsd: real('cost_usd').notNull().default(0),
     costAmount: real('cost_amount').notNull().default(0),
     /** 该行金额的币种。无金额的纯 token 行与历史 NULL 行迁移时填为 'USD'。 */
-    costCurrency: text('cost_currency', { enum: ['CNY', 'USD'] }).notNull().default('USD'),
-    costIsApproximate: integer('cost_is_approximate', { mode: 'boolean' })
+    costCurrency: text('cost_currency', { enum: ['CNY', 'USD'] })
       .notNull()
-      .default(false),
+      .default('USD'),
+    costIsApproximate: integer('cost_is_approximate', { mode: 'boolean' }).notNull().default(false),
     inputTokens: integer('input_tokens').notNull().default(0),
     outputTokens: integer('output_tokens').notNull().default(0),
     cacheReadTokens: integer('cache_read_tokens').notNull().default(0),
@@ -1204,6 +1659,20 @@ export const skillUsageExposures = sqliteTable(
       t.analyzerVersion,
       t.skillName,
       t.skillDocumentHash,
+    ),
+    bySkillRecent: index('idx_skill_usage_exposures_skill_recent').on(
+      t.skillName,
+      t.analyzerVersion,
+      t.seenAt,
+    ),
+    bySkillRecentAnyVersion: index('idx_skill_usage_exposures_skill_recent_any_version').on(
+      t.skillName,
+      t.seenAt,
+    ),
+    byAnalyzerRecentSource: index('idx_skill_usage_exposures_analyzer_recent_source').on(
+      t.analyzerVersion,
+      t.seenAt,
+      t.rawFilePath,
     ),
     bySession: index('idx_skill_usage_exposures_session').on(t.sessionId),
     byRawFile: index('idx_skill_usage_exposures_raw_file').on(t.rawFilePath),
@@ -1325,6 +1794,14 @@ export const rightSidebarTabs = sqliteTable(
   },
   (t) => ({
     bySession: index('right_sidebar_tabs_session_idx').on(t.sessionId, t.position),
+    // Other tab kinds may have multiple instances. Subagents is one durable
+    // workspace per parent task and must remain singleton across two renderers.
+    uniqSubagents: uniqueIndex('right_sidebar_tabs_subagents_singleton_idx')
+      .on(t.sessionId)
+      .where(sql`${t.kind} = 'subagents'`),
+    uniqBotArtifacts: uniqueIndex('right_sidebar_tabs_bot_artifacts_singleton_idx')
+      .on(t.sessionId)
+      .where(sql`${t.kind} = 'bot-artifacts'`),
   }),
 );
 
@@ -1447,6 +1924,36 @@ export const mediaRefs = sqliteTable(
 );
 
 /**
+ * Cindy Core 媒体模型调用记录。
+ *
+ * guideJson 固化 prepare 时取得的服务端调用说明，保证后续 request / poll
+ * 不会因目录刷新而切换协议；submitting 是付费 POST 的单次消费闸门，进程
+ * 中断后恢复为 unknown，禁止自动重提。
+ */
+export const mediaInvocations = sqliteTable(
+  'media_invocations',
+  {
+    id: text('id').primaryKey(),
+    owner: text('owner').notNull(),
+    modelId: text('model_id').notNull(),
+    capability: text('capability').notNull(),
+    guideRevision: text('guide_revision').notNull(),
+    guideJson: text('guide_json').notNull(),
+    state: text('state', {
+      enum: ['prepared', 'submitting', 'pending', 'complete', 'failed', 'unknown'],
+    }).notNull(),
+    taskId: text('task_id'),
+    responseJson: text('response_json'),
+    createdAt: integer('created_at').notNull(),
+    updatedAt: integer('updated_at').notNull(),
+  },
+  (t) => ({
+    byOwnerCreatedAt: index('media_invocations_owner_created_at_idx').on(t.owner, t.createdAt),
+    byOwnerState: index('media_invocations_owner_state_idx').on(t.owner, t.state),
+  }),
+);
+
+/**
  * 意识聊天卡片(卡槽③海报模式)。
  *
  * 一行 = 一次 ghost_call 的最新卡片版本(upsert by callId,过程版被终版
@@ -1518,5 +2025,31 @@ export const hookGroupMessages = sqliteTable(
     ),
     /** 窗口查询与 GC 的扫描路径。 */
     byWindow: index('hook_group_messages_window_idx').on(t.provider, t.chatId, t.threadId, t.id),
+  }),
+);
+
+/** hook_group_messages 的派生容量计数；由本地 SQLite 触发器增量维护。 */
+export const hookGroupMessageStats = sqliteTable('hook_group_message_stats', {
+  provider: text('provider').primaryKey(),
+  rowCount: integer('row_count').notNull(),
+  textBytes: integer('text_bytes').notNull(),
+});
+
+/**
+ * 群消息窗口的已提交游标。游标与消息池同属本地 DB，但按 provider 命名空间
+ * 隔离，登出/换绑时只清理对应 bot 的行。
+ */
+export const hookGroupContextCursors = sqliteTable(
+  'hook_group_context_cursors',
+  {
+    provider: text('provider').notNull(),
+    cursorKey: text('cursor_key').notNull(),
+    cursorId: integer('cursor_id').notNull(),
+    updatedAt: integer('updated_at').notNull(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.provider, t.cursorKey] }),
+    /** 消息命名空间已清空后，惰性 sweep 按最后活跃时间回收孤儿游标。 */
+    byUpdatedAt: index('hook_group_context_cursors_updated_at_idx').on(t.updatedAt),
   }),
 );

@@ -1,4 +1,11 @@
-import { isLoopbackProviderUrl } from '@cindy/model-providers';
+import {
+  isLoopbackProviderUrl,
+  resolvePiModelRoute,
+  type AgentKind,
+  type PiModelApi,
+  type ProviderModelRouteConfig,
+  type ProviderWireProtocol,
+} from '@cindy/model-providers';
 
 export type CustomProviderAuthMode = 'apiKey' | 'oauth' | 'none';
 
@@ -11,8 +18,42 @@ export interface ProviderModelFetchSignatureFields {
 }
 
 export interface ProviderConnectionTestSignatureFields extends ProviderModelFetchSignatureFields {
-  wireProtocol: string;
-  models: ReadonlyArray<{ id: string }>;
+  wireProtocol: ProviderWireProtocol;
+  models: ReadonlyArray<{ id: string; piApi?: PiModelApi; route?: ProviderModelRouteConfig }>;
+}
+
+type ProviderProbeAgent = Extract<AgentKind, 'claude-code' | 'codex' | 'pi'>;
+
+export interface ProviderConnectionProbeRoute {
+  baseUrl: string;
+  wireProtocol: ProviderWireProtocol;
+  requestPath?: string;
+}
+
+/** Resolve the first model's effective inference route using the same override order as runtime. */
+export function resolveProviderConnectionProbeRoute(
+  agent: ProviderProbeAgent,
+  fields: Pick<
+    ProviderConnectionTestSignatureFields,
+    'baseUrl' | 'requestPath' | 'wireProtocol' | 'models'
+  >,
+): ProviderConnectionProbeRoute | null {
+  const firstModel = fields.models.find((model) => model.id.trim().length > 0);
+  if (agent === 'pi') {
+    const route = resolvePiModelRoute(firstModel, {
+      baseUrl: fields.baseUrl,
+      wireProtocol: fields.wireProtocol,
+    });
+    return route ? { baseUrl: route.baseUrl.trim(), wireProtocol: route.wireProtocol } : null;
+  }
+
+  const modelRoute = firstModel?.route;
+  const requestPath = (modelRoute?.requestPath ?? fields.requestPath).trim();
+  return {
+    baseUrl: (modelRoute?.baseUrl ?? fields.baseUrl).trim(),
+    wireProtocol: modelRoute?.wireProtocol ?? fields.wireProtocol,
+    ...(requestPath ? { requestPath } : {}),
+  };
 }
 
 export function stripCredentialHeaders(headers: Record<string, string>): Record<string, string> {
@@ -77,6 +118,17 @@ export interface SavedProviderProbeBaseline {
   authMode: CustomProviderAuthMode;
   apiKey: string;
   headers: ReadonlyArray<{ name: string; value: string }>;
+  modelPiApi?: string;
+  modelRoute?: ProviderModelRouteConfig;
+}
+
+function normalizedModelRoute(route: ProviderModelRouteConfig | undefined): object | null {
+  if (!route) return null;
+  return {
+    baseUrl: route.baseUrl.trim(),
+    wireProtocol: route.wireProtocol,
+    requestPath: route.requestPath?.trim() || null,
+  };
 }
 
 function normalizeHeaderRows(
@@ -109,10 +161,57 @@ function headerRowsEqual(
  * 由 main 侧以 renderer 值优先覆盖,这里只决定「是否附带 savedProviderId」。
  */
 export function modelFetchCanReuseSavedCredentials(
-  form: Pick<ProviderModelFetchSignatureFields, 'baseUrl' | 'modelsUrl'>,
+  form: Pick<ProviderModelFetchSignatureFields, 'baseUrl' | 'modelsUrl'> &
+    Partial<Pick<ProviderModelFetchSignatureFields, 'requestPath'>>,
   baseline: Pick<SavedProviderProbeBaseline, 'baseUrl' | 'modelsUrl' | 'authMode'>,
   authMode: CustomProviderAuthMode,
 ): boolean {
+  return (
+    authMode === baseline.authMode &&
+    form.baseUrl.trim() === baseline.baseUrl.trim() &&
+    form.modelsUrl.trim() === baseline.modelsUrl.trim()
+  );
+}
+
+/**
+ * Restore an untouched hydrated key after an endpoint edit is reverted to the
+ * saved base/models target. Explicit key edits always win, including clearing
+ * the field, so this helper only fills an actually empty, revision-zero draft.
+ */
+export function restoreHydratedApiKey<
+  T extends Pick<ProviderModelFetchSignatureFields, 'baseUrl' | 'modelsUrl' | 'apiKey'>,
+>(
+  form: T,
+  baseline: Pick<SavedProviderProbeBaseline, 'baseUrl' | 'modelsUrl' | 'authMode' | 'apiKey'>,
+  authMode: CustomProviderAuthMode,
+  keyEditRevision: number,
+): T {
+  if (
+    authMode !== 'apiKey' ||
+    keyEditRevision !== 0 ||
+    form.apiKey.trim() ||
+    !baseline.apiKey.trim() ||
+    !modelFetchCanReuseSavedCredentials(form, baseline, authMode)
+  ) {
+    return form;
+  }
+  return { ...form, apiKey: baseline.apiKey };
+}
+
+/**
+ * Decide whether a hydrated API key may be sent to the saved provider's endpoint.
+ * requestPath is a routing detail within the same base/models URL and does not
+ * change the credential target; baseUrl/modelsUrl changes still require an edit.
+ */
+export function canSendHydratedApiKey(
+  form: Pick<ProviderModelFetchSignatureFields, 'baseUrl' | 'modelsUrl'> &
+    Partial<Pick<ProviderModelFetchSignatureFields, 'requestPath'>>,
+  baseline: Pick<SavedProviderProbeBaseline, 'baseUrl' | 'modelsUrl' | 'authMode'> &
+    Partial<Pick<SavedProviderProbeBaseline, 'requestPath'>>,
+  authMode: CustomProviderAuthMode,
+  keyEditRevision: number,
+): boolean {
+  if (keyEditRevision > 0) return true;
   return (
     authMode === baseline.authMode &&
     form.baseUrl.trim() === baseline.baseUrl.trim() &&
@@ -136,6 +235,13 @@ export function connectionTestCanUseSaved(
   if (form.baseUrl.trim() !== baseline.baseUrl.trim()) return false;
   if (form.requestPath.trim() !== baseline.requestPath.trim()) return false;
   if (form.wireProtocol !== baseline.wireProtocol) return false;
+  const firstModel = form.models.find((model) => model.id.trim().length > 0);
+  if ((firstModel?.piApi ?? null) !== (baseline.modelPiApi ?? null)) return false;
+  if (
+    JSON.stringify(normalizedModelRoute(firstModel?.route)) !==
+    JSON.stringify(normalizedModelRoute(baseline.modelRoute))
+  )
+    return false;
   if (authMode === 'apiKey' && form.apiKey.trim() !== baseline.apiKey.trim()) return false;
   return headerRowsEqual(form.headers, baseline.headers);
 }
@@ -149,5 +255,9 @@ export function providerConnectionTestRequestSignature(
     request: providerModelFetchRequestSignature(fields, authMode),
     wireProtocol: fields.wireProtocol,
     modelId: fields.models.map((model) => model.id.trim()).find(Boolean) ?? null,
+    modelPiApi: fields.models.find((model) => model.id.trim().length > 0)?.piApi ?? null,
+    modelRoute: normalizedModelRoute(
+      fields.models.find((model) => model.id.trim().length > 0)?.route,
+    ),
   });
 }

@@ -10,7 +10,13 @@
  * tool call), but each is uniquely keyed.
  */
 
-import type { InteractionDecision } from '@cindy/maker-core';
+import type { AskUserQuestionItem, InteractionDecision } from '@cindy/maker-core';
+
+import {
+  buildAskNoAnswerDecision,
+  buildPermissionDenyDecision,
+  buildPlanDenyDecision,
+} from './interactionCardModel';
 
 interface PendingEntry {
   resolve: (decision: InteractionDecision) => void;
@@ -26,6 +32,24 @@ interface PendingEntry {
    * the request, so we stash it here at register time.
    */
   toolName?: string;
+  /**
+   * 授权卡原始正文(title + body, 仅 kind === 'permission')。点击后收口时
+   * 保留它再追加决策结果 — 用户需要看到自己批准的是什么, 不能整卡换成
+   * 一句「✅ 已允许」。
+   */
+  permissionCard?: { title: string; body: string };
+  /**
+   * 多题/多选打勾卡的原始问题(仅 kind === 'ask_user_question' 且
+   * needsAskMultiCard 时登记)。ask:multi 按键要按问题下标改写勾选态并
+   * 重建卡片, cardActionHandler 拿不到原始请求, 与 toolName 同理登记在此。
+   */
+  askQuestions?: AskUserQuestionItem[];
+  /**
+   * 打勾卡的勾选态: 问题下标 -> 已选选项下标集合。注册时置空 Map,
+   * cardActionHandler 在每次 ask:multi 按键时原地改动; 随 entry 一同
+   * 删除(resolve / cancel)即自动回收, 无需单独清理。
+   */
+  askSelections?: Map<number, Set<number>>;
 }
 
 const pending = new Map<string, PendingEntry>();
@@ -34,7 +58,12 @@ export function registerPending(
   requestId: string,
   kind: InteractionDecision['kind'],
   messageId: string,
-  extras?: { toolName?: string },
+  extras?: {
+    toolName?: string;
+    permissionCard?: { title: string; body: string };
+    askQuestions?: AskUserQuestionItem[];
+    askSelections?: Map<number, Set<number>>;
+  },
 ): Promise<InteractionDecision> {
   return new Promise<InteractionDecision>((resolve, reject) => {
     try {
@@ -59,7 +88,12 @@ export function registerPendingExternal(
   messageId: string,
   resolve: (decision: InteractionDecision) => void,
   reject: (err: Error) => void,
-  extras?: { toolName?: string },
+  extras?: {
+    toolName?: string;
+    permissionCard?: { title: string; body: string };
+    askQuestions?: AskUserQuestionItem[];
+    askSelections?: Map<number, Set<number>>;
+  },
 ): void {
   if (pending.has(requestId)) {
     throw new Error(`pending interaction already exists for requestId=${requestId}`);
@@ -70,6 +104,9 @@ export function registerPendingExternal(
     messageId,
     kind,
     toolName: extras?.toolName,
+    permissionCard: extras?.permissionCard,
+    askQuestions: extras?.askQuestions,
+    askSelections: extras?.askSelections,
   });
 }
 
@@ -80,29 +117,35 @@ export function lookupPending(requestId: string): PendingEntry | null {
 export function resolvePending(
   requestId: string,
   decision: InteractionDecision,
-): { messageId: string } | null {
+): { messageId: string; permissionCard?: { title: string; body: string } } | null {
   const entry = pending.get(requestId);
   if (!entry) return null;
   pending.delete(requestId);
   entry.resolve(decision);
-  return { messageId: entry.messageId };
+  return { messageId: entry.messageId, permissionCard: entry.permissionCard };
 }
 
-/** Resolve one pending card with the safe decision used when its turn ends. */
-export function cancelPending(requestId: string, reason: string): boolean {
+/**
+ * Resolve one pending card with the safe decision used when its turn ends.
+ * 安全默认与 hook 链路同源(interactionCardModel), 只有 reason 文案按渠道给。
+ *
+ * Returns the card's messageId (same shape as `resolvePending`) so the caller
+ * can close the card off. Without that, the card stays on screen with live
+ * buttons after the interaction is already gone — pressing it then does
+ * nothing at all, which is exactly what a dropped turn looks like to the user.
+ */
+export function cancelPending(requestId: string, reason: string): { messageId: string } | null {
   const entry = pending.get(requestId);
-  if (!entry) return false;
+  if (!entry) return null;
   pending.delete(requestId);
   if (entry.kind === 'ask_user_question') {
-    entry.resolve({ kind: 'ask_user_question', answers: {} });
-    return true;
+    entry.resolve(buildAskNoAnswerDecision());
+  } else if (entry.kind === 'plan_review') {
+    entry.resolve(buildPlanDenyDecision(reason));
+  } else {
+    entry.resolve(buildPermissionDenyDecision(reason));
   }
-  if (entry.kind === 'plan_review') {
-    entry.resolve({ kind: 'plan_review', behavior: 'deny', reason, dismissed: true });
-    return true;
-  }
-  entry.resolve({ kind: 'permission', behavior: 'deny', reason });
-  return true;
+  return { messageId: entry.messageId };
 }
 
 /** Reject all pending interactions (used on session close / error). */

@@ -89,6 +89,10 @@ export interface ThemeColors {
   brandSplashForeground: string;
   /** App 内品牌 splash 二级文案 */
   brandSplashMuted: string;
+  /** Beta 测试渠道已开启徽标红底(用户指定,跨主题不变) */
+  betaChannelBadgeBackground: string;
+  /** Beta 测试渠道已开启徽标白字(与红底对比度 4.98:1) */
+  betaChannelBadgeForeground: string;
   /** Chip / pill / 选中行填充 */
   surfaceChip: string;
   /** 1px 分隔线 / 边框(桌面 Board) */
@@ -394,6 +398,8 @@ export const lightColors: ThemeColors = {
   brandSplashBackground: '#DF0C27',
   brandSplashForeground: '#FFFFFF',
   brandSplashMuted: 'rgba(255, 255, 255, 0.82)',
+  betaChannelBadgeBackground: '#DF0C27',
+  betaChannelBadgeForeground: '#FFFFFF',
   surfaceChip: '#F1F1F1',
   border: '#C6C9CE', // 试穿 B 档(原 #DCDFE3,light 对 #EDEDED 仅 1.14:1 太弱 → 1.42:1)
   borderTranslucent: 'rgba(198, 201, 206, 0.62)',
@@ -466,6 +472,8 @@ export const darkColors: ThemeColors = {
   brandSplashBackground: '#DF0C27',
   brandSplashForeground: '#FFFFFF',
   brandSplashMuted: 'rgba(255, 255, 255, 0.82)',
+  betaChannelBadgeBackground: '#DF0C27',
+  betaChannelBadgeForeground: '#FFFFFF',
   surfaceChip: '#2F2D2D',
   border: '#434343',
   borderTranslucent: 'rgba(67, 67, 67, 0.62)',
@@ -700,7 +708,8 @@ export const loginSizes = {
 /**
  * Motion token(全局动效档位,ms)——与桌面端 DESIGN.md §14.4 的 --motion-* 同名
  * 同值,双端同构。新增动效一律引用这些档位,不要在组件里硬编码时长。
- * spinnerCycle 是功能性 loading spinner 的语义循环例外,不是第六档交互时长。
+ * spinnerCycle 与 sidebarTitleMarqueePerViewport 是 §14.4 登记的语义例外,
+ * 不是额外交互时长档位。
  */
 export const motionDuration = {
   /** hover / 即时反馈、轻浮层退场 */
@@ -715,6 +724,8 @@ export const motionDuration = {
   exit: 150,
   /** 功能性 loading spinner 完整一圈(§14.4 窄例外) */
   spinnerCycle: 1000,
+  /** Desktop 侧栏溢出标题每个可视宽度的阅读时长(双端 token 同构,移动端不消费) */
+  sidebarTitleMarqueePerViewport: 2400,
 } as const;
 
 /**

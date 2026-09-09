@@ -774,6 +774,7 @@ interface PasswordInputProps {
 function PasswordInput({
   label, value, onChange, disabled, visible, onToggleVisible, errorText, autoFocus, onSubmit,
 }: PasswordInputProps) {
+  const { t } = useTranslation();
   return (
     <label className="flex flex-col gap-1">
       <span className="text-12 font-medium"
@@ -808,7 +809,9 @@ function PasswordInput({
           type="button"
           onClick={onToggleVisible}
           disabled={disabled}
-          aria-label={visible ? 'Hide' : 'Show'}
+          aria-label={
+            visible ? t('sessionShare.export.hidePassword') : t('sessionShare.export.showPassword')
+          }
           className="flex h-8 w-8 items-center justify-center"
           style={{ color: 'var(--settings-integration-subtitle)' }}
         >
@@ -948,7 +951,7 @@ function CodeBlock({
         </button>
       </div>
       <pre
-        className="max-h-32 overflow-auto rounded-md border p-2.5 text-[11.5px] leading-relaxed whitespace-pre-wrap break-all"
+        className="max-h-32 overflow-auto rounded-md border p-2.5 text-11 leading-relaxed whitespace-pre-wrap break-all"
         style={{
           backgroundColor: 'var(--settings-input-bg, #faf9f5)',
           borderColor: 'var(--settings-input-border, #d7d7d4)',
@@ -1114,6 +1117,19 @@ function AgentTroubleDialog({ state, onClose }: AgentTroubleDialogProps) {
                   />
                 ))}
               </div>
+            )}
+
+            {/* Path problem (no_such_file): no platform commands help — the
+                configured key path itself is wrong. Give an explicit fix
+                direction (re-select the key / edit the host's Identity file
+                path) instead of the generic "use a terminal" fallback below. */}
+            {state.reason === 'no_such_file' && (
+              <p
+                className="text-12 leading-relaxed"
+                style={{ color: 'var(--settings-integration-subtitle)' }}
+              >
+                {t('settings.remote.keys.agentTrouble.noSuchFileFix')}
+              </p>
             )}
 
             {/* Fallback: skip the agent entirely and rely on ~/.ssh/config +

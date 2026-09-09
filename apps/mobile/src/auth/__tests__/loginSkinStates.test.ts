@@ -10,6 +10,11 @@ import {
   type AuthRegion,
 } from '@cindy/auth-client';
 import { createScenarioFetch } from '@cindy/auth-client/fixtures';
+import {
+  LOGIN_CONTROL,
+  LOGIN_SSO_ORG_HISTORY,
+} from '../loginSkinLayout';
+import { loginSizes } from '../../theme/tokens';
 
 /**
  * PR4a 全登录态测试(SC-1 harness 真链 + SC-7 slice pr4a 状态行)。
@@ -44,6 +49,21 @@ function makeClient(scenario: string, region: AuthRegion = 'cn') {
 }
 
 describe('loginSkin 全登录态(harness 真链 + 渲染层接线)', () => {
+  it('keeps retained accounts reachable after the active session expires', () => {
+    expect(loginSource).toContain(
+      "import { AccountSwitcherSheet } from '@/session/AccountSwitcherSheet';",
+    );
+    expect(loginSource).toContain(
+      'void auth.syncSavedAccounts().catch(() => undefined);',
+    );
+    expect(loginSource).toContain('auth.savedAccounts.length > 0');
+    expect(loginSource).toContain('testID="login.accountSwitcher"');
+    expect(loginSource).toContain("label={t('devices.list.accounts.title')}");
+    expect(loginSource).toContain('<AccountSwitcherSheet');
+    expect(loginSource).toContain('hasRunningTasks={hasRunningTasks}');
+    expect(loginSource).toContain('remoteSessionStore.isSessionRunning(session.id)');
+  });
+
   it('identifier:providers 真链加载→identifier 步骤,区域定形态(无 tabs)/输入/主按钮/圆钮行接线', async () => {
     const client = makeClient('providers:both');
     const providers = await client.getProviders();
@@ -60,7 +80,7 @@ describe('loginSkin 全登录态(harness 真链 + 渲染层接线)', () => {
     expect(loginSource).toContain('testID="login.identifierInput"');
     expect(loginSource).toContain('testID="login.continueButton"');
     expect(loginSource).toContain('testID="login.ssoEntryButton"');
-    // Apple 圆钮(iOS)计入行 count:apple 1 + nonAppleProviders + SSO 1
+    // Apple 圆钮(当前平台有可用路径时)计入行 count:apple 1 + nonAppleProviders + SSO 1
     expect(loginSource).toContain("socialProviders.includes('apple') ? 1 : 0");
     expect(loginSource).toContain('nonAppleProviders.length');
     expect(loginSource).toContain(
@@ -161,15 +181,30 @@ describe('loginSkin 全登录态(harness 真链 + 渲染层接线)', () => {
 
   it('sso-org-empty:企业 ID 子视图空态接线(placeholder/hint/返回)', () => {
     expect(loginSource).toContain('testID="login.ssoOrgInput"');
+    expect(loginSource).toContain('hydrateSsoOrgHistory()');
+    expect(loginSource).toContain('<LoginSsoOrgHistoryList');
+    expect(loginSource).toContain('accessibilityRole="combobox"');
+    expect(loginSource).not.toContain('setSsoOrgHistoryOpen(history.length > 1)');
+    expect(loginSource).not.toContain('setSsoOrgHistoryOpen(ssoOrgHistory.length > 1)');
     expect(loginSource).toContain("loginText('ssoOrgTitle')");
     expect(loginSource).toContain("loginText('ssoOrgPlaceholder')");
     expect(loginSource).toContain("loginText('ssoOrgHint')");
+    expect(LOGIN_SSO_ORG_HISTORY.y).toBe(
+      LOGIN_CONTROL.inputY + LOGIN_CONTROL.height + 8,
+    );
+    expect(
+      LOGIN_SSO_ORG_HISTORY.y + LOGIN_SSO_ORG_HISTORY.maxHeight,
+    ).toBeLessThanOrEqual(loginSizes.panelHeight);
+    expect(controlsSource).toContain('showsVerticalScrollIndicator={false}');
     // 返回钮:子视图退回首屏输入(不整体 reset)
     expect(loginSource).toContain('setSsoOrgMode(false);');
   });
 
   it('sso-org-filled:企业 ID 直接发现，仅在状态机判定跨区后确认', () => {
     expect(loginSource).toContain("type: 'discover-sso-org'");
+    expect(loginSource).toContain(
+      'setSsoOrgHistory(getSsoOrgHistorySnapshot())',
+    );
     expect(loginSource).toContain("auth.loginState?.step === 'realm-confirmation'");
     expect(loginSource).toContain("type: 'confirm-sso-realm'");
     expect(loginSource).toContain("type: 'cancel-sso-realm'");
@@ -382,13 +417,14 @@ describe('loginSkin 全登录态(harness 真链 + 渲染层接线)', () => {
     // accessibilityState.busy 无障碍语义(非视觉,对齐桌面 aria-disabled;见 LoginSkinButton),
     // 不传原生 disabled——视觉/交互态不变。
     // 渲染层读源码断言(login.tsx 依赖 expo/RN,node vitest 不加载,沿用仓内既有模式)。
-    // 1. in-flight guard 存在:两个圆钮 onPress 各一(native-social + ssoEntry),≥2 处
+    // 1. in-flight guard 存在:两个圆钮 onPress 各一(social + ssoEntry),≥2 处
     // FRAGILE:源码字面匹配——重排版空格仍匹配(\s* 容差),但变量改名(disabled→别的)或
     // 改写为 if-block 会假失败;改 onPress guard 时同步更新此正则,或抽成纯函数测行为。
     const guardMatches = loginSource.match(/if\s*\(\s*disabled\s*\)\s*return\s*;/g) ?? [];
     expect(guardMatches.length).toBeGreaterThanOrEqual(2);
-    // 2. 非 in-flight 派发路径保留(native-social dispatch 仍在,措辞 verbatim)
+    // 2. 非 in-flight 派发路径保留:iOS native + Global Android browser。
     expect(loginSource).toMatch(/type:\s*'native-social',\s*provider/);
+    expect(loginSource).toContain("type: 'start-social-browser'");
     // 3. SSO 非 in-flight 路径保留(clearAuthError + setSsoOrgMode)
     expect(loginSource).toContain('auth.clearAuthError();');
     expect(loginSource).toContain('setSsoOrgMode(true);');

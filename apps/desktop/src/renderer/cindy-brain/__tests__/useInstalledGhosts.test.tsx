@@ -26,10 +26,10 @@ const ghost = (id: string, name = id): InstalledGhost => ({
     version: '1.0.0',
     kind: 'chip',
     entry: 'main.js',
-    slots: ['tool'],
   },
   dir: `/brain/${id}`,
   enabled: true,
+  approval: { state: 'approved', revision: '00000000-0000-4000-8000-000000000001' },
 });
 
 type ChangedCb = (payload: { ghosts: InstalledGhost[] }) => void;
