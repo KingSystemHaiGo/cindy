@@ -193,7 +193,19 @@ export async function planLegacyShardMigration(
   let entries: string[];
   try {
     entries = await fs.readdir(memoryRoot);
-  } catch {
+  } catch (e) {
+    // ENOENT = 尚无数据, 空计划合法; EACCES/EIO/ENOTDIR 等不得伪装成
+    // 0 分片成功 (Codex 3972389951 / 第五轮 Us6gzzAz 漏修: 原先 catch
+    // 一律 return plan, dry-run 报 0、--apply ok:true/exit 0)。
+    if (isEnoentError(e)) return plan;
+    const code = errnoCode(e);
+    plan.failed.push(
+      await buildSkippedInfo(
+        memoryRoot,
+        path.basename(memoryRoot),
+        `memory-root-unreadable:${code}`,
+      ),
+    );
     return plan;
   }
 
@@ -345,6 +357,15 @@ function isAbsoluteLocalPath(p: string): boolean {
   if (/^[A-Za-z]:\//.test(p)) return true;
   if (p.startsWith('//') && p.length > 2) return true;
   return false;
+}
+
+function errnoCode(e: unknown): string {
+  const code = typeof e === 'object' && e !== null ? (e as { code?: unknown }).code : undefined;
+  return typeof code === 'string' && code.length > 0 ? code : 'UNKNOWN';
+}
+
+function isEnoentError(e: unknown): boolean {
+  return errnoCode(e) === 'ENOENT';
 }
 
 async function buildSkippedInfo(

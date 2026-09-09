@@ -85,6 +85,42 @@ async function registerManagedWorktree(mainRepo: string, worktreeName: string): 
 }
 
 describe('planLegacyShardMigration — 计划生成', () => {
+  it('memoryRoot ENOENT → 空计划 (尚无数据); 其它读取失败 → plan.failed (Codex 3972389951 / Us6gzzAz)', async () => {
+    const missing = path.join(tmpRoot, 'no-such-memory-root');
+    const empty = await planLegacyShardMigration(missing);
+    expect(empty.all).toHaveLength(0);
+    expect(empty.failed).toHaveLength(0);
+    expect(empty.skipped).toHaveLength(0);
+    expect(empty.mergeCandidates).toHaveLength(0);
+    expect(empty.emptyToDelete).toHaveLength(0);
+    expect(summarizeApplyMigration(empty, { results: [], conflicts: [] }).ok).toBe(true);
+
+    const origReaddir = fs.readdir.bind(fs);
+    // @ts-expect-error 测试注入
+    fs.readdir = async (p) => {
+      if (typeof p === 'string' && p === memoryRoot) {
+        throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+      }
+      return origReaddir(p);
+    };
+    try {
+      const blocked = await planLegacyShardMigration(memoryRoot);
+      expect(blocked.all).toHaveLength(0);
+      expect(blocked.mergeCandidates).toHaveLength(0);
+      expect(blocked.emptyToDelete).toHaveLength(0);
+      expect(blocked.failed).toHaveLength(1);
+      expect(blocked.failed[0].dir).toBe(memoryRoot);
+      expect(blocked.failed[0].skipReason).toBe('memory-root-unreadable:EACCES');
+      const apply = summarizeApplyMigration(blocked, { results: [], conflicts: [] });
+      expect(apply.ok).toBe(false);
+      expect(apply.failed).toEqual([
+        { dir: memoryRoot, reason: 'memory-root-unreadable:EACCES' },
+      ]);
+    } finally {
+      fs.readdir = origReaddir;
+    }
+  });
+
   it('worktree 分片 (目录名 ≠ canonical) 归入 merge/empty, 主仓分片跳过', async () => {
     const mainRepo = path.join(tmpRoot, 'repo');
     const worktree = path.join(tmpRoot, 'repo-wt');
