@@ -9321,6 +9321,8 @@
         "all": "전체"
       },
       "filterSortBy": {
+        "created": "생성 시간",
+        "activity": "최근 활동",
         "recency": "시간순",
         "manual": "수동",
         "priority": "우선순위"
@@ -9336,7 +9338,7 @@
       "filterTaskSortHeading": "세션 정렬",
       "filterProjectOrderHeading": "프로젝트 순서",
       "filterProjectOrder": {
-        "activity": "최근 활동순",
+        "activity": "세션 정렬 따르기",
         "custom": "수동"
       },
       "filterProjectOrderTip": {

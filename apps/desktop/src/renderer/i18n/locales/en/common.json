@@ -9336,6 +9336,8 @@
         "all": "All"
       },
       "filterSortBy": {
+        "created": "Created Time",
+        "activity": "Recent Activity",
         "recency": "By time",
         "manual": "Manual",
         "priority": "Priority"
@@ -9351,7 +9353,7 @@
       "filterTaskSortHeading": "Session sort",
       "filterProjectOrderHeading": "Project order",
       "filterProjectOrder": {
-        "activity": "By recent activity",
+        "activity": "Follow Session Sorting",
         "custom": "Manual"
       },
       "filterProjectOrderTip": {
