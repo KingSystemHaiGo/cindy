@@ -18,6 +18,7 @@ export type GoalRunEventType =
   | 'budget-consumed' // 预算检查命中(超限转 budgetLimited,含 preflight 停止)
   | 'stall-detected' // 连续空轮撞 noProgressLimit
   | 'resumed' // 手动 resume / resumeActiveGoals 续跑
+  | 'cleared' // 用户清除目标(删行收口;accepted 后的 turn-dispatched 仍需显式 closeout)
   | 'terminal'; // 终态落盘(仅 complete / budgetLimited;usageLimited 不是终态不发)
 
 export interface GoalRunEvent {
@@ -112,6 +113,7 @@ export function createRunEventRecorder(limit = 200, sink?: RunEventSink): GoalRu
         'state-transition',
         'stall-detected',
         'budget-consumed',
+        'cleared',
         'terminal',
       ]);
       // lifecycleId 序号(g\d+ 单调递增):同 at 跨生命周期时按序号排序——

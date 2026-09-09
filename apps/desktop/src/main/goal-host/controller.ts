@@ -959,6 +959,20 @@ export class GoalController {
         );
         if (this.turns.get(sessionId) !== limitBoundary) return reconcileLifecycleChange();
         if (limited) {
+          this.recordRunEvent('state-transition', sessionId, limited, {
+            from: current.status,
+            to: 'budgetLimited',
+            reason: limited.lastReason,
+          });
+          this.recordRunEvent('budget-consumed', sessionId, limited, {
+            from: current.status,
+            to: 'budgetLimited',
+            reason: limited.lastReason,
+          });
+          this.recordRunEvent('terminal', sessionId, limited, {
+            to: 'budgetLimited',
+            reason: limited.lastReason,
+          });
           this.stopSession(sessionId);
           this.emit(limited);
         }
@@ -1267,6 +1281,14 @@ export class GoalController {
     }
     await this.awaitPendingLifecycle(clearBoundary);
     if (this.turns.get(sessionId) !== clearBoundary) return;
+    const clearedState = await this.deps.storage.get(sessionId);
+    if (this.turns.get(sessionId) !== clearBoundary) return;
+    if (clearedState) {
+      this.recordRunEvent('cleared', sessionId, clearedState, {
+        from: clearedState.status,
+        reason: 'cleared by user',
+      });
+    }
     await this.trackPersistence(clearBoundary, this.deps.storage.clear(sessionId));
     if (this.turns.get(sessionId) !== clearBoundary) return;
     this.deps.emitStatus({ sessionId, goal: null });
@@ -1313,7 +1335,14 @@ export class GoalController {
         }),
       );
       if (this.turns.get(sessionId) !== pauseBoundary) return;
-      if (updated) this.emit(updated);
+      if (updated) {
+        this.recordRunEvent('state-transition', sessionId, updated, {
+          from: state.status,
+          to: 'paused',
+          reason: updated.lastReason,
+        });
+        this.emit(updated);
+      }
       return;
     }
     if (state.status !== 'active') return;
@@ -1326,7 +1355,14 @@ export class GoalController {
       }),
     );
     if (this.turns.get(sessionId) !== pauseBoundary) return;
-    if (updated) this.emit(updated);
+    if (updated) {
+      this.recordRunEvent('state-transition', sessionId, updated, {
+        from: state.status,
+        to: 'paused',
+        reason: updated.lastReason,
+      });
+      this.emit(updated);
+    }
   }
 
   /**
@@ -2820,7 +2856,11 @@ export class GoalController {
         this.scheduleContinuation(sessionId);
       } else {
         // Provider acceptance ends any prior confirmed-rejection retry window.
-        this.dispatchRejectionRetries.delete(sessionId);
+        // 只清当前派发 owner:旧 send 晚到 accepted 时不能删掉新生命周期已建立的
+        // 退避记录 (Codex P2 on #2107: 将重试窗口清理限定在当前派发 owner)。
+        if (isCurrentDispatch()) {
+          this.dispatchRejectionRetries.delete(sessionId);
+        }
         // onDispatching 是归属登记的唯一边界。不能在 await send 后再次 add：极快的
         // turn 可能已经发出终态并同步释放归属，重新登记会把后续用户 turn 误认成 Goal。
         baselineStarted = false;
