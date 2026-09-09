@@ -28,7 +28,7 @@
  * 产生的全部令牌只存在主机保险库与内存缓存,本端点没有任何读回动作。
  */
 
-import { isOfficialGhostId } from '../../../shared/ghost.js';
+import { isBrokerEligibleGhostId } from '../../../shared/ghost.js';
 import { GhostKvError } from '../ghostKvStore.js';
 import { GHOST_SECRET_VALUE_MAX_CHARS } from './ghostSecretsEndpoint.js';
 import type {
@@ -90,12 +90,18 @@ export async function handleGhostOauthRequest(args: {
   networkHosts?: readonly string[];
   manager: GhostOauthEndpointManager;
   ghostId: string;
+  /** Official prefix first; otherwise first-party resolver. Defaults to official-prefix only. */
+  isTokenBrokerAuthorized?: (ghostId: string) => boolean;
+  /** Serialize credential/account persistence with package OAuth migration. */
+  withMutationLock?: <T>(ghostId: string, task: () => Promise<T> | T) => Promise<T>;
   /** Successful semantic persistence only; never receives credential values. */
   onChanged?: (secretKey: string) => void;
   log?: { warn(message: string, meta?: Record<string, unknown>): void };
 }): Promise<GhostOauthRequestOutcome> {
   const { method, pathname, readBodyText, oauthSecrets, networkHosts, manager, ghostId, log } =
     args;
+  const runMutation = <T>(task: () => Promise<T> | T): Promise<T> =>
+    args.withMutationLock?.(ghostId, task) ?? Promise.resolve(task());
   const notifyChanged = (secretKey: string): void => {
     try {
       args.onChanged?.(secretKey);
@@ -175,7 +181,8 @@ export async function handleGhostOauthRequest(args: {
         clientSecret = trimmed.length > 0 ? trimmed : undefined;
       }
       try {
-        if (!manager.setClientConfig(ghostId, secretKey, clientId, clientSecret)) {
+        if (!(await runMutation(() =>
+          manager.setClientConfig(ghostId, secretKey, clientId, clientSecret)))) {
           return { status: 500 };
         }
         notifyChanged(secretKey);
@@ -187,7 +194,7 @@ export async function handleGhostOauthRequest(args: {
     }
     if (method === 'DELETE') {
       try {
-        manager.clearClientConfig(ghostId, secretKey);
+        await runMutation(() => manager.clearClientConfig(ghostId, secretKey));
         notifyChanged(secretKey);
         return { status: 204 };
       } catch (err) {
@@ -200,15 +207,16 @@ export async function handleGhostOauthRequest(args: {
 
   if (action === 'connect' && segments.length === 2) {
     if (method !== 'POST') return { status: 405 };
-    // tokenBroker 第一方门控·连接闸(装入闸的运行时兜底,覆盖 dev 装入等
-    // 旁路):XDT 授权 broker 只对官方前缀意识开放。
-    if (decl.tokenBroker !== undefined && !isOfficialGhostId(ghostId)) {
+    // tokenBroker 第一方门控·连接闸。官方前缀命中照今天放行；否则问接线处判据。
+    const brokerAuthorized =
+      args.isTokenBrokerAuthorized?.(ghostId) ?? isBrokerEligibleGhostId(ghostId);
+    if (decl.tokenBroker !== undefined && !brokerAuthorized) {
       return {
         status: 200,
         body: JSON.stringify({
           ok: false,
           error: 'BROKER_FORBIDDEN',
-          detail: 'tokenBroker 仅第一方官方意识可用',
+          detail: '当前安装来源或组织身份无权使用授权 broker',
         }),
       };
     }
@@ -295,11 +303,8 @@ export async function handleGhostOauthRequest(args: {
       scopes.push(scope);
     }
     try {
-      const stored = manager.reportInsufficientScopes(
-        ghostId,
-        secretKey,
-        scopes,
-        decl.scopes ?? [],
+      const stored = await runMutation(() =>
+        manager.reportInsufficientScopes(ghostId, secretKey, scopes, decl.scopes ?? []),
       );
       if (stored === false) return { status: 500 };
       // 证据未变时不广播:插件在用户重连前会反复撞同一权限错误并 fire-and-forget
@@ -317,7 +322,7 @@ export async function handleGhostOauthRequest(args: {
     const accountId = segments[2];
     if (!accountId) return { status: 404 };
     try {
-      manager.disconnectAccount(ghostId, secretKey, accountId);
+      await runMutation(() => manager.disconnectAccount(ghostId, secretKey, accountId));
       notifyChanged(secretKey);
       return { status: 204 };
     } catch (err) {
@@ -333,7 +338,9 @@ export async function handleGhostOauthRequest(args: {
     const accountId = parsed.body.accountId;
     if (typeof accountId !== 'string' || accountId.length === 0) return { status: 400 };
     try {
-      if (!manager.setDefaultAccount(ghostId, secretKey, accountId)) return { status: 404 };
+      if (!(await runMutation(() => manager.setDefaultAccount(ghostId, secretKey, accountId)))) {
+        return { status: 404 };
+      }
       notifyChanged(secretKey);
       return { status: 204 };
     } catch (err) {

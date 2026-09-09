@@ -6,6 +6,7 @@ import {
   IOSSimulatorCreateCleanupRequiredError,
   type IOSSimulatorSimctlLifecycle,
 } from "./simctl-lifecycle.js";
+import type { IOSSimulatorInstance } from "./instance-types.js";
 import type { IOSSimulatorDevice } from "./types.js";
 
 const UDID = "1A9D41E0-E031-4AD0-A8B5-847480802E8E";
@@ -27,6 +28,7 @@ function createHarness(
     booted?: boolean;
     cindy?: boolean;
     onDetachCleanupError?: (error: unknown) => void;
+    onStoreChange?: (instances: IOSSimulatorInstance[]) => void;
   } = {},
 ) {
   let now = 1_000;
@@ -35,10 +37,11 @@ function createHarness(
     clock: { now: () => now },
     createId: () => `id-${++id}`,
     leaseDurationMs: 1_000_000,
+    onChange: options.onStoreChange,
   });
   const scheduled: Array<() => void | Promise<void>> = [];
   const lifecycle: IOSSimulatorSimctlLifecycle = {
-    findExact: vi.fn(),
+    findExact: vi.fn(async () => DEVICE),
     bootExact: vi.fn(async () => ({ ...DEVICE, state: "Booted" })),
     shutdownExact: vi.fn(async () => undefined),
     createExact: vi.fn(),
@@ -94,6 +97,85 @@ function createHarness(
 }
 
 describe("IOSSimulatorInstanceActor", () => {
+  it("keeps the current route when a reconcile observes no change", () => {
+    const harness = createHarness();
+    const before = harness.instance;
+
+    const reconciled = harness.actor.reconcile(
+      before.instanceId,
+      before.sessionId,
+      before.lifecycleState,
+      before.healthState,
+      before.errorCode,
+    );
+
+    expect(reconciled.generation).toBe(before.generation);
+    expect(reconciled.lease.id).toBe(before.lease.id);
+    // CoreSimulator says nothing about viewer attachment, so an unchanged
+    // binding must not have a live viewer kicked out from under it.
+    expect(reconciled.viewerState).toBe("attached");
+    expect(() =>
+      harness.actor.assertRoute(harness.route(before)),
+    ).not.toThrow();
+  });
+
+  it("renews an expired lease on an unchanged reconcile without issuing a new generation", () => {
+    const harness = createHarness();
+    const before = harness.instance;
+    // A persisted lease restored from a previous process, or idle past its TTL.
+    harness.setNow(Date.parse(before.lease.expiresAt) + 1);
+
+    const reconciled = harness.actor.reconcile(
+      before.instanceId,
+      before.sessionId,
+      before.lifecycleState,
+      before.healthState,
+      before.errorCode,
+    );
+
+    // Without this, every later sweep stays unchanged too, so the binding could
+    // never produce a usable route again.
+    expect(reconciled.generation).toBe(before.generation);
+    expect(reconciled.lease.id).not.toBe(before.lease.id);
+    expect(reconciled.viewerState).toBe(before.viewerState);
+    expect(() =>
+      harness.actor.assertRoute(harness.route(reconciled)),
+    ).not.toThrow();
+  });
+
+  it("issues a new route when the observed state changed", () => {
+    const harness = createHarness();
+    const before = harness.instance;
+
+    const reconciled = harness.actor.reconcile(
+      before.instanceId,
+      before.sessionId,
+      "ready",
+      before.healthState,
+      before.errorCode,
+    );
+
+    expect(reconciled.generation).toBe(before.generation + 1);
+    expect(reconciled.lease.id).not.toBe(before.lease.id);
+    expect(reconciled.viewerState).toBe("detached");
+  });
+
+  it("normalizes a viewer state inherited from a dead process", () => {
+    const harness = createHarness();
+    const before = harness.instance;
+
+    const reconciled = harness.actor.reconcile(
+      before.instanceId,
+      before.sessionId,
+      before.lifecycleState,
+      before.healthState,
+      before.errorCode,
+      { normalizeViewerState: true },
+    );
+
+    expect(reconciled.viewerState).toBe("detached");
+  });
+
   it("increments generation across exact start and stop operations", async () => {
     const harness = createHarness();
     const started = await harness.actor.start(harness.route());
@@ -860,6 +942,37 @@ describe("IOSSimulatorInstanceActor", () => {
       UDID,
       expect.any(AbortSignal),
     );
+  });
+
+  it("releases ownership on retry when the Cindy simulator was already physically deleted", async () => {
+    let failOwnershipWrite = false;
+    let physicalDeviceExists = true;
+    const harness = createHarness({
+      cindy: true,
+      onStoreChange: () => {
+        if (failOwnershipWrite) throw new Error("registry write failed");
+      },
+    });
+    vi.mocked(harness.lifecycle.findExact).mockImplementation(async () =>
+      physicalDeviceExists ? DEVICE : null,
+    );
+    vi.mocked(harness.lifecycle.deleteExact).mockImplementation(async () => {
+      physicalDeviceExists = false;
+    });
+
+    failOwnershipWrite = true;
+    await expect(harness.actor.delete(harness.route())).rejects.toThrow(
+      "registry write failed",
+    );
+    expect(harness.lifecycle.deleteExact).toHaveBeenCalledTimes(1);
+    expect(harness.store.get(harness.instance.instanceId)).not.toBeNull();
+
+    failOwnershipWrite = false;
+    await harness.actor.delete(harness.route());
+
+    expect(harness.lifecycle.findExact).toHaveBeenCalledTimes(2);
+    expect(harness.lifecycle.deleteExact).toHaveBeenCalledTimes(1);
+    expect(harness.store.get(harness.instance.instanceId)).toBeNull();
   });
 
   it("creates a Cindy-owned simulator from an exact installed template", async () => {

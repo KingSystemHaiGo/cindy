@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { createIOSSimulatorCodexDynamicToolProvider } from '../ios-simulator-codex-dynamic-tools.js';
+import { CODEX_DISABLED_BUILTIN_PLUGIN_IDS_KEY } from '../../mcp-integrations/codexBuiltinToolPolicy.js';
 
 const CONTEXT = {
   sessionId: 'session-a',
@@ -11,18 +12,38 @@ const CONTEXT = {
 };
 
 describe('iOS Simulator Codex dynamic tools', () => {
-  it('registers an eager gateway only when the project capability is enabled', () => {
-    const enabled = createIOSSimulatorCodexDynamicToolProvider({
+  it('does not advertise or execute the eager gateway when the Bot snapshot disables it', async () => {
+    const callTool = vi.fn();
+    const provider = createIOSSimulatorCodexDynamicToolProvider({ deps: { callTool } });
+    const context = {
+      ...CONTEXT,
+      vendorOptions: { [CODEX_DISABLED_BUILTIN_PLUGIN_IDS_KEY]: ['ios-simulator'] },
+    };
+
+    expect(provider.listTools(context)).toEqual([]);
+    await expect(
+      provider.callTool(
+        {
+          threadId: 'thread-disabled',
+          turnId: 'turn-disabled',
+          callId: 'call-disabled',
+          namespace: null,
+          tool: 'cindy_ios_simulator__list_tools',
+          arguments: {},
+        },
+        context,
+      ),
+    ).resolves.toMatchObject({ success: false });
+    expect(callTool).not.toHaveBeenCalled();
+  });
+
+  it('keeps the lightweight gateway discoverable so it can explain installation', () => {
+    const provider = createIOSSimulatorCodexDynamicToolProvider({
       deps: { callTool: vi.fn() },
-      isEnabled: () => true,
-    });
-    const disabled = createIOSSimulatorCodexDynamicToolProvider({
-      deps: { callTool: vi.fn() },
-      isEnabled: () => false,
     });
 
     if (process.platform === 'darwin') {
-      expect(enabled.listTools(CONTEXT)).toEqual([
+      expect(provider.listTools(CONTEXT)).toEqual([
         expect.objectContaining({
           type: 'function',
           name: 'cindy_ios_simulator__list_tools',
@@ -35,16 +56,14 @@ describe('iOS Simulator Codex dynamic tools', () => {
         }),
       ]);
     } else {
-      expect(enabled.listTools(CONTEXT)).toEqual([]);
+      expect(provider.listTools(CONTEXT)).toEqual([]);
     }
-    expect(disabled.listTools(CONTEXT)).toEqual([]);
   });
 
   it('lists tools without invoking the simulator host', async () => {
     const callTool = vi.fn();
     const provider = createIOSSimulatorCodexDynamicToolProvider({
       deps: { callTool },
-      isEnabled: () => true,
     });
 
     const result = await provider.callTool(
@@ -65,6 +84,11 @@ describe('iOS Simulator Codex dynamic tools', () => {
         type: 'inputText',
         text: expect.stringContaining('"check_environment"'),
       });
+      // The workflow hint is model guidance: naming a superseded tool would send
+      // the model straight back to the ambiguous name this rename hides.
+      const listed = JSON.stringify(result?.contentItems ?? []);
+      expect(listed).toContain('list_simulator_devices');
+      expect(listed).not.toContain('list_devices');
       expect(callTool).not.toHaveBeenCalled();
     }
   });
@@ -73,7 +97,6 @@ describe('iOS Simulator Codex dynamic tools', () => {
     const callTool = vi.fn(async () => ({ ok: true, data: { available: true } }));
     const provider = createIOSSimulatorCodexDynamicToolProvider({
       deps: { callTool },
-      isEnabled: () => true,
     });
 
     const result = await provider.callTool(
@@ -93,10 +116,65 @@ describe('iOS Simulator Codex dynamic tools', () => {
       expect(callTool).toHaveBeenCalledWith(
         'check_environment',
         {},
-        { sessionId: 'session-a', origin: 'agent' },
+        { sessionId: 'session-a', workingDir: '/repo', origin: 'agent' },
       );
     } else {
       expect(result?.success).toBe(false);
+      expect(callTool).not.toHaveBeenCalled();
+    }
+  });
+
+  it('surfaces an actionable plugin-required notice without touching the Host', async () => {
+    const callTool = vi.fn(async () => ({
+      ok: false,
+      errorCode: 'IOS_SIMULATOR_PLUGIN_REQUIRED',
+      message: 'Install the iOS Simulator plugin.',
+    }));
+    const describeTools = vi.fn(async () => ({
+      ready: false,
+      instanceCount: 0,
+      runningInstanceCount: 0,
+      tools: {
+        check_environment: {
+          state: 'unavailable' as const,
+          reasonCode: 'IOS_SIMULATOR_PLUGIN_REQUIRED',
+        },
+      },
+      notice: {
+        errorCode: 'IOS_SIMULATOR_PLUGIN_REQUIRED' as const,
+        message: 'Open Plugins → Marketplace and install iOS Simulator.',
+        data: { action: 'install-plugin', pluginId: 'ios-simulator' },
+      },
+    }));
+    const provider = createIOSSimulatorCodexDynamicToolProvider({
+      deps: { callTool, describeTools },
+    });
+
+    const result = await provider.callTool(
+      {
+        threadId: 'thread-a',
+        turnId: 'turn-a',
+        callId: 'call-a',
+        namespace: null,
+        tool: 'cindy_ios_simulator__list_tools',
+        arguments: {},
+      },
+      CONTEXT,
+    );
+
+    if (process.platform === 'darwin') {
+      expect(result?.success).toBe(true);
+      expect(result?.contentItems[0]).toMatchObject({
+        text: expect.stringContaining('IOS_SIMULATOR_PLUGIN_REQUIRED'),
+      });
+      expect(result?.contentItems[0]).toMatchObject({
+        text: expect.stringContaining('install-plugin'),
+      });
+      expect(describeTools).toHaveBeenCalledWith({
+        sessionId: 'session-a',
+        workingDir: '/repo',
+        origin: 'agent',
+      });
       expect(callTool).not.toHaveBeenCalled();
     }
   });

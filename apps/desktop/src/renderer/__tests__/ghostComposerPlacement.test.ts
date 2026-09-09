@@ -30,12 +30,12 @@ function ghost(command: string, id = command, enabled = true): InstalledGhost {
       version: '1.0.0',
       kind: 'chip',
       entry: 'main.js',
-      slots: ['tool'],
       tools: [{ name: 'run', description: 'Run.' }],
       command,
     },
     dir: `/tmp/${id}`,
     enabled,
+    approval: { state: 'approved', revision: '00000000-0000-4000-8000-000000000001' },
   };
 }
 
@@ -48,10 +48,11 @@ function hostCapabilityGhost(id = 'ios-simulator'): InstalledGhost {
       version: '1.0.0',
       kind: 'chip',
       entry: 'main.js',
-      slots: ['ios-simulator'],
+      iosSimulator: true,
     },
     dir: `/tmp/${id}`,
     enabled: true,
+    approval: { state: 'approved', revision: '00000000-0000-4000-8000-000000000001' },
   };
 }
 

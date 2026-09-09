@@ -28,10 +28,11 @@ function capabilityGhost(): InstalledGhost {
       version: '0.2.0',
       kind: 'chip',
       entry: 'main.js',
-      slots: ['ios-simulator'],
+      iosSimulator: true,
     },
     dir: '/tmp/ios-simulator',
     enabled: true,
+    approval: { state: 'approved', revision: '00000000-0000-4000-8000-000000000001' },
   };
 }
 

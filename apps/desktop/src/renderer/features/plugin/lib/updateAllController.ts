@@ -1,9 +1,8 @@
 /**
  * Window-level controller for the "update all plugins" batch flow.
  *
- * The controller owns only batch progress and serial execution. Permission
- * review belongs to the Main-owned real-package transaction; no catalog
- * manifest or parallel approval state is retained here.
+ * The controller owns only batch progress and serial execution. Main validates
+ * every downloaded package against its market manifest before atomic placement.
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -16,6 +15,7 @@ import {
   type DataOwnerGeneration,
 } from '@/contexts/dataOwnerGeneration';
 import type { PluginMarketItem } from '../../../../shared/pluginMarket';
+import { ghostInstallApprovalToken } from '../../../../shared/ghost';
 import { pluginMarketErrorKey } from './pluginMarketErrorKey';
 import {
   batchSummary,
@@ -123,7 +123,7 @@ export function startUpdateAllBatch(marketUpdates: readonly PluginMarketItem[]):
   void runQueue(generation);
 }
 
-/** 串行执行，每个 install() 自己在 Main 中下载、确认并提交同一真实包。 */
+/** 串行执行，每个 install() 自己在 Main 中下载、校验并提交同一真实包。 */
 async function runQueue(generation: number): Promise<void> {
   if (state.running || !isGenerationCurrent(generation)) return;
   emit({ ...state, running: true });
@@ -163,8 +163,10 @@ async function runQueue(generation: number): Promise<void> {
           fromVersion: installed.manifest.version,
           toVersion: detail.version,
         });
-        const result = await window.electronAPI.pluginMarket.install(next.pluginId, {
+        await window.electronAPI.pluginMarket.install(next.pluginId, {
           expectedReleaseId: detail.releaseId,
+          expectedManifest: detail.manifest,
+          expectedInstalledApproval: ghostInstallApprovalToken(installed.approval),
           allowSourceReplacement: false,
         });
         if (generation !== batchGeneration) return;
@@ -172,9 +174,7 @@ async function runQueue(generation: number): Promise<void> {
           voidStaleBatch();
           return;
         }
-        patchRow(generation, next.pluginId, {
-          status: result.cancelled ? 'skipped' : 'done',
-        });
+        patchRow(generation, next.pluginId, { status: 'done' });
       } catch (error) {
         if (generation !== batchGeneration) return;
         if (!batchOwnerCurrent()) {

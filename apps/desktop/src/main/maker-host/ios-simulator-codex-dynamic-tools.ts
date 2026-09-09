@@ -7,6 +7,7 @@ import {
   registerIOSSimulatorTools,
   type IOSSimulatorMcpDeps,
 } from '@cindy/mcps';
+import { isFrozenBuiltinPluginAllowed } from '../mcp-integrations/codexBuiltinToolPolicy.js';
 
 const NAMESPACE = 'cindy_ios_simulator';
 const FLAT_TOOL_SEPARATOR = '__';
@@ -18,7 +19,7 @@ const TOOLS = [
     type: 'function',
     name: LIST_TOOLS_NAME,
     description:
-      "Discover Cindy's embedded iOS Simulator tools. Use this deterministic Host gateway for iOS app work instead of probing MCP resources or opening macOS Simulator.app. Start with check_environment.",
+      "Discover Cindy's embedded iOS Simulator tools. Use this deterministic Host gateway when the embedded route is selected for iOS app work. Every tool behind it acts on a simulated Apple device: never use it to browse the web, fetch HTTP data, or automate this Mac. Start with check_environment.",
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -32,7 +33,7 @@ const TOOLS = [
     type: 'function',
     name: CALL_TOOL_NAME,
     description:
-      "Invoke a validated embedded iOS Simulator tool for the current Cindy session. Call list_tools first, then pass the selected inner tool name and arguments.",
+      "Invoke a validated embedded iOS Simulator tool for the current Cindy session. Call list_tools first, then pass the selected inner tool name and arguments. Every tool here targets a simulated Apple device, so do not route web browsing, HTTP fetching, or host automation through it.",
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -82,25 +83,36 @@ function textResponse(
  */
 export function createIOSSimulatorCodexDynamicToolProvider(options: {
   deps: IOSSimulatorMcpDeps;
-  isEnabled: (workingDir: string) => boolean;
 }): CodexHostDynamicToolProvider {
   return {
-    listTools: (context) =>
-      process.platform === 'darwin' && options.isEnabled(context.workingDir)
+    listTools: (context) => (
+      process.platform === 'darwin'
+      && isFrozenBuiltinPluginAllowed(context.vendorOptions, 'ios-simulator')
         ? TOOLS
-        : [],
+        : []
+    ),
     callTool: async (params, context) => {
       const toolName = innerToolName(params);
       if (!toolName) return undefined;
-      if (
-        process.platform !== 'darwin' ||
-        !options.isEnabled(context.workingDir)
-      ) {
+      if (!isFrozenBuiltinPluginAllowed(context.vendorOptions, 'ios-simulator')) {
         return textResponse(
           {
             ok: false,
             errorCode: 'IOS_SIMULATOR_DISABLED',
-            data: { message: 'iOS Simulator tools are disabled for this project.' },
+            data: {
+              reason: 'disabled-by-bot-profile',
+              message: 'The embedded iOS Simulator is not enabled in this Bot runtime snapshot.',
+            },
+          },
+          false,
+        );
+      }
+      if (process.platform !== 'darwin') {
+        return textResponse(
+          {
+            ok: false,
+            errorCode: 'IOS_SIMULATOR_DISABLED',
+            data: { message: 'The embedded iOS Simulator is available only on macOS.' },
           },
           false,
         );
@@ -119,6 +131,7 @@ export function createIOSSimulatorCodexDynamicToolProvider(options: {
       const registry = new IOSSimulatorToolRegistry();
       registerIOSSimulatorTools(registry, options.deps, () => ({
         sessionId: context.sessionId!,
+        workingDir: context.workingDir,
         origin: 'agent',
       }));
 
@@ -143,6 +156,7 @@ export function createIOSSimulatorCodexDynamicToolProvider(options: {
         }
         const availability = await options.deps.describeTools?.({
           sessionId: context.sessionId,
+          workingDir: context.workingDir,
           origin: 'agent',
         });
         return textResponse({
@@ -151,7 +165,7 @@ export function createIOSSimulatorCodexDynamicToolProvider(options: {
           tools: registry.list(availability?.tools),
           ...(availability ? { availability } : {}),
           workflow:
-            'Use this embedded viewer workflow: check_environment, then list_devices and either create_instance or attach_device, then start_instance. Build, install, and launch the app through this gateway. Route mutations with instanceId, generation, and leaseId.',
+            'Use this embedded viewer workflow: check_environment, then list_simulator_devices and either create_instance or attach_device, then start_instance. Build, install, and launch the app through this gateway. Route mutations with instanceId, generation, and leaseId.',
         });
       }
 

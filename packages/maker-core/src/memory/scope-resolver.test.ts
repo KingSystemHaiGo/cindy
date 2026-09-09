@@ -53,6 +53,19 @@ describe('resolveMemoryScopeKey — SSH 与空输入旁路', () => {
   it('空 workingDir 原样返回', async () => {
     expect(await resolveMemoryScopeKey('')).toBe('');
   });
+
+  it('已是 bot: / ssh: 复合键时原样透传且不 spawn git', async () => {
+    let probeCalls = 0;
+    const probe: GitProbe = async () => {
+      probeCalls += 1;
+      throw new Error('should not be called');
+    };
+    await expect(resolveMemoryScopeKey('bot:cindy', null, { execGit: probe })).resolves.toBe('bot:cindy');
+    await expect(
+      resolveMemoryScopeKey('ssh:my-host:%2Fhome%2Fme', null, { execGit: probe }),
+    ).resolves.toBe('ssh:my-host:%2Fhome%2Fme');
+    expect(probeCalls).toBe(0);
+  });
 });
 
 describe('resolveMemoryScopeKey — fake probe 回落与缓存', () => {

@@ -152,6 +152,23 @@ async function waitFor(
 }
 
 describe('sdk-handlers end-to-end', () => {
+  it('rewrites controller-local Claude config paths at the remote RPC boundary', async () => {
+    await ctx!.client.request('query/start', {
+      sessionId: 'remote-env',
+      cwd: '/Users/david/repo',
+      model: 'm',
+      env: {
+        ANTHROPIC_API_KEY: 'sk-gw',
+        CLAUDE_CONFIG_DIR: 'C:\\Users\\Admin\\AppData\\Roaming\\Cindy-dev2\\claude-home',
+      },
+    });
+
+    expect(latestFactoryOptions?.env).toEqual({
+      ANTHROPIC_API_KEY: 'sk-gw',
+      CLAUDE_CONFIG_DIR: expect.stringMatching(/\/.xdt-server\/v1\/claude-home$/),
+    });
+  });
+
   it('query/start returns sessionId + emits init notification', async () => {
     const result = await ctx!.client.request<{ sessionId: string }>('query/start', {
       sessionId: 'sess-1',
@@ -403,6 +420,22 @@ describe('sdk-handlers end-to-end', () => {
       toolGuards: [{
         toolNamePrefix: 'mcp__orca_worker_bridge__send_to_lead',
         sourceServerId: 'orca_worker_bridge',
+        invocation: 'root-only',
+      }],
+    });
+    await waitFor(() => ctx!.notifications.length >= 1);
+    expect(latestFactoryOptions?.hooks?.PreToolUse?.[0]?.hooks[0]).toBeDefined();
+  });
+
+  it('query/start accepts a root-only guard for the native AskUserQuestion tool', async () => {
+    await ctx!.client.request('query/start', {
+      sessionId: 's-root-only-ask-user-question',
+      cwd: '/a',
+      model: 'm',
+      env: {},
+      toolGuards: [{
+        toolNamePrefix: 'AskUserQuestion',
+        sourceServerId: 'claude-code',
         invocation: 'root-only',
       }],
     });

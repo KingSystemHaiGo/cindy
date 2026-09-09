@@ -1,7 +1,7 @@
 /**
  * Regression coverage for the module-level update-all controller.
- * Permission review is intentionally absent here: every row delegates to the
- * Main-owned real-package transaction and this module owns progress only.
+ * Every row delegates validation and atomic placement to Main; this module owns
+ * progress only.
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  * @vitest-environment jsdom
  */
@@ -11,9 +11,21 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('@/i18n', () => ({ i18n: { t: (key: string) => key } }));
 vi.mock('@/lib/toast', () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
-let installedGhosts: Array<{ manifest: GhostManifest }> = [];
+let installedGhosts: Array<{
+  manifest: GhostManifest;
+  approval?: GhostInstallApproval;
+}> = [];
 vi.mock('@/cindy-brain/useInstalledGhosts', () => ({
-  readInstalledGhostsSnapshot: () => installedGhosts,
+  readInstalledGhostsSnapshot: () =>
+    installedGhosts.map((ghost) => ({
+      ...ghost,
+      dir: 'C:/test/ghost',
+      enabled: true,
+      approval: ghost.approval ?? {
+        state: 'approved',
+        revision: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      },
+    })),
 }));
 
 import {
@@ -21,7 +33,7 @@ import {
   setDataOwnerGeneration,
 } from '@/contexts/dataOwnerGeneration';
 import { toast } from '@/lib/toast';
-import type { GhostManifest } from '../../../../shared/ghost';
+import type { GhostInstallApproval, GhostManifest } from '../../../../shared/ghost';
 import type { PluginMarketDetail, PluginMarketItem } from '../../../../shared/pluginMarket';
 import {
   __resetUpdateAllBatchForTest,
@@ -36,7 +48,6 @@ function manifest(overrides: Partial<GhostManifest> = {}): GhostManifest {
     id: 'ghost-a',
     name: 'Ghost A',
     version: '1.1.0',
-    slots: [],
     ...overrides,
   } as GhostManifest;
 }
@@ -75,6 +86,7 @@ function detail(overrides: Partial<PluginMarketDetail> = {}): PluginMarketDetail
 
 const detailMock = vi.fn<(pluginId: string) => Promise<PluginMarketDetail>>();
 const installMock = vi.fn();
+const DEFAULT_APPROVAL_TOKEN = 'approved:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 
 async function waitForFinishedBatch(): Promise<void> {
   await vi.waitFor(() => {
@@ -97,12 +109,13 @@ beforeEach(() => {
   installMock.mockResolvedValue({ ghost: { manifest: manifest() } });
   vi.mocked(toast.success).mockClear();
   (window as unknown as { electronAPI: unknown }).electronAPI = {
+    appVersion: '1.0.0',
     pluginMarket: { detail: detailMock, install: installMock },
   };
 });
 
 describe('updateAllController', () => {
-  it('serially delegates every row with only its current release precondition', async () => {
+  it('serially delegates every row with its release and installed receipt preconditions', async () => {
     installedGhosts.push({ manifest: manifest({ id: 'ghost-b', version: '2.0.0' }) });
     detailMock.mockImplementation(async (pluginId) =>
       pluginId === 'plugin-a'
@@ -127,22 +140,26 @@ describe('updateAllController', () => {
     await waitForFinishedBatch();
 
     expect(installMock.mock.calls).toEqual([
-      ['plugin-a', { expectedReleaseId: 'release-2', allowSourceReplacement: false }],
-      ['plugin-b', { expectedReleaseId: 'release-b2', allowSourceReplacement: false }],
+      [
+        'plugin-a',
+        {
+          expectedReleaseId: 'release-2',
+          expectedManifest: manifest(),
+          expectedInstalledApproval: DEFAULT_APPROVAL_TOKEN,
+          allowSourceReplacement: false,
+        },
+      ],
+      [
+        'plugin-b',
+        {
+          expectedReleaseId: 'release-b2',
+          expectedManifest: manifest({ id: 'ghost-b', version: '2.1.0' }),
+          expectedInstalledApproval: DEFAULT_APPROVAL_TOKEN,
+          allowSourceReplacement: false,
+        },
+      ],
     ]);
-    expect(getUpdateAllBatchState().rows?.map((row) => row.status)).toEqual([
-      'done',
-      'done',
-    ]);
-  });
-
-  it('marks a Main-side permission cancellation as skipped', async () => {
-    installMock.mockResolvedValueOnce({ cancelled: true });
-
-    startUpdateAllBatch([marketItem()]);
-    await waitForFinishedBatch();
-
-    expect(getUpdateAllBatchState().rows?.[0]?.status).toBe('skipped');
+    expect(getUpdateAllBatchState().rows?.map((row) => row.status)).toEqual(['done', 'done']);
   });
 
   it('skips a plugin removed before its row starts', async () => {
@@ -184,10 +201,7 @@ describe('updateAllController', () => {
           }),
     );
 
-    startUpdateAllBatch([
-      marketItem(),
-      marketItem({ pluginId: 'plugin-b', ghostId: 'ghost-b' }),
-    ]);
+    startUpdateAllBatch([marketItem(), marketItem({ pluginId: 'plugin-b', ghostId: 'ghost-b' })]);
     await vi.waitFor(() => expect(resolveFirstInstall).toBeDefined());
     resolveFirstInstall?.();
     await waitForFinishedBatch();
@@ -206,6 +220,21 @@ describe('updateAllController', () => {
       status: 'failed',
       errorText: 'settings.ghosts.market.errors.generic',
     });
+  });
+
+  it('does not re-check the server-selected release against the client version', async () => {
+    detailMock.mockResolvedValueOnce(
+      detail({ manifest: manifest({ minCindyVersion: '99.0.0' }) }),
+    );
+
+    startUpdateAllBatch([marketItem()]);
+    await waitForFinishedBatch();
+
+    expect(installMock).toHaveBeenCalledWith(
+      'plugin-a',
+      expect.objectContaining({ expectedReleaseId: 'release-2' }),
+    );
+    expect(getUpdateAllBatchState().rows?.[0]?.status).toBe('done');
   });
 
   it('voids the whole batch when its data owner changes during detail loading', async () => {
@@ -240,12 +269,8 @@ describe('updateAllController', () => {
     await vi.waitFor(() => expect(resolveRefresh).toBeDefined());
     expect(getUpdateAllBatchState().running).toBe(true);
 
-    startUpdateAllBatch([
-      marketItem({ pluginId: 'plugin-b', ghostId: 'ghost-b' }),
-    ]);
-    expect(getUpdateAllBatchState().rows?.map((row) => row.pluginId)).toEqual([
-      'plugin-a',
-    ]);
+    startUpdateAllBatch([marketItem({ pluginId: 'plugin-b', ghostId: 'ghost-b' })]);
+    expect(getUpdateAllBatchState().rows?.map((row) => row.pluginId)).toEqual(['plugin-a']);
 
     resolveRefresh?.();
     await waitForFinishedBatch();
@@ -262,15 +287,10 @@ describe('updateAllController', () => {
         }),
     );
     detailMock.mockImplementation(async (pluginId) =>
-      pluginId === 'plugin-a'
-        ? detail()
-        : detail({ pluginId: 'plugin-b', ghostId: 'ghost-b' }),
+      pluginId === 'plugin-a' ? detail() : detail({ pluginId: 'plugin-b', ghostId: 'ghost-b' }),
     );
 
-    startUpdateAllBatch([
-      marketItem(),
-      marketItem({ pluginId: 'plugin-b', ghostId: 'ghost-b' }),
-    ]);
+    startUpdateAllBatch([marketItem(), marketItem({ pluginId: 'plugin-b', ghostId: 'ghost-b' })]);
     await vi.waitFor(() => expect(resolveInstall).toBeDefined());
     installedGhosts = [{ manifest: manifest({ version: '1.0.0' }) }];
     reconcileUpdateAllBatch();

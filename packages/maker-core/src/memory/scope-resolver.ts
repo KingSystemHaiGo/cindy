@@ -37,7 +37,9 @@ import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 import { promisify } from 'node:util';
 
-import { buildMemoryScopeKey } from './storage.js';
+import { buildMemoryScopeKey, SSH_SCOPE_KEY_PREFIX } from './storage.js';
+
+const BOT_SCOPE_KEY_PREFIX = 'bot:';
 
 /** git 探测抽象: 跑一条 git 命令, resolve stdout。失败 (非 git 目录/超时/无 git) reject。 */
 export type GitProbe = (args: string[], cwd: string) => Promise<string>;
@@ -117,6 +119,11 @@ export async function resolveMemoryScopeKey(
   // 远端路径是远端机器上的字符串, 控制端不解析远端 git。
   if (remoteHostId) return buildMemoryScopeKey(workingDir, remoteHostId);
   if (!workingDir) return workingDir;
+  // 已经是复合键 (bot: / ssh:) 时不得再当本地路径做 git worktree 归一化。
+  // Bot scope 由 host 显式注入; SSH 复合键若被二次传入同样原样透传。
+  if (workingDir.startsWith(BOT_SCOPE_KEY_PREFIX) || workingDir.startsWith(SSH_SCOPE_KEY_PREFIX)) {
+    return workingDir;
+  }
 
   const execGit = deps?.execGit;
   const now = deps?.now ?? (() => Date.now());

@@ -1,4 +1,5 @@
 import { promises as fs } from 'node:fs';
+import fsSync from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -7,6 +8,20 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createComputerMcpServer } from './server.js';
 import type { ComputerMcpDeps } from '../types.js';
+
+const canLinkFile = (() => {
+  const root = fsSync.mkdtempSync(path.join(os.tmpdir(), 'computer-file-link-probe-'));
+  try {
+    const target = path.join(root, 'target');
+    fsSync.writeFileSync(target, 'probe');
+    fsSync.symlinkSync(target, path.join(root, 'link'), 'file');
+    return true;
+  } catch {
+    return false;
+  } finally {
+    fsSync.rmSync(root, { recursive: true, force: true });
+  }
+})();
 
 /** Temp session workingDir for path-boundary-constrained tools (recording/replay). */
 async function makeWorkingDir(): Promise<string> {
@@ -39,16 +54,8 @@ function textPayload(result: unknown): unknown {
 async function makeHarness(
   deps: ComputerMcpDeps,
   options?: Parameters<typeof createComputerMcpServer>[1],
-  testOptions: { injectDefaultProcessResolver?: boolean } = {},
 ) {
-  const resolvedDeps =
-    testOptions.injectDefaultProcessResolver === false || deps.resolveProcessIdentity
-      ? deps
-      : {
-          ...deps,
-          resolveProcessIdentity: vi.fn(async (pid: number) => ({ pid, name: 'Code' })),
-        };
-  const server = createComputerMcpServer(resolvedDeps, options);
+  const server = createComputerMcpServer(deps, options);
   const [clientTx, serverTx] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: 'computer-test-client', version: '0.0.0' });
   await Promise.all([server.connect(serverTx), client.connect(clientTx)]);
@@ -62,6 +69,20 @@ async function makeHarness(
 }
 
 describe('createComputerMcpServer', () => {
+  it('halts replay after an unknown action effect even with stop_on_error false', async () => {
+    const root = await makeWorkingDir();
+    const h = await makeHarness({ getStatus: vi.fn(), callTool: vi.fn(async () => ({ effect: 'unverifiable' })) }, {
+      sessionId: 'replay-unknown', getSessionContext: () => ({ sessionId: 'replay-unknown', agentKind: 'test', workingDir: root }),
+    });
+    try {
+      const dir = await writeTrajectory(root, [
+        { tool: 'click', arguments: { pid: 1, window_id: 2, x: 1, y: 2 } },
+        { tool: 'click', arguments: { pid: 1, window_id: 2, x: 3, y: 4 } },
+      ]);
+      const payload = textPayload(await h.client.callTool({ name: 'call_tool', arguments: { name: 'replay_trajectory', args: { dir, stop_on_error: false } } }));
+      expect(payload).toMatchObject({ data: { attempted: 1, succeeded: 0, failed: 1 } });
+    } finally { await h.cleanup(); await fs.rm(root, { recursive: true, force: true }); }
+  });
   it('lists desktop computer-use tools', async () => {
     const deps: ComputerMcpDeps = {
       getStatus: vi.fn(),
@@ -87,15 +108,15 @@ describe('createComputerMcpServer', () => {
     expect(payload.tools.map((tool) => tool.name)).toContain('replay_trajectory');
     expect(payload.tools.map((tool) => tool.name)).toContain('type_text');
     const listWindows = payload.tools.find((tool) => tool.name === 'list_windows');
+    const typeText = payload.tools.find((tool) => tool.name === 'type_text');
     expect(listWindows?.inputSchema?.properties).toHaveProperty('query');
     expect(listWindows?.inputSchema?.properties).toHaveProperty('workspace_root');
     expect(listWindows?.inputSchema?.properties).toHaveProperty('process_name');
     expect(payload.workflow).toContain('query/workspace_root/process_name');
     expect(listWindows?.description).toContain('{"process_name":"Simulator"}');
-    expect(payload.workflow).toContain('cindy_ios_simulator first');
-    expect(listWindows?.description).toContain('external desktop UI work');
+    expect(payload.workflow).toContain('{"process_name":"Simulator"}');
     expect(payload.tools.find((tool) => tool.name === 'get_window_state')?.description)
-      .toContain('{"capture_mode":"vision"}');
+      .toContain('include_screenshot:false');
     expect(payload.tools.find((tool) => tool.name === 'click')?.description)
       .toContain('Always include pid');
     expect(payload.tools.find((tool) => tool.name === 'launch_app')?.description)
@@ -104,8 +125,9 @@ describe('createComputerMcpServer', () => {
       .not.toHaveProperty('use_external_simulator');
     expect(payload.tools.find((tool) => tool.name === 'hotkey')?.inputSchema?.properties)
       .not.toHaveProperty('use_external_ios_workflow');
+    expect(typeText?.inputSchema?.properties).toHaveProperty('delivery_mode');
     expect(payload.workflow).toContain('always for coordinates');
-    expect(payload.workflow).toContain('{"capture_mode":"vision"}');
+    expect(payload.workflow).toContain('include_screenshot:false');
     await h.cleanup();
   });
 
@@ -185,7 +207,7 @@ describe('createComputerMcpServer', () => {
     })) as { ok: boolean };
 
     expect(payload.ok).toBe(true);
-    expect(deps.callTool).toHaveBeenCalledWith('get_accessibility_tree', {});
+    expect(deps.callTool).toHaveBeenCalledWith('get_accessibility_tree', {}, { signal: expect.any(AbortSignal) });
     await h.cleanup();
   });
 
@@ -214,7 +236,7 @@ describe('createComputerMcpServer', () => {
       workspace_root: '/repo',
       process_name: 'Electron',
       session: 'agent-session-1',
-    }, { sessionId: 'agent-session-1' });
+    }, { signal: expect.any(AbortSignal), sessionId: 'agent-session-1' });
     await h.cleanup();
   });
 
@@ -237,7 +259,7 @@ describe('createComputerMcpServer', () => {
     expect(deps.callTool).toHaveBeenCalledWith('list_windows', {
       process_name: 'Simulator',
       session: 'agent-session-1',
-    }, { sessionId: 'agent-session-1' });
+    }, { signal: expect.any(AbortSignal), sessionId: 'agent-session-1' });
     await h.cleanup();
   });
 
@@ -259,7 +281,7 @@ describe('createComputerMcpServer', () => {
     expect(payload.ok).toBe(true);
     expect(deps.callTool).toHaveBeenCalledWith('list_windows', {
       process_name: 'Simulator',
-    });
+    }, { signal: expect.any(AbortSignal) });
     await h.cleanup();
   });
 
@@ -312,7 +334,7 @@ describe('createComputerMcpServer', () => {
       window_id: 7,
       capture_mode: 'vision',
       session: 'agent-session-1',
-    }, { sessionId: 'agent-session-1' });
+    }, { signal: expect.any(AbortSignal), sessionId: 'agent-session-1' });
     await h.cleanup();
   });
 
@@ -336,7 +358,7 @@ describe('createComputerMcpServer', () => {
       pid: 123,
       window_id: 7,
       capture_mode: 'vision',
-    });
+    }, { signal: expect.any(AbortSignal) });
     await h.cleanup();
   });
 
@@ -418,6 +440,30 @@ describe('createComputerMcpServer', () => {
     await h.cleanup();
   });
 
+  it('forwards an explicit type_text delivery mode to cua-driver', async () => {
+    const deps: ComputerMcpDeps = {
+      getStatus: vi.fn(),
+      callTool: vi.fn(async () => ({ ok: true })),
+    };
+    const h = await makeHarness(deps);
+
+    const result = await h.client.callTool({
+      name: 'call_tool',
+      arguments: {
+        name: 'type_text',
+        args: { pid: 123, text: 'hello', delivery_mode: 'foreground' },
+      },
+    });
+
+    expect(textPayload(result)).toMatchObject({ ok: true });
+    expect(deps.callTool).toHaveBeenCalledWith('type_text', {
+      pid: 123,
+      text: 'hello',
+      delivery_mode: 'foreground',
+    }, { signal: expect.any(AbortSignal) });
+    await h.cleanup();
+  });
+
   it('dispatches zoom with cua-driver 0.5 region bounds', async () => {
     const deps: ComputerMcpDeps = {
       getStatus: vi.fn(),
@@ -440,7 +486,7 @@ describe('createComputerMcpServer', () => {
       y1: 20,
       x2: 110,
       y2: 120,
-    });
+    }, { signal: expect.any(AbortSignal) });
     await h.cleanup();
   });
 
@@ -470,48 +516,40 @@ describe('createComputerMcpServer', () => {
       creates_new_application_instance: true,
       electron_debugging_port: 9222,
       additional_arguments: ['--flag'],
-    });
+    }, { signal: expect.any(AbortSignal) });
     await h.cleanup();
   });
 
-  it('routes standalone Simulator.app launches to the embedded simulator by default', async () => {
+  it('dispatches standalone Simulator.app launches through the normal desktop driver', async () => {
     const deps: ComputerMcpDeps = {
       getStatus: vi.fn(),
-      callTool: vi.fn(),
+      callTool: vi.fn(async () => ({ ok: true })),
     };
     const h = await makeHarness(deps);
 
-    const result = await h.client.callTool({
+    const payload = textPayload(await h.client.callTool({
       name: 'call_tool',
       arguments: {
         name: 'launch_app',
         args: { name: 'Simulator' },
       },
-    });
-    const payload = textPayload(result) as {
-      ok: boolean;
-      errorCode: string;
-      data: { next_tool?: string };
-    };
+    })) as { ok: boolean };
 
-    expect(payload).toMatchObject({
-      ok: false,
-      errorCode: 'EMBEDDED_IOS_SIMULATOR_PREFERRED',
-      data: { next_tool: 'cindy_ios_simulator' },
-    });
-    expect(result.isError).toBe(true);
-    expect(deps.callTool).not.toHaveBeenCalled();
+    expect(payload.ok).toBe(true);
+    expect(deps.callTool).toHaveBeenCalledWith('launch_app', {
+      name: 'Simulator',
+    }, { signal: expect.any(AbortSignal) });
     await h.cleanup();
   });
 
-  it('routes Xcode launches to the embedded simulator workflow by default', async () => {
+  it('dispatches Xcode launches through the normal desktop driver', async () => {
     const deps: ComputerMcpDeps = {
       getStatus: vi.fn(),
-      callTool: vi.fn(),
+      callTool: vi.fn(async () => ({ ok: true })),
     };
     const h = await makeHarness(deps);
 
-    const result = await h.client.callTool({
+    const payload = textPayload(await h.client.callTool({
       name: 'call_tool',
       arguments: {
         name: 'launch_app',
@@ -521,217 +559,45 @@ describe('createComputerMcpServer', () => {
           urls: ['file:///repo/App.xcworkspace'],
         },
       },
-    });
-    const payload = textPayload(result) as {
-      ok: boolean;
-      errorCode: string;
-      data: { next_tool?: string; blocked_target?: string };
-    };
-
-    expect(payload).toMatchObject({
-      ok: false,
-      errorCode: 'EMBEDDED_IOS_SIMULATOR_PREFERRED',
-      data: {
-        next_tool: 'cindy_ios_simulator',
-        blocked_target: 'Xcode',
-      },
-    });
-    expect(result.isError).toBe(true);
-    expect(deps.callTool).not.toHaveBeenCalled();
-    await h.cleanup();
-  });
-
-  it.each(['/Applications/Xcode-beta.app', '/Applications/Xcode_26.app'])(
-    'routes renamed Xcode bundle %s to the embedded simulator workflow',
-    async (name) => {
-      const deps: ComputerMcpDeps = {
-        getStatus: vi.fn(),
-        callTool: vi.fn(),
-      };
-      const h = await makeHarness(deps);
-
-      const result = await h.client.callTool({
-        name: 'call_tool',
-        arguments: {
-          name: 'launch_app',
-          args: { name },
-        },
-      });
-      expect(textPayload(result)).toMatchObject({
-        ok: false,
-        errorCode: 'EMBEDDED_IOS_SIMULATOR_PREFERRED',
-        data: { blocked_target: 'Xcode' },
-      });
-      expect(result.isError).toBe(true);
-      expect(deps.callTool).not.toHaveBeenCalled();
-      await h.cleanup();
-    },
-  );
-
-  it('blocks Xcode hotkeys using host-resolved PID provenance', async () => {
-    const deps: ComputerMcpDeps = {
-      getStatus: vi.fn(),
-      resolveProcessIdentity: vi.fn(async (pid) => ({
-        pid,
-        name: 'Xcode',
-        executable: '/Applications/Xcode.app/Contents/MacOS/Xcode',
-      })),
-      callTool: vi.fn(),
-    };
-    const h = await makeHarness(deps, { sessionId: 'agent-session-1' });
-
-    const result = await h.client.callTool({
-      name: 'call_tool',
-      arguments: {
-        name: 'hotkey',
-        args: { pid: 686, window_id: 282, keys: ['cmd', 'r'] },
-      },
-    });
-    const payload = textPayload(result) as {
-      ok: boolean;
-      errorCode: string;
-      data: { next_tool?: string; blocked_target?: string };
-    };
-
-    expect(payload).toMatchObject({
-      ok: false,
-      errorCode: 'EMBEDDED_IOS_SIMULATOR_PREFERRED',
-      data: {
-        next_tool: 'cindy_ios_simulator',
-        blocked_target: 'Xcode',
-      },
-    });
-    expect(deps.resolveProcessIdentity).toHaveBeenCalledWith(686);
-    expect(deps.callTool).not.toHaveBeenCalled();
-    await h.cleanup();
-  });
-
-  it('blocks mutating Simulator.app actions using host-resolved PID provenance', async () => {
-    const deps: ComputerMcpDeps = {
-      getStatus: vi.fn(),
-      resolveProcessIdentity: vi.fn(async (pid) => ({
-        pid,
-        command: '/Applications/Xcode.app/Contents/Developer/Applications/Simulator.app/Contents/MacOS/Simulator',
-      })),
-      callTool: vi.fn(),
-    };
-    const h = await makeHarness(deps);
-
-    const result = await h.client.callTool({
-      name: 'call_tool',
-      arguments: {
-        name: 'click',
-        args: { pid: 44412, window_id: 29131, x: 20, y: 20 },
-      },
-    });
-    const payload = textPayload(result) as {
-      ok: boolean;
-      errorCode: string;
-      data: { blocked_target?: string };
-    };
-
-    expect(payload).toMatchObject({
-      ok: false,
-      errorCode: 'EMBEDDED_IOS_SIMULATOR_PREFERRED',
-      data: { blocked_target: 'Simulator.app' },
-    });
-    expect(deps.callTool).not.toHaveBeenCalled();
-    await h.cleanup();
-  });
-
-  it('keeps Xcode read-only inspection available', async () => {
-    const deps: ComputerMcpDeps = {
-      getStatus: vi.fn(),
-      resolveProcessIdentity: vi.fn(async (pid) => ({ pid, name: 'Xcode' })),
-      callTool: vi.fn(async () => ({ elements: [] })),
-    };
-    const h = await makeHarness(deps, { sessionId: 'agent-session-1' });
-
-    const payload = textPayload(await h.client.callTool({
-      name: 'call_tool',
-      arguments: {
-        name: 'get_window_state',
-        args: { pid: 686, window_id: 282, capture_mode: 'ax' },
-      },
     })) as { ok: boolean };
 
     expect(payload.ok).toBe(true);
-    expect(deps.resolveProcessIdentity).not.toHaveBeenCalled();
-    expect(deps.callTool).toHaveBeenCalledWith('get_window_state', {
-      pid: 686,
-      window_id: 282,
-      capture_mode: 'ax',
-      session: 'agent-session-1',
-    }, { sessionId: 'agent-session-1' });
-    await h.cleanup();
-  });
-
-  it('does not block the same hotkey in a non-iOS desktop app', async () => {
-    const deps: ComputerMcpDeps = {
-      getStatus: vi.fn(),
-      resolveProcessIdentity: vi.fn(async (pid) => ({
-        pid,
-        name: 'Code',
-        executable: '/Applications/Visual Studio Code.app/Contents/MacOS/Electron',
-      })),
-      callTool: vi.fn(async () => ({ ok: true })),
-    };
-    const h = await makeHarness(deps, { sessionId: 'agent-session-1' });
-
-    const payload = textPayload(await h.client.callTool({
-      name: 'call_tool',
-      arguments: {
-        name: 'hotkey',
-        args: { pid: 123, window_id: 7, keys: ['cmd', 'r'] },
-      },
-    })) as { ok: boolean };
-
-    expect(payload.ok).toBe(true);
-    expect(deps.callTool).toHaveBeenCalledWith('hotkey', {
-      pid: 123,
-      window_id: 7,
-      keys: ['cmd', 'r'],
-      session: 'agent-session-1',
-    }, { sessionId: 'agent-session-1' });
+    expect(deps.callTool).toHaveBeenCalledWith('launch_app', {
+      name: 'Xcode',
+      bundle_id: 'com.apple.dt.Xcode',
+      urls: ['file:///repo/App.xcworkspace'],
+    }, { signal: expect.any(AbortSignal) });
     await h.cleanup();
   });
 
   it.each([
-    ['missing resolver', undefined],
-    ['resolver failure', vi.fn(async () => { throw new Error('process snapshot unavailable'); })],
-    ['missing process', vi.fn(async () => null)],
-    ['empty identity', vi.fn(async (pid: number) => ({ pid }))],
-    ['mismatched pid', vi.fn(async () => ({ pid: 999, name: 'Code' }))],
-  ])('fails closed for mutating actions with %s', async (_label, resolveProcessIdentity) => {
-    const callTool = vi.fn();
-    const deps: ComputerMcpDeps = {
-      getStatus: vi.fn(),
-      ...(resolveProcessIdentity ? { resolveProcessIdentity } : {}),
-      callTool,
-    };
-    const h = await makeHarness(
-      deps,
-      undefined,
-      { injectDefaultProcessResolver: false },
-    );
+    ['Xcode hotkey', 'hotkey', { pid: 686, window_id: 282, keys: ['cmd', 'r'] }],
+    ['Simulator click', 'click', { pid: 44412, window_id: 29131, x: 20, y: 20 }],
+  ])(
+    'dispatches %s without requiring process provenance',
+    async (_label, name, args) => {
+      const deps: ComputerMcpDeps = {
+        getStatus: vi.fn(),
+        callTool: vi.fn(async () => ({ ok: true })),
+      };
+      const h = await makeHarness(deps, { sessionId: 'agent-session-1' });
 
-    const result = await h.client.callTool({
-      name: 'call_tool',
-      arguments: {
-        name: 'click',
-        args: { pid: 123, window_id: 7, x: 10, y: 20 },
-      },
-    });
-    const payload = textPayload(result) as { ok: boolean; errorCode: string };
+      const payload = textPayload(await h.client.callTool({
+        name: 'call_tool',
+        arguments: {
+          name,
+          args,
+        },
+      })) as { ok: boolean };
 
-    expect(payload).toMatchObject({
-      ok: false,
-      errorCode: 'TARGET_PROVENANCE_UNAVAILABLE',
-    });
-    expect(result.isError).toBe(true);
-    expect(callTool).not.toHaveBeenCalled();
-    await h.cleanup();
-  });
+      expect(payload.ok).toBe(true);
+      expect(deps.callTool).toHaveBeenCalledWith(
+        name,
+        { ...args, session: 'agent-session-1' },
+        { signal: expect.any(AbortSignal), sessionId: 'agent-session-1' });
+      await h.cleanup();
+    },
+  );
 
   it('rejects model-supplied external iOS override fields before dispatch', async () => {
     const deps: ComputerMcpDeps = {
@@ -803,7 +669,7 @@ describe('createComputerMcpServer', () => {
       window_id: 7,
       element_index: 2,
       value: 'Option',
-    });
+    }, { signal: expect.any(AbortSignal) });
     await h.cleanup();
   });
 
@@ -850,7 +716,7 @@ describe('createComputerMcpServer', () => {
       direction: 'down',
       amount: 3,
       by: 'page',
-    });
+    }, { signal: expect.any(AbortSignal) });
     await h.cleanup();
   });
 
@@ -876,7 +742,7 @@ describe('createComputerMcpServer', () => {
       x: 10,
       y: 20,
       session: 'agent-session-1',
-    }, { sessionId: 'agent-session-1' });
+    }, { signal: expect.any(AbortSignal), sessionId: 'agent-session-1' });
     await h.cleanup();
   });
 
@@ -918,14 +784,14 @@ describe('createComputerMcpServer', () => {
       x: 10,
       y: 20,
       session: 'dynamic-session-1',
-    }, { sessionId: 'dynamic-session-1', agentKind: 'codex' });
+    }, { signal: expect.any(AbortSignal), sessionId: 'dynamic-session-1', agentKind: 'codex' });
     expect(deps.callTool).toHaveBeenNthCalledWith(2, 'click', {
       pid: 123,
       window_id: 7,
       x: 11,
       y: 21,
       session: 'dynamic-session-2',
-    }, { sessionId: 'dynamic-session-2', agentKind: 'codex' });
+    }, { signal: expect.any(AbortSignal), sessionId: 'dynamic-session-2', agentKind: 'codex' });
     await h.cleanup();
   });
 
@@ -950,7 +816,7 @@ describe('createComputerMcpServer', () => {
       y: 20,
       cursor_id: 'agent-session-1',
       session: 'agent-session-1',
-    }, { sessionId: 'agent-session-1' });
+    }, { signal: expect.any(AbortSignal), sessionId: 'agent-session-1' });
     await h.cleanup();
   });
 
@@ -972,7 +838,7 @@ describe('createComputerMcpServer', () => {
     expect(payload.ok).toBe(true);
     expect(deps.callTool).toHaveBeenCalledWith('get_agent_cursor_state', {
       cursor_id: 'agent-session-1',
-    }, { sessionId: 'agent-session-1' });
+    }, { signal: expect.any(AbortSignal), sessionId: 'agent-session-1' });
     await h.cleanup();
   });
 
@@ -1005,7 +871,7 @@ describe('createComputerMcpServer', () => {
       output_dir: path.join(root, 'rec'),
       record_video: true,
       session: 'recording-session',
-    }, { sessionId: 'recording-session', agentKind: 'claude-code' });
+    }, { signal: expect.any(AbortSignal), sessionId: 'recording-session', agentKind: 'claude-code' });
     await h.cleanup();
     await fs.rm(root, { recursive: true, force: true });
   });
@@ -1139,8 +1005,7 @@ describe('createComputerMcpServer', () => {
     expect(deps.callTool).toHaveBeenCalledWith(
       'click',
       { pid: 123, window_id: 7, x: 10, y: 20 },
-      { agentKind: 'claude-code' },
-    );
+      { signal: expect.any(AbortSignal), agentKind: 'claude-code' });
     expect(deps.callTool).not.toHaveBeenCalledWith(
       'replay_trajectory',
       expect.anything(),
@@ -1150,7 +1015,7 @@ describe('createComputerMcpServer', () => {
     await fs.rm(root, { recursive: true, force: true });
   });
 
-  it.skipIf(process.platform === 'win32')(
+  it(
     'replays inside a workingDir reached through a symbolic link',
     async () => {
       const deps: ComputerMcpDeps = {
@@ -1161,7 +1026,11 @@ describe('createComputerMcpServer', () => {
       const realWorkingDir = path.join(container, 'real-workspace');
       const linkedWorkingDir = path.join(container, 'linked-workspace');
       await fs.mkdir(realWorkingDir);
-      await fs.symlink(realWorkingDir, linkedWorkingDir, 'dir');
+      await fs.symlink(
+        realWorkingDir,
+        linkedWorkingDir,
+        process.platform === 'win32' ? 'junction' : 'dir',
+      );
       await writeTrajectory(realWorkingDir, [
         {
           tool: 'get_window_state',
@@ -1195,195 +1064,50 @@ describe('createComputerMcpServer', () => {
           window_id: 1,
           screenshot_out_file: path.join(realWorkingDir, 'screens', 'state.png'),
         },
-        { agentKind: 'claude-code' },
-      );
+        { signal: expect.any(AbortSignal), agentKind: 'claude-code' });
       await h.cleanup();
       await fs.rm(container, { recursive: true, force: true });
     },
   );
 
-  it('preflights every turn before replay and blocks a later Simulator action', async () => {
+  it('replays external iOS desktop actions through the normal driver path', async () => {
     const deps: ComputerMcpDeps = {
       getStatus: vi.fn(),
-      resolveProcessIdentity: vi.fn(async (pid) =>
-        pid === 202
-          ? {
-              pid,
-              command:
-                '/Applications/Xcode.app/Contents/Developer/Applications/Simulator.app/Contents/MacOS/Simulator',
-            }
-          : { pid, name: 'Code' },
-      ),
       callTool: vi.fn(async () => ({ ok: true })),
     };
     const root = await makeWorkingDir();
     await writeTrajectory(root, [
-      { tool: 'click', arguments: { pid: 101, window_id: 1, x: 10, y: 20 } },
+      { tool: 'launch_app', arguments: { name: 'Simulator' } },
       { tool: 'click', arguments: { pid: 202, window_id: 2, x: 30, y: 40 } },
     ]);
     const h = await makeHarness(deps, {
       getSessionContext: () => ({ agentKind: 'claude-code', workingDir: root }),
     });
 
-    const result = await h.client.callTool({
+    const payload = textPayload(await h.client.callTool({
       name: 'call_tool',
       arguments: {
         name: 'replay_trajectory',
         args: { dir: 'rec', delay_ms: 0, stop_on_error: false },
       },
-    });
-
-    expect(textPayload(result)).toMatchObject({
-      ok: false,
-      errorCode: 'EMBEDDED_IOS_SIMULATOR_PREFERRED',
-      data: { blocked_target: 'Simulator.app' },
-    });
-    expect(result.isError).toBe(true);
-    expect(deps.callTool).not.toHaveBeenCalled();
-    await h.cleanup();
-    await fs.rm(root, { recursive: true, force: true });
-  });
-
-  it.each([
-    [
-      'Xcode hotkey',
-      { tool: 'hotkey', arguments: { pid: 303, keys: ['cmd', 'r'] } },
-      { pid: 303, name: 'Xcode' },
-      'Xcode',
-    ],
-    [
-      'Simulator launch',
-      { tool: 'launch_app', arguments: { name: 'Simulator' } },
-      { pid: 404, name: 'Code' },
-      'Simulator.app',
-    ],
-  ])(
-    'blocks %s embedded in a manually authored trajectory',
-    async (_label, action, identity, target) => {
-      const deps: ComputerMcpDeps = {
-        getStatus: vi.fn(),
-        resolveProcessIdentity: vi.fn(async () => identity),
-        callTool: vi.fn(),
-      };
-      const root = await makeWorkingDir();
-      await writeTrajectory(root, [action]);
-      const h = await makeHarness(deps, {
-        getSessionContext: () => ({
-          agentKind: 'claude-code',
-          workingDir: root,
-        }),
-      });
-
-      const result = await h.client.callTool({
-        name: 'call_tool',
-        arguments: {
-          name: 'replay_trajectory',
-          args: { dir: 'rec', delay_ms: 0 },
-        },
-      });
-
-      expect(textPayload(result)).toMatchObject({
-        ok: false,
-        errorCode: 'EMBEDDED_IOS_SIMULATOR_PREFERRED',
-        data: { blocked_target: target },
-      });
-      expect(deps.callTool).not.toHaveBeenCalled();
-      await h.cleanup();
-      await fs.rm(root, { recursive: true, force: true });
-    },
-  );
-
-  it('does not classify trajectory paths or typed text as an external Simulator target', async () => {
-    const deps: ComputerMcpDeps = {
-      getStatus: vi.fn(),
-      resolveProcessIdentity: vi.fn(async (pid) => ({ pid, name: 'Code' })),
-      callTool: vi.fn(async () => ({ ok: true })),
-    };
-    const root = await makeWorkingDir();
-    await writeTrajectory(
-      root,
-      [
-        {
-          tool: 'type_text',
-          arguments: { pid: 505, text: 'Simulator.app is text only' },
-        },
-      ],
-      'Simulator-recording',
-    );
-    const h = await makeHarness(deps, {
-      getSessionContext: () => ({ agentKind: 'claude-code', workingDir: root }),
-    });
-
-    const payload = textPayload(
-      await h.client.callTool({
-        name: 'call_tool',
-        arguments: {
-          name: 'replay_trajectory',
-          args: { dir: 'Simulator-recording', delay_ms: 0 },
-        },
-      }),
-    ) as { ok: boolean; data: { succeeded: number } };
-
-    expect(payload).toMatchObject({ ok: true, data: { succeeded: 1 } });
-    expect(deps.callTool).toHaveBeenCalledWith(
-      'type_text',
-      {
-        pid: 505,
-        text: 'Simulator.app is text only',
-      },
-      { agentKind: 'claude-code' },
-    );
-    await h.cleanup();
-    await fs.rm(root, { recursive: true, force: true });
-  });
-
-  it('re-resolves process identity immediately before each recorded action', async () => {
-    const resolveProcessIdentity = vi
-      .fn()
-      .mockResolvedValueOnce({ pid: 606, name: 'Code' })
-      .mockResolvedValueOnce({
-        pid: 606,
-        bundleId: 'com.apple.iphonesimulator',
-      });
-    const deps: ComputerMcpDeps = {
-      getStatus: vi.fn(),
-      resolveProcessIdentity,
-      callTool: vi.fn(async () => ({ ok: true })),
-    };
-    const root = await makeWorkingDir();
-    await writeTrajectory(root, [
-      { tool: 'click', arguments: { pid: 606, window_id: 6, x: 10, y: 20 } },
-    ]);
-    const h = await makeHarness(deps, {
-      getSessionContext: () => ({ agentKind: 'claude-code', workingDir: root }),
-    });
-
-    const payload = textPayload(
-      await h.client.callTool({
-        name: 'call_tool',
-        arguments: {
-          name: 'replay_trajectory',
-          args: { dir: 'rec', delay_ms: 0 },
-        },
-      }),
-    ) as {
-      ok: boolean;
-      data: {
-        attempted: number;
-        failed: number;
-        first_failure?: { error?: string };
-      };
-    };
+    })) as { ok: boolean; data: { attempted: number; succeeded: number } };
 
     expect(payload).toMatchObject({
       ok: true,
-      data: { attempted: 1, failed: 1 },
+      data: { attempted: 2, succeeded: 2 },
     });
-    expect(payload.data.first_failure?.error).toContain('EMBEDDED_IOS_SIMULATOR_PREFERRED');
-    expect(resolveProcessIdentity).toHaveBeenCalledTimes(2);
-    expect(resolveProcessIdentity).toHaveBeenNthCalledWith(1, 606);
-    expect(resolveProcessIdentity).toHaveBeenNthCalledWith(2, 606, { forceFresh: true });
-    expect(deps.callTool).not.toHaveBeenCalled();
+    expect(deps.callTool).toHaveBeenNthCalledWith(
+      1,
+      'launch_app',
+      { name: 'Simulator' },
+      { signal: expect.any(AbortSignal), agentKind: 'claude-code' },
+    );
+    expect(deps.callTool).toHaveBeenNthCalledWith(
+      2,
+      'click',
+      { pid: 202, window_id: 2, x: 30, y: 40 },
+      { signal: expect.any(AbortSignal), agentKind: 'claude-code' },
+    );
     await h.cleanup();
     await fs.rm(root, { recursive: true, force: true });
   });
@@ -1394,20 +1118,17 @@ describe('createComputerMcpServer', () => {
       { tool: 'type_text', arguments: { pid: 616, text: 'original text' } },
     ]);
     const actionPath = path.join(trajectory, 'turn-00001', 'action.json');
-    const resolveProcessIdentity = vi.fn(async (pid: number) => {
-      if (resolveProcessIdentity.mock.calls.length === 1) {
-        await fs.writeFile(
-          actionPath,
-          JSON.stringify({ tool: 'launch_app', arguments: { name: 'Simulator' } }),
-          'utf8',
-        );
-      }
-      return { pid, name: 'Code' };
+    const callTool = vi.fn(async () => {
+      await fs.writeFile(
+        actionPath,
+        JSON.stringify({ tool: 'launch_app', arguments: { name: 'Simulator' } }),
+        'utf8',
+      );
+      return { ok: true };
     });
     const deps: ComputerMcpDeps = {
       getStatus: vi.fn(),
-      resolveProcessIdentity,
-      callTool: vi.fn(async () => ({ ok: true })),
+      callTool,
     };
     const h = await makeHarness(deps, {
       getSessionContext: () => ({ agentKind: 'claude-code', workingDir: root }),
@@ -1422,55 +1143,16 @@ describe('createComputerMcpServer', () => {
     })) as { ok: boolean; data: { succeeded: number } };
 
     expect(payload).toMatchObject({ ok: true, data: { succeeded: 1 } });
-    expect(deps.callTool).toHaveBeenCalledWith(
+    expect(callTool).toHaveBeenCalledWith(
       'type_text',
       { pid: 616, text: 'original text' },
-      { agentKind: 'claude-code' },
-    );
-    expect(deps.callTool).not.toHaveBeenCalledWith('launch_app', expect.anything());
+      { signal: expect.any(AbortSignal), agentKind: 'claude-code' });
+    expect(callTool).not.toHaveBeenCalledWith('launch_app', expect.anything());
     await h.cleanup();
     await fs.rm(root, { recursive: true, force: true });
   });
 
-  it('fails replay closed when host process provenance is unavailable', async () => {
-    const deps: ComputerMcpDeps = {
-      getStatus: vi.fn(),
-      callTool: vi.fn(async () => ({ ok: true })),
-    };
-    const root = await makeWorkingDir();
-    await writeTrajectory(root, [
-      { tool: 'click', arguments: { pid: 707, window_id: 7, x: 10, y: 20 } },
-    ]);
-    const h = await makeHarness(
-      deps,
-      {
-        getSessionContext: () => ({
-          agentKind: 'claude-code',
-          workingDir: root,
-        }),
-      },
-      { injectDefaultProcessResolver: false },
-    );
-
-    const result = await h.client.callTool({
-      name: 'call_tool',
-      arguments: {
-        name: 'replay_trajectory',
-        args: { dir: 'rec', delay_ms: 0, stop_on_error: false },
-      },
-    });
-
-    expect(textPayload(result)).toMatchObject({
-      ok: false,
-      errorCode: 'TARGET_PROVENANCE_UNAVAILABLE',
-    });
-    expect(result.isError).toBe(true);
-    expect(deps.callTool).not.toHaveBeenCalled();
-    await h.cleanup();
-    await fs.rm(root, { recursive: true, force: true });
-  });
-
-  it.skipIf(process.platform === 'win32')(
+  it(
     'rejects a recorded turn that escapes through a symlink',
     async () => {
       const deps: ComputerMcpDeps = {
@@ -1485,7 +1167,11 @@ describe('createComputerMcpServer', () => {
         JSON.stringify({ tool: 'get_screen_size', arguments: {} }),
         'utf8',
       );
-      await fs.symlink(outside, path.join(root, 'rec', 'turn-00001'), 'dir');
+      await fs.symlink(
+        outside,
+        path.join(root, 'rec', 'turn-00001'),
+        process.platform === 'win32' ? 'junction' : 'dir',
+      );
       const h = await makeHarness(deps, {
         getSessionContext: () => ({
           agentKind: 'claude-code',
@@ -1513,7 +1199,7 @@ describe('createComputerMcpServer', () => {
     },
   );
 
-  it.skipIf(process.platform === 'win32')(
+  it.skipIf(!canLinkFile)(
     'rejects a symbolic-link action file even when its target stays in the task',
     async () => {
       const deps: ComputerMcpDeps = {
@@ -1555,7 +1241,6 @@ describe('createComputerMcpServer', () => {
   it('rejects trajectories whose aggregate action files exceed the memory budget', async () => {
     const deps: ComputerMcpDeps = {
       getStatus: vi.fn(),
-      resolveProcessIdentity: vi.fn(async (pid) => ({ pid, name: 'Code' })),
       callTool: vi.fn(async () => ({ ok: true })),
     };
     const root = await makeWorkingDir();

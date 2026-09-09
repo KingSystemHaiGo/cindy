@@ -78,6 +78,17 @@ const desktopDbExclude = [
 const desktopGitIntegrationInclude = [
   'src/main/**/*.git-integration.test.ts',
 ];
+const makerCoreIntegrationInclude = [
+  'src/agents/codex/*.integration.test.ts',
+  'src/agents/claude-code/__tests__/*.integration.test.ts',
+  'src/agents/pi/__tests__/*.integration.test.ts',
+];
+const makerPiManagerIntegrationInclude = [
+  'src/__tests__/pi-manager.integration.test.ts',
+];
+const desktopE2eInclude = [
+  'src/main/maker-host/__tests__/*.e2e.test.ts',
+];
 
 export function desktopUnitWorkerCount(
   availableParallelism = os.availableParallelism(),
@@ -96,7 +107,7 @@ const noCollectableWorkspace = (name, cwd, reason = noCollectableTestsReason) =>
   tiers: {},
 });
 
-const requiredUnitWorkspace = (name, cwd, { workers = 1, execution, pool } = {}) => ({
+const requiredUnitWorkspace = (name, cwd, { workers = 1, execution, pool, exclude } = {}) => ({
   name,
   cwd,
   status: 'required',
@@ -105,6 +116,7 @@ const requiredUnitWorkspace = (name, cwd, { workers = 1, execution, pool } = {})
       status: 'required',
       ...(execution ? { execution } : {}),
       command: unitVitestCommand(workers, pool),
+      ...(exclude?.length ? { exclude } : {}),
     },
   },
 });
@@ -140,6 +152,8 @@ export default {
           ),
           exclude: [
             '**/*.git-integration.test.ts',
+            '**/*.integration.test.ts',
+            '**/*.e2e.test.ts',
             'src/main/localDb/**',
             'src/main/__tests__/*Migration.test.ts',
             'src/main/__tests__/schemaDriftRepair.test.ts',
@@ -160,6 +174,14 @@ export default {
           coverage: 'allowlist',
           command: vitestBin('run', `--maxWorkers=${desktopUnitWorkerCount()}`),
           include: desktopGitIntegrationInclude,
+        },
+        e2e: {
+          status: 'manual',
+          reason: 'Desktop E2E tests spawn the real Codex binary and are explicit because they are platform and binary dependent.',
+          execution: 'exclusive',
+          coverage: 'allowlist',
+          command: vitestBin('run', '--pool=forks', '--maxWorkers=1'),
+          include: desktopE2eInclude,
         },
         db: {
           status: 'manual',
@@ -225,6 +247,9 @@ export default {
     requiredUnitWorkspace('@cindy/mcps', 'packages/lizi-mcps'),
     requiredUnitWorkspace('@cindy/ios-simulator-runtime', 'packages/ios-simulator-runtime'),
     requiredUnitWorkspace('@cindy/maker-cc-manager', 'packages/maker-cc-manager'),
+    // Stays on forks: palette-scanner's tests stub HOME and the scanner resolves
+    // it through os.homedir(), which a worker thread cannot see (see
+    // UNIT_POOL_DEFAULT above).
     {
       name: '@cindy/maker-core',
       cwd: 'packages/maker-core',
@@ -232,13 +257,8 @@ export default {
       tiers: {
         unit: {
           status: 'required',
-          // Stays on forks: palette-scanner's tests stub HOME and the scanner
-          // resolves it through os.homedir(), which a worker thread cannot see
-          // (see UNIT_POOL_DEFAULT above).
           command: unitVitestCommand(1, 'forks'),
-          // Real-Git combination matrices live in the explicit git-integration
-          // tier (engineering-conventions §3.1); unit keeps only one smoke.
-          exclude: ['**/*.git-integration.test.ts'],
+          exclude: ['**/*.integration.test.ts', '**/*.e2e.test.ts', '**/*.git-integration.test.ts'],
         },
         'git-integration': {
           status: 'manual',
@@ -247,9 +267,39 @@ export default {
           command: vitestBin('run', '--maxWorkers=1'),
           include: ['src/**/*.git-integration.test.ts'],
         },
+        integration: {
+          status: 'manual',
+          reason: 'Claude/Pi/Codex integration tests spawn real agent binaries and local protocol servers.',
+          execution: 'exclusive',
+          coverage: 'allowlist',
+          command: vitestBin('run', '--pool=forks', '--maxWorkers=1'),
+          include: makerCoreIntegrationInclude,
+        },
       },
     },
     requiredUnitWorkspace('@cindy/maker-remote-ssh', 'packages/maker-remote-ssh'),
+    // 轮 42:新包 maker-pi-manager(TS 单例 pi daemon)已随 SSH remote 交付;
+    // 漏登记会让 test-workspaces 的 manifest 覆盖校验失败(全量门禁拒跑)。
+    {
+      name: '@cindy/maker-pi-manager',
+      cwd: 'packages/maker-pi-manager',
+      status: 'required',
+      tiers: {
+        unit: {
+          status: 'required',
+          command: unitVitestCommand(),
+          exclude: ['src/__tests__/pi-manager.integration.test.ts'],
+        },
+        integration: {
+          status: 'manual',
+          reason: 'Pi manager integration tests spawn real processes and sockets.',
+          execution: 'exclusive',
+          coverage: 'allowlist',
+          command: vitestBin('run', '--pool=forks', '--maxWorkers=1'),
+          include: makerPiManagerIntegrationInclude,
+        },
+      },
+    },
     requiredUnitWorkspace('@cindy/maker-scheduler', 'packages/maker-scheduler'),
     requiredUnitWorkspace('@cindy/maker-shared', 'packages/maker-shared'),
     requiredUnitWorkspace('@cindy/model-providers', 'packages/model-providers'),
@@ -269,9 +319,9 @@ export default {
     requiredUnitWorkspace('@cindy/remote-file-service', 'packages/remote-file-service'),
     requiredUnitWorkspace('@cindy/voice-input-core', 'packages/voice-input-core'),
     requiredUnitWorkspace('@cindy/wechat-ilink', 'packages/wechat-ilink'),
-    noCollectableWorkspace('@cindy/device-link-protocol', 'cindy-protocol/packages/device-link-protocol'),
-    requiredUnitWorkspace('@cindy/model-access-protocol', 'cindy-protocol/packages/model-access-protocol'),
-    requiredUnitWorkspace('@cindy/plugin-protocol', 'cindy-protocol/packages/plugin-protocol'),
-    requiredUnitWorkspace('@cindy/slack-hook-protocol', 'cindy-protocol/packages/slack-hook-protocol'),
+    noCollectableWorkspace('@cindy/device-link-protocol', 'packages/device-link-protocol'),
+    requiredUnitWorkspace('@cindy/plugin-protocol', 'packages/plugin-protocol'),
+    requiredUnitWorkspace('@cindy/slack-hook-protocol', 'packages/slack-hook-protocol'),
+    requiredUnitWorkspace('@cindy/design-tokens', 'packages/design-tokens'),
   ],
 };

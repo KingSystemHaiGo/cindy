@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import React from 'react';
-import { act, render } from '@testing-library/react';
+import { act, fireEvent, render } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
 vi.mock('react-i18next', () => ({
@@ -31,12 +31,15 @@ vi.mock('@/hooks/useExpandedBlockMemory', () => ({
   }),
 }));
 
-const { openBackgroundTasksTabMock, openSubagentsTabMock } = vi.hoisted(() => ({
+const { openBackgroundTasksTabMock } = vi.hoisted(() => ({
   openBackgroundTasksTabMock: vi.fn().mockResolvedValue(undefined),
-  openSubagentsTabMock: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock('@/features/right-sidebar/lib/openBackgroundTasksTab', () => ({
   openBackgroundTasksTab: openBackgroundTasksTabMock,
+}));
+
+const { openSubagentsTabMock } = vi.hoisted(() => ({
+  openSubagentsTabMock: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock('@/features/right-sidebar/lib/openSubagentsTab', () => ({
   openSubagentsTab: openSubagentsTabMock,
@@ -70,6 +73,27 @@ const withPanelHost = (
   });
 
 describe('AgentTaskCard', () => {
+  it.each([
+    ['failed', 'chat.agentTask.status.failed'],
+    ['stopped', 'chat.agentTask.status.stopped'],
+  ] as const)('keeps a persisted %s status when replaying a non-empty result', (status, label) => {
+    const { container } = render(
+      React.createElement(AgentTaskCard, {
+        result: 'terminal task output',
+        persistedStatus: status,
+        toolCall: {
+          clientId: `tool-${status}`,
+          role: 'tool_use',
+          content: '',
+          toolName: 'Agent',
+        },
+      }),
+    );
+
+    expect(container.textContent).toContain(label);
+    expect(container.textContent).not.toContain('Completed');
+  });
+
   it('renders the full expanded task result instead of truncating it', () => {
     const tail = 'TAIL_MARKER_KEPT_VISIBLE';
     const longResult = `Summary start\n\n${'x'.repeat(500)}\n${tail}`;
@@ -90,6 +114,28 @@ describe('AgentTaskCard', () => {
     expect(container.textContent).toContain('Summary start');
   });
 
+  it('clamps only durable Pi results and lets the user expand the full result', () => {
+    const longResult = `line 1\nline 2\nline 3\nline 4\nline 5\n${'tail'.repeat(100)}`;
+    const { container, getByRole } = render(
+      React.createElement(AgentTaskCard, {
+        update: {
+          provider: 'pi',
+          taskId: 'pi-task-1',
+          taskType: 'pi_subagent',
+          status: 'completed',
+          title: 'Inspect files',
+          summary: longResult,
+        },
+      }),
+    );
+
+    const preview = container.querySelector('[data-agent-task-result-preview="true"]');
+    expect(preview?.className).toContain('line-clamp-4');
+    fireEvent.click(getByRole('button', { name: 'chat.agentTask.showFullResult' }));
+    expect(preview?.className).not.toContain('line-clamp-4');
+    expect(getByRole('button', { name: 'chat.agentTask.hideFullResult' })).toBeTruthy();
+  });
+
   it('prefers the paired tool result over task update summaries', () => {
     const { container } = render(
       React.createElement(AgentTaskCard, {
@@ -108,6 +154,31 @@ describe('AgentTaskCard', () => {
     expect(container.textContent).not.toContain('Task notification summary only');
   });
 
+  it('replaces a PI background launch receipt with the durable terminal summary', () => {
+    const { container } = render(
+      React.createElement(AgentTaskCard, {
+        toolCall: {
+          clientId: 'pi-bg-card',
+          role: 'tool_use',
+          content: '',
+          toolName: 'subagent',
+          toolUseId: 'pi-tool-bg',
+        },
+        result: 'Cindy subagent launched. The agent is working in the background.',
+        update: {
+          provider: 'pi',
+          taskId: 'pi-tool-bg',
+          status: 'completed',
+          taskType: 'pi_subagent',
+          summary: 'Durable terminal answer',
+        },
+      }),
+    );
+
+    expect(container.textContent).toContain('Durable terminal answer');
+    expect(container.textContent).not.toContain('Cindy subagent launched');
+  });
+
   // subagent-model-chip --------------------------------------------------------
   const modelChip = (container: HTMLElement) =>
     container.querySelector('[data-agent-task-model-chip="true"]');
@@ -115,6 +186,14 @@ describe('AgentTaskCard', () => {
   it('renders the subagent model chip from update.model (live)', () => {
     const { container } = render(
       React.createElement(AgentTaskCard, {
+        toolCall: {
+          clientId: 'c-live',
+          role: 'tool_use',
+          content: '',
+          toolName: 'Agent',
+          toolUseId: 'toolu_LIVE',
+          toolInput: { model: 'sonnet' },
+        },
         update: {
           provider: 'claude-code',
           taskId: 'task-1',
@@ -156,6 +235,55 @@ describe('AgentTaskCard', () => {
       }),
     );
     expect(modelChip(container)).toBeNull();
+  });
+
+  it('renders PI thinking from the durable task update', () => {
+    const { container } = render(
+      React.createElement(AgentTaskCard, {
+        update: {
+          provider: 'pi',
+          taskId: 'pi-1',
+          status: 'running',
+          taskType: 'pi_subagent',
+          reasoningEffort: 'high',
+        },
+      }),
+    );
+    expect(modelChip(container)?.textContent).toBe('effortLevels.high');
+  });
+
+  it('does not present a Claude Agent request model as the actual model', () => {
+    const { container } = render(
+      React.createElement(AgentTaskCard, {
+        toolCall: {
+          clientId: 'c-requested',
+          role: 'tool_use',
+          content: '',
+          toolName: 'Agent',
+          toolUseId: 'toolu_REQUESTED',
+          toolInput: { model: 'sonnet' },
+        },
+        result: 'done',
+      }),
+    );
+    expect(modelChip(container)).toBeNull();
+  });
+
+  it('keeps the existing Codex collab explicit model chip fallback', () => {
+    const { container } = render(
+      React.createElement(AgentTaskCard, {
+        toolCall: {
+          clientId: 'c-codex',
+          role: 'tool_use',
+          content: '',
+          toolName: 'collab:spawn',
+          toolUseId: 'call_CODEX',
+          toolInput: { model: 'gpt-5.6-terra' },
+        },
+        result: 'done',
+      }),
+    );
+    expect(modelChip(container)?.textContent).toBe('Gpt 5.6 Terra');
   });
 
   it('does not fall back to stale history or spawn input after an explicit model clear', () => {
@@ -217,7 +345,62 @@ describe('AgentTaskCard', () => {
     }
   });
 
-  it('hides the stop button for terminal tasks, codex tasks, and when sessionId is missing', () => {
+  it('stops a running PI durable subagent through the common task control IPC', async () => {
+    const stopAgentTask = vi.fn().mockResolvedValue({ ok: true });
+    (window as unknown as { electronAPI?: unknown }).electronAPI = {
+      maker: { stopAgentTask },
+    };
+    try {
+      const { container } = render(
+        React.createElement(AgentTaskCard, {
+          sessionId: 'session-pi',
+          sessionAgentKind: 'pi',
+          update: {
+            provider: 'pi',
+            taskId: 'pi-tool-1',
+            status: 'running',
+            taskType: 'pi_subagent',
+          },
+        }),
+      );
+      const btn = stopButton(container);
+      expect(btn).not.toBeNull();
+      await act(async () => {
+        btn!.click();
+        await Promise.resolve();
+      });
+      expect(stopAgentTask).toHaveBeenCalledWith('session-pi', 'pi-tool-1');
+    } finally {
+      delete (window as unknown as { electronAPI?: unknown }).electronAPI;
+    }
+  });
+
+  it.each(['cc', 'codex'] as const)(
+    'keeps a historical PI durable card inline after the session switches to %s',
+    (sessionAgentKind) => {
+      openSubagentsTabMock.mockClear();
+      const { container } = render(
+        withPanelHost(
+          `session-${sessionAgentKind}`,
+          React.createElement(AgentTaskCard, {
+            sessionId: `session-${sessionAgentKind}`,
+            sessionAgentKind,
+            update: {
+              provider: 'pi',
+              taskId: 'historical-pi-tool',
+              status: 'completed',
+              taskType: 'pi_subagent',
+            },
+          }),
+        ),
+      );
+      expect(container.querySelector('[data-agent-task-open-subagents="true"]')).toBeNull();
+      expect(container.querySelector('button[aria-expanded]')).not.toBeNull();
+      expect(openSubagentsTabMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it('hides the stop button for terminal tasks, codex tasks, foreground PI tasks, and when sessionId is missing', () => {
     const terminal = render(
       React.createElement(AgentTaskCard, {
         sessionId: 'session-1',
@@ -239,6 +422,14 @@ describe('AgentTaskCard', () => {
     );
     expect(stopButton(codex.container)).toBeNull();
 
+    const foregroundPi = render(
+      React.createElement(AgentTaskCard, {
+        sessionId: 'session-1',
+        update: { provider: 'pi', taskId: 'pi-1', status: 'running' },
+      }),
+    );
+    expect(stopButton(foregroundPi.container)).toBeNull();
+
     const noSession = render(
       React.createElement(AgentTaskCard, {
         update: {
@@ -250,6 +441,66 @@ describe('AgentTaskCard', () => {
       }),
     );
     expect(stopButton(noSession.container)).toBeNull();
+  });
+
+  it('opens the existing Subagents panel focused on a PI durable run alias', () => {
+    openSubagentsTabMock.mockClear();
+    const { container } = render(
+      withPanelHost(
+        'session-pi',
+        React.createElement(AgentTaskCard, {
+          sessionId: 'session-pi',
+          sessionAgentKind: 'pi',
+          update: {
+            provider: 'pi',
+            taskId: 'pi-tool-1',
+            status: 'running',
+            taskType: 'pi_subagent',
+          },
+        }),
+      ),
+    );
+    const button = container.querySelector<HTMLButtonElement>(
+      '[data-agent-task-open-subagents="true"]',
+    );
+    expect(button).not.toBeNull();
+    act(() => button!.click());
+    expect(openSubagentsTabMock).toHaveBeenCalledWith('session-pi', {
+      focusRunId: 'pi-tool-1',
+      focusProvider: 'pi',
+    });
+  });
+
+  it.each([
+    ['claude-code', 'Agent'],
+    ['codex', 'collab:spawnAgent'],
+  ] as const)('keeps %s Subagent cards inline without a sidebar jump', (provider, toolName) => {
+    openSubagentsTabMock.mockClear();
+    const { container } = render(
+      withPanelHost(
+        `session-${provider}`,
+        React.createElement(AgentTaskCard, {
+          sessionId: `session-${provider}`,
+          toolCall: {
+            clientId: `${provider}-card`,
+            role: 'tool_use',
+            content: '',
+            toolName,
+            toolUseId: `${provider}-tool`,
+          },
+          update: {
+            provider,
+            taskId: `${provider}-task`,
+            status: 'running',
+          },
+        }),
+      ),
+    );
+    expect(container.querySelector('[data-agent-task-open-subagents="true"]')).toBeNull();
+    const inlineToggle = container.querySelector<HTMLButtonElement>('button[aria-expanded]');
+    expect(inlineToggle).not.toBeNull();
+    act(() => inlineToggle!.click());
+    expect(openSubagentsTabMock).not.toHaveBeenCalled();
   });
 
   // workflow-card:整卡 = 后台任务面板入口 -------------------------------------
@@ -519,9 +770,8 @@ describe('AgentTaskCard', () => {
     expect(progressLine(container)?.textContent).toBe('2/2 Agent');
   });
 
-  it('renders no workflow progress line and opens ordinary Subagents in their durable panel', () => {
+  it('renders no progress line when workflowProgress is absent, and keeps non-workflow cards off the panel entry', () => {
     openBackgroundTasksTabMock.mockClear();
-    openSubagentsTabMock.mockClear();
     const workflow = render(
       React.createElement(AgentTaskCard, {
         sessionId: 'session-1',
@@ -536,59 +786,23 @@ describe('AgentTaskCard', () => {
     expect(progressLine(workflow.container)).toBeNull();
 
     const normal = render(
-      withPanelHost(
-        'session-1',
-        React.createElement(AgentTaskCard, {
-          sessionId: 'session-1',
-          update: {
-            provider: 'claude-code',
-            taskId: 'task-1',
-            status: 'running',
-            title: 'Inspect files',
-          },
-        }),
-      ),
+      React.createElement(AgentTaskCard, {
+        sessionId: 'session-1',
+        update: {
+          provider: 'claude-code',
+          taskId: 'task-1',
+          status: 'running',
+          title: 'Inspect files',
+        },
+      }),
     );
-    const subagentButton = headerButton(normal.container);
-    expect(subagentButton).not.toBeNull();
+    // 普通卡头部仍是展开 toggle,不触发面板。
+    const toggleBtn = normal.container.querySelector<HTMLButtonElement>('button[aria-expanded]');
+    expect(toggleBtn).not.toBeNull();
     act(() => {
-      subagentButton!.click();
+      toggleBtn!.click();
     });
     expect(openBackgroundTasksTabMock).not.toHaveBeenCalled();
-    expect(openSubagentsTabMock).toHaveBeenCalledWith('session-1', {
-      focusRunId: 'task-1',
-      focusProvider: 'claude-code',
-    });
     expect(progressLine(normal.container)).toBeNull();
-  });
-
-  it('keeps Codex control cards expandable instead of opening a nonexistent Subagent run', () => {
-    openSubagentsTabMock.mockClear();
-    const { container } = render(
-      withPanelHost(
-        'session-1',
-        React.createElement(AgentTaskCard, {
-          sessionId: 'session-1',
-          toolCall: {
-            clientId: 'wait-1',
-            role: 'tool_use',
-            content: '',
-            toolName: 'collab:wait',
-            toolUseId: 'wait-1',
-          },
-          update: {
-            provider: 'codex',
-            taskId: 'wait-1',
-            status: 'completed',
-            title: 'wait',
-          },
-        }),
-      ),
-    );
-
-    const toggleButton = container.querySelector<HTMLButtonElement>('button[aria-expanded]');
-    expect(toggleButton).not.toBeNull();
-    act(() => toggleButton!.click());
-    expect(openSubagentsTabMock).not.toHaveBeenCalled();
   });
 });
