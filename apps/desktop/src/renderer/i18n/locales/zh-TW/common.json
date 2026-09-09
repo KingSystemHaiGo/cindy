@@ -1382,7 +1382,7 @@
         "reasonListSep": " · ",
         "reasonListClose": "）",
         "reasonListSource": "Claude：",
-        "reasonInternal": "內部 Agent 會話",
+        "reasonInternal": "內部 Agent 運行時",
         "reasonNoEvents": "無有效內容",
         "reasonWindowLimit": "超出掃描窗口",
         "reasonInvalidId": "ID 格式無效",
