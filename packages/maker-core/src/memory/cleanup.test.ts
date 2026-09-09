@@ -171,6 +171,38 @@ describe('planMemoryCleanup', () => {
     expect(plan.digests.archive).toEqual(['digest_old.md']);
     // digest 冗余是确定性动作 → 进 archiveItems。
     expect(plan.archiveItems.map((i) => i.filename)).toEqual(['digest_old.md']);
+    expect(plan.archiveItems[0].digestKeep?.map((k) => k.filename).sort()).toEqual(
+      ['digest_mid.md', 'digest_new.md'].sort(),
+    );
+  });
+
+  it('ranks digest keep by chronological updatedAt not lexicographic ISO', async () => {
+    // `...T12:00:00Z` 字典序晚于 `...T09:00:00-08:00`, 但后者实际更新 (17:00Z)。
+    await shard('digest_lex.md', 'digest', 'Lex', 'hook', 'lex', '2026-01-01T12:00:00Z');
+    await shard('digest_tz.md', 'digest', 'Tz', 'hook', 'tz', '2026-01-01T09:00:00-08:00');
+
+    const plan = await planMemoryCleanup(dir, { keepDigests: 1 });
+    expect(plan.digests.keep).toEqual(['digest_tz.md']);
+    expect(plan.digests.archive).toEqual(['digest_lex.md']);
+  });
+
+  it('excludes digests whose updatedAt is only in the body or invalid', async () => {
+    await shard('digest_old.md', 'digest', 'Digest 1', 'hook', 'old', '2026-01-01T00:00:00.000Z');
+    await writeFile(
+      path.join(dir, 'digest_body_ts.md'),
+      '---\ntitle: Body TS\ndescription: hook\ntype: digest\n---\nupdatedAt: 2026-09-01T00:00:00.000Z\n',
+      'utf8',
+    );
+    await writeFile(
+      path.join(dir, 'digest_bad_ts.md'),
+      "---\ntitle: Bad TS\ndescription: hook\ntype: digest\nupdatedAt: not-a-date\n---\nbody\n",
+      'utf8',
+    );
+
+    const plan = await planMemoryCleanup(dir);
+    expect(plan.digests.keep).toEqual(['digest_old.md']);
+    expect(plan.digests.archive).toEqual([]);
+    expect(plan.archiveItems).toHaveLength(0);
   });
 
   it('excludes digests without updatedAt from retention pruning', async () => {
@@ -951,20 +983,17 @@ describe('runMemoryCleanup', () => {
     }
   });
 
-  it('renames trash back to src when link and copy restore both fail', async () => {
+  it('keeps trash reachable when link and copy restore both fail (no rename clobber)', async () => {
     await shard('feedback_a.md', 'feedback', 'Same', 'hook', 'same', '2026-01-01T00:00:00.000Z');
     await shard('feedback_b.md', 'feedback', 'Same', 'hook', 'same', '2026-02-01T00:00:00.000Z');
 
     const plan = await planMemoryCleanup(dir);
     // 模拟: 源在归档期间变化 (trash ≠ 快照), 且硬链接恢复 (link ENOTSUP) 与
-    // 排他复制恢复 (copyFile ENOSPC) 都失败 — rename 兜底把 trash 改回合法
-    // 分片名, 记忆留在 list()/MEMORY.md/FTS 正常路径, 而非只留在 cleanup-trash
-    // 被 rebuildIndex 跳过 (Greptile P1 on #2561 第二十六轮)。
+    // 排他复制恢复 (copyFile ENOSPC) 都失败 — 不再 rename 兜底, 以免覆盖
+    // 窗口内重建的 src (Codex P1 on #2561: atomic protect live shard)。
     const realLink = fs.link.bind(fs);
     const linkSpy = vi.spyOn(fs, 'link').mockImplementation(async (src, dst) => {
       if (String(src).endsWith('feedback_a.md') && String(dst).includes('cleanup-trash')) {
-        // reserveTrashTarget 的排他预留: 宿主在预留前写新内容 → trash ≠ 快照,
-        // 触发 restoreTrash; 然后真实 link (移动 src → trash)。
         await writeFile(
           String(src),
           "---\ntitle: NEW\ndescription: new\ntype: feedback\nupdatedAt: '2026-03-01T00:00:00.000Z'\n---\nUPDATED\n",
@@ -972,8 +1001,6 @@ describe('runMemoryCleanup', () => {
         );
         return realLink(src as string, dst as string);
       }
-      // restoreTrash 的 link (existing=trash → new=src): 硬链接不可用 → 走
-      // copyFile fallback (也被 mock 拒绝) → 双重恢复失败。
       throw Object.assign(new Error('link not supported'), { code: 'ENOTSUP' });
     });
     const copySpy = vi
@@ -982,15 +1009,31 @@ describe('runMemoryCleanup', () => {
 
     try {
       const result = await runMemoryCleanup(plan);
-      // rename 兜底成功: src 恢复 (合法分片名, 内容 = trash 内容), failed 如实。
       expect(result.failed.some((f) => f.filename === 'feedback_a.md')).toBe(true);
-      await expect(readFile(path.join(dir, 'feedback_a.md'), 'utf8')).resolves.toContain('UPDATED');
       const files = await readdir(dir);
-      expect(files.some((f) => f.includes('cleanup-trash'))).toBe(false);
+      expect(files.some((f) => f.includes('cleanup-trash'))).toBe(true);
     } finally {
       linkSpy.mockRestore();
       copySpy.mockRestore();
     }
+  });
+
+  it('fails digest archive when a keep digest changed since plan', async () => {
+    await shard('digest_old.md', 'digest', 'Digest 1', 'hook', 'old', '2026-01-01T00:00:00.000Z');
+    await shard('digest_mid.md', 'digest', 'Digest 2', 'hook', 'mid', '2026-02-01T00:00:00.000Z');
+    await shard('digest_new.md', 'digest', 'Digest 3', 'hook', 'new', '2026-03-01T00:00:00.000Z');
+
+    const plan = await planMemoryCleanup(dir);
+    await writeFile(
+      path.join(dir, 'digest_new.md'),
+      "---\ntitle: Digest 3\ndescription: hook\ntype: digest\nupdatedAt: '2026-04-01T00:00:00.000Z'\n---\nchanged keep\n",
+      'utf8',
+    );
+
+    const result = await runMemoryCleanup(plan);
+    expect(result.archived).toHaveLength(0);
+    expect(result.failed.some((f) => f.filename === 'digest_old.md')).toBe(true);
+    await expect(readFile(path.join(dir, 'digest_old.md'), 'utf8')).resolves.toContain('old');
   });
 
   it('keeps trash reachable when link, copy, and rename restore all fail', async () => {

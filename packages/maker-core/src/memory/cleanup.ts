@@ -106,6 +106,13 @@ export interface ArchiveItem {
    * #2561 第二十九轮: 同时校验重复组的保留副本)。
    */
   keep?: { filename: string; contentHash: string };
+  /**
+   * digest 精简的保留集 (reason=digest-retention 时) — plan 审阅时点
+   * 各 keep 文件的 raw sha256, run 在归档前复验仍存在且内容一致,
+   * 任一变化则失败要求重新规划 (不把仍在保留窗口内的
+   * digest 归档掉) (Codex P1 on #2561: re-verify digest keep set before archive)。
+   */
+  digestKeep?: Array<{ filename: string; expectedHash: string }>;
 }
 
 /** 完全重复组 (title+description+body 三者一致, 仅 filename 不同)。 */
@@ -333,31 +340,36 @@ export async function planMemoryCleanup(
   }
 
   // ── 4. digest 精简: 保留最新 N, 其余归档 ──────────────────────────────
-  // 缺 updatedAt 的 digest 被 parseRawShard 每次读取填当前时间 — 按它排序
-  // 等价于按 readdir/解析先后而非真实新旧, 精简会误归档实际最新的 digest
-  // (Codex P1 on #2561 第二十九轮: 不要按解析时刻排列无时间戳 digest)。
-  // raw 检查是否含 updatedAt 字段, 缺 → 不参与精简 (仅报告, 不归档)。
-  const digestMeta: Array<{ rec: MemoryRecord; hasTs: boolean }> = [];
+  // 只接受 frontmatter 里可解析的 updatedAt — 正文里的 `updatedAt:` 字串
+  // 或无效值不能当真实时间戳 (否则精简会误归档实际最新 digest)
+  // (Codex P1 on #2561: only accept valid digest timestamps in frontmatter)。
+  // 缺字段 / 无效 → 不参与精简 (仅报告, 不归档)。
+  // 排序用纪元时间 (不是 ISO 字符串字典序): `...T09:00:00-08:00` 比
+  // `...T12:00:00Z` 更新, 但 localeCompare 会把 Z 排在前
+  // (Codex P1 on #2561: compare digest timestamps chronologically)。
+  const digestMeta: Array<{ rec: MemoryRecord; ts: number }> = [];
   for (const r of records) {
     if (r.frontmatter.type !== 'digest') continue;
     const raw = rawByName.get(r.filename);
-    digestMeta.push({
-      rec: r,
-      hasTs: raw !== undefined && /^updatedAt\s*:/m.test(raw),
-    });
+    const ts = parseFrontmatterUpdatedAt(raw);
+    if (ts === null) continue;
+    digestMeta.push({ rec: r, ts });
   }
-  const digests = digestMeta
-    .filter((d) => d.hasTs)
-    .map((d) => d.rec)
-    .sort((a, b) => {
-      const d = b.frontmatter.updatedAt.localeCompare(a.frontmatter.updatedAt);
-      if (d !== 0) return d;
-      return a.filename.localeCompare(b.filename);
-    });
+  digestMeta.sort((a, b) => {
+    if (b.ts !== a.ts) return b.ts - a.ts;
+    return a.rec.filename.localeCompare(b.rec.filename);
+  });
+  const digests = digestMeta.map((d) => d.rec);
   plan.digests = {
     keep: digests.slice(0, keepDigests).map((r) => r.filename),
     archive: digests.slice(keepDigests).map((r) => r.filename),
   };
+  const digestKeep: Array<{ filename: string; expectedHash: string }> = [];
+  for (const f of plan.digests.keep) {
+    const keepHash = hashOfRaw(rawByName.get(f));
+    if (keepHash === null) continue;
+    digestKeep.push({ filename: f, expectedHash: keepHash });
+  }
   for (const f of plan.digests.archive) {
     const expectedHash = hashOfRaw(rawByName.get(f));
     if (expectedHash === null) continue;
@@ -366,6 +378,7 @@ export async function planMemoryCleanup(
       reason: 'digest-retention',
       detail: `digest beyond keep-latest-${keepDigests}`,
       expectedHash,
+      digestKeep,
     });
   }
 
@@ -376,6 +389,23 @@ export async function planMemoryCleanup(
 function hashOfRaw(raw: string | undefined): string | null {
   if (raw === undefined) return null;
   return sha256(Buffer.from(raw, 'utf8'));
+}
+
+/**
+ * 从 YAML frontmatter 解析 updatedAt 纪元毫秒。只认分隔符 `---` 之间的
+ * `updatedAt:` 字段; 正文里的同名字串忽略。无效 / 缺字段 → null。
+ */
+function parseFrontmatterUpdatedAt(raw: string | undefined): number | null {
+  if (raw === undefined) return null;
+  const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  if (!match) return null;
+  const fm = match[1];
+  const line = fm.match(/^updatedAt\s*:\s*(?:['"]([^'"]+)['"]|(\S+))\s*$/m);
+  if (!line) return null;
+  const value = line[1] ?? line[2];
+  if (!value) return null;
+  const ts = Date.parse(value);
+  return Number.isNaN(ts) ? null : ts;
 }
 
 /**
@@ -422,15 +452,10 @@ export async function runMemoryCleanup(
       // 重复组保留副本校验 (Codex P1 on #2561 第二十九轮): keep 在 plan 后
       // 被更新/删除则重复组不再成立 — 归档待删副本会让最后一份已审阅内容
       // 退出 MEMORY.md/FTS 正常路径, 必须失败并要求重新规划。
-      if (item.keep) {
-        const keepRec = await new MemoryStorage(plan.shardDir).readWithRaw(item.keep.filename);
-        if (!keepRec || contentHash(keepRec.rec) !== item.keep.contentHash) {
-          result.failed.push({
-            filename: item.filename,
-            error: `duplicate keeper ${item.keep.filename} changed since plan; replan required`,
-          });
-          continue;
-        }
+      const earlyKeeperError = await verifyBoundKeepers(plan.shardDir, item);
+      if (earlyKeeperError) {
+        result.failed.push({ filename: item.filename, error: earlyKeeperError });
+        continue;
       }
       // 幂等 + 移动前校验: 只对 ENOENT (源已被上次运行归档) 静默跳过;
       // 其他读错误 (EACCES/EPERM/瞬态锁定) 必须暴露为 failed, 不能伪装成
@@ -471,6 +496,15 @@ export async function runMemoryCleanup(
       //      读失败 (宿主并发写的新内容) → no-clobber 恢复 src (见
       //      restoreTrash — Greptile P1 / Codex P1 on #2561 第十一轮)。
       await writeExclusive(archiveDir, item.filename, stamp, srcContent);
+      // 归档边界再验 keeper (Codex P1 on #2561: recheck the keeper at the
+      // archive boundary) — 首次校验之后还有读源 / 备份 / 写快照, --force
+      // 下 keeper 可能在窗口内被改掉。移动前再验一次, 否则会把仍该保留的
+      // 副本归档出 MEMORY.md。
+      const keeperError = await verifyBoundKeepers(plan.shardDir, item);
+      if (keeperError) {
+        result.failed.push({ filename: item.filename, error: keeperError });
+        continue;
+      }
       // trash 目标排他预留 (Codex P2 on #2561 第二十二轮): 失败清理遗留的
       // cleanup-trash 文件是 live-writer 内容的恢复路径 — 同 stamp rerun 或
       // 并发清理时 rename(src, trash) 会覆盖既有 trash, 丢弃唯一可达副本。
@@ -633,12 +667,21 @@ async function reserveTrashTarget(
     );
     try {
       await fs.link(src, candidate);
-      // link 成功 (目标已原子排他预留), 删源路径名。unlink 失败 (Windows 锁
-      // / --force 下其他进程持有 src) 时**必须抛错**: src 仍在活动分片, 若吞错
-      // 继续会标 archived 而 rebuildIndex() 仍把 src 写回 MEMORY.md, CLI 误报
-      // 成功 (Greptile P1 / Codex P1 on #2561 第二十三轮: fail when unlink
-      // leaves the source active)。link 副本已落盘 (共享 inode, 数据双份安全),
-      // 抛错由外层记 failed, 下次重跑可再次处理。
+      // link 成功后、unlink 前核对 inode: 编辑器原子保存 (rename 替换 src)
+      // 会让 src 指向新 inode, 此时 unlink(src) 会删掉替换文件而留下旧内容
+      // 的 trash (Codex P1 on #2561: avoid unlinking a replacement inode)。
+      // 发现不一致 → 丢掉 candidate (审阅快照已在 .archive), 保留新 src, 失败重规划。
+      const [srcStat, candStat] = await Promise.all([fs.lstat(src), fs.lstat(candidate)]);
+      if (srcStat.ino !== candStat.ino || srcStat.dev !== candStat.dev) {
+        await fs.unlink(candidate).catch(() => {});
+        throw Object.assign(
+          new Error('source replaced after trash reservation; replan required'),
+          { code: 'CLEANUP_SOURCE_REPLACED' },
+        );
+      }
+      // unlink 失败 (Windows 锁 / --force 下其他进程持有 src) 时**必须抛错**:
+      // src 仍在活动分片, 若吞错继续会标 archived 而 rebuildIndex() 仍把 src
+      // 写回 MEMORY.md, CLI 误报成功 (Greptile P1 / Codex P1 on #2561 第二十三轮)。
       await fs.unlink(src).catch((e) => {
         throw Object.assign(
           new Error(`unable to remove source after reservation: ${String(e)}`),
@@ -687,6 +730,29 @@ function contentHash(rec: MemoryRecord): string {
 /** Buffer 的 sha256 (用于 plan 时点 vs run 时点的源内容对比)。 */
 function sha256(buf: Buffer): string {
   return createHash('sha256').update(buf).digest('hex');
+}
+
+/** 校验 duplicate keeper / digest keep 集仍与 plan 一致; 变化则返回错误文案。 */
+async function verifyBoundKeepers(
+  shardDir: string,
+  item: ArchiveItem,
+): Promise<string | null> {
+  const storage = new MemoryStorage(shardDir);
+  if (item.keep) {
+    const keepRec = await storage.readWithRaw(item.keep.filename);
+    if (!keepRec || contentHash(keepRec.rec) !== item.keep.contentHash) {
+      return `duplicate keeper ${item.keep.filename} changed since plan; replan required`;
+    }
+  }
+  if (item.digestKeep) {
+    for (const k of item.digestKeep) {
+      const keepRec = await storage.readWithRaw(k.filename);
+      if (!keepRec || sha256(Buffer.from(keepRec.raw, 'utf8')) !== k.expectedHash) {
+        return `digest keeper ${k.filename} changed since plan; replan required`;
+      }
+    }
+  }
+  return null;
 }
 
 /**
@@ -777,16 +843,10 @@ async function restoreTrash(
         });
         return;
       }
-      // 双重恢复 (link + copy) 都失败。最后兜底: rename(trash → src) 是元数据
-      // 操作不写内容, 在 ENOTSUP/ENOSPC 场景下仍可把 trash 改回合法分片名 —
-      // 记忆留在 list()/MEMORY.md/FTS 正常路径 (Greptile P1 on #2561 第二十六
-      // 轮: 双重恢复失败后分片缺失 — rebuildIndex 跳过非 .md 名)。
+      // 双重恢复 (link + copy) 都失败。不再 rename 兜底: POSIX rename 会覆盖
+      // 探测后、rename 前宿主重建的 src (Codex P1 on #2561: atomic protect live
+      // shard before trash rename)。无法原子预留 src 时保留 trash 并失败。
       if (!(await pathExists(src))) {
-        // 探测后、rename 前**再试一次排他复制**: 若宿主在探测后写入 src,
-        // copyFile EXCL 抛 EEXIST 能被检测到且不覆盖 (Greptile P1 on #2561
-        // 第二十七轮: 兜底重命名覆盖新内容 — 探测-rename 窗口内宿主重建 src
-        // 会被 POSIX rename 覆盖)。仅当 src 确实不存在且内容无法复制
-        // (ENOSPC/EACCES) 才走 rename 兜底。
         try {
           await fs.copyFile(trash, src, fs.constants.COPYFILE_EXCL);
           result.failed.push({
@@ -797,7 +857,6 @@ async function restoreTrash(
           return;
         } catch (e3) {
           if ((e3 as NodeJS.ErrnoException).code === 'EEXIST') {
-            // 宿主在探测后写入 src → 不覆盖, 保留 trash 供找回
             result.failed.push({
               filename: item.filename,
               error:
@@ -805,17 +864,6 @@ async function restoreTrash(
             });
             return;
           }
-        }
-        try {
-          await fs.rename(trash, src);
-          result.failed.push({
-            filename: item.filename,
-            error:
-              'source changed during archive; link/copy restore failed — renamed trash back to active shard (content may be stale)',
-          });
-          return;
-        } catch {
-          // rename 也失败 → 落到下方保留 trash
         }
       }
       result.failed.push({
