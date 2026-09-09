@@ -230,7 +230,6 @@ import {
   invalidateRunningSessionScheduleEntries,
   invalidateScheduleIndexForDevice,
   loadDeviceSessionScheduleIndex,
-  loadSessionScheduleIndexThrottled,
   replaceSessionScheduleIndexEntries,
 } from '@/session/scheduleIndex';
 import { createScheduleIndexDeferRegistry } from '@/session/scheduleIndexDefer';
@@ -357,6 +356,9 @@ export default function HomeScreen() {
 }
 
 function HomeScreenContent() {
+  const screenFocused = useIsFocused();
+  const screenFocusedRef = useRef(screenFocused);
+  screenFocusedRef.current = screenFocused;
   const styles = useThemedStyles(makeStyles);
   const { colors } = useTheme();
   const { t, i18n: i18nInstance } = useTranslation();
@@ -648,8 +650,9 @@ function HomeScreenContent() {
   const refreshDeviceScheduleIndex = useCallback((
     deviceId: string,
     sessionIds: readonly string[],
-    options?: { accountGeneration?: number; force?: boolean; homeSyncGeneration?: number },
+    options?: { accountGeneration?: number; homeSyncGeneration?: number },
   ) => {
+    if (!screenFocusedRef.current || AppState.currentState !== 'active') return;
     const expectedAccountGeneration = options?.accountGeneration ?? accountGeneration;
     const expectedHomeSyncGeneration = options?.homeSyncGeneration
       ?? homeSyncGenerationByDeviceRef.current.get(deviceId);
@@ -660,19 +663,18 @@ function HomeScreenContent() {
     ) return;
     // 节流(单飞 + 30s TTL):focus / hydrate / schedule 推送三个触发源高频交叠,每次都全量
     // 重放 1+N×listRuns 会拥塞 device-link 管道、拖慢会话打开的关键读(见 scheduleIndex 注释)。
-    // force = 已读类权威信号(read / all-read 推送),必须绕过 TTL 立即重拉——否则「看完
-    // 返回首页」这个最常见路径永远命中 30s 内的陈旧缓存,未读徽标清不掉(review P1)。
+    // Authoritative events invalidate the shared cache before notifying screens.
     const invalidationVersion = getScheduleIndexInvalidationVersion(deviceId);
     void homeDeviceSyncLimiterRef.current.run(async () => {
       if (
-        homeAccountGenerationRef.current !== expectedAccountGeneration
+        !screenFocusedRef.current || AppState.currentState !== 'active'
+        || homeAccountGenerationRef.current !== expectedAccountGeneration
         || !isCurrentHomeSyncTarget(deviceId, expectedHomeSyncGeneration)
       ) return null;
-      return loadSessionScheduleIndexThrottled(
-        deviceId,
-        () => loadDeviceSessionScheduleIndex(deviceId, invoke),
-        { force: options?.force },
-      );
+      return loadDeviceSessionScheduleIndex(deviceId, invoke,
+        () => screenFocusedRef.current && AppState.currentState === 'active'
+          && homeAccountGenerationRef.current === expectedAccountGeneration
+          && isCurrentHomeSyncTarget(deviceId, expectedHomeSyncGeneration));
     })
       .then((nextIndex) => {
         if (!nextIndex) return;
@@ -1225,14 +1227,7 @@ function HomeScreenContent() {
         remoteSessionStore.requestReseed(deviceId);
         continue;
       }
-      // schedule 列表变化(changed,含 pause / resume / 改绑)与 read / all-read 都是低频
-      // 权威信号,force 穿透节流保证状态即时更新;fired / running 等高频事件照常吃 TTL
-      // (全量 force 会把 listRuns 风暴请回来)。
-      refreshDeviceScheduleIndex(deviceId, sessionIds, {
-        force: projection.refresh.scheduleList === true
-          || projection.unreadImpact === 'may-clear-schedule'
-          || projection.unreadImpact === 'clear-all',
-      });
+      refreshDeviceScheduleIndex(deviceId, sessionIds);
     }
   }), [refreshDeviceScheduleIndex]);
 
