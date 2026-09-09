@@ -2982,8 +2982,10 @@ export class PiAgent extends BaseAgent {
     const makerMemoryPromptEnabled =
       sessionMemoryEnabled &&
       (opts.makerMemoryIndexSnapshot !== undefined || !!this.deps.makerMemory);
-    const memoryScopeKey =
-      opts.makerMemoryScopeKey ?? (await resolveMemoryScopeKey(opts.workingDir, opts.remoteHostId));
+    // Maker Memory 关闭时跳过 git 探测 (Codex #2399 P1): 解析结果不会被用。
+    const memoryScopeKey = (compactionMemoryEnabled || makerMemoryPromptEnabled)
+      ? (opts.makerMemoryScopeKey ?? (await resolveMemoryScopeKey(opts.workingDir, opts.remoteHostId)))
+      : (opts.makerMemoryScopeKey ?? opts.workingDir);
     let makerMemoryIndex = '';
     if (makerMemoryPromptEnabled) {
       try {

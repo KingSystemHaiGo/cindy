@@ -159,6 +159,48 @@ describe.skipIf(!gitAvailable())('resolveMemoryScopeKey — 真实临时 git 仓
     }
   });
 
+  it('linked worktree 内初始化过的 submodule → 主仓 submodule 路径 (Codex #2399 P1)', async () => {
+    const tmpRoot = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'scope-resolver-sub-')));
+    const subRepo = path.join(tmpRoot, 'sub');
+    const repoRoot = path.join(tmpRoot, 'repo');
+    const wt = path.join(tmpRoot, 'wt');
+    const git = (args: string[], cwd: string, extraEnv?: NodeJS.ProcessEnv) =>
+      execFileSync('git', args, {
+        cwd,
+        stdio: 'ignore',
+        env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
+      });
+    try {
+      await fs.mkdir(subRepo, { recursive: true });
+      git(['init'], subRepo);
+      git(['config', 'user.email', 'test@example.com'], subRepo);
+      git(['config', 'user.name', 'scope-resolver-test'], subRepo);
+      await fs.writeFile(path.join(subRepo, 'README'), 'sub\n');
+      git(['add', '.'], subRepo);
+      git(['commit', '-m', 'sub'], subRepo);
+
+      await fs.mkdir(repoRoot, { recursive: true });
+      git(['init'], repoRoot);
+      git(['config', 'user.email', 'test@example.com'], repoRoot);
+      git(['config', 'user.name', 'scope-resolver-test'], repoRoot);
+      git(['-c', 'protocol.file.allow=always', 'submodule', 'add', subRepo, 'mod'], repoRoot);
+      git(['commit', '-m', 'add sub'], repoRoot);
+      git(['worktree', 'add', '-b', 'wt-branch', wt], repoRoot);
+      git(['-c', 'protocol.file.allow=always', 'submodule', 'update', '--init'], wt);
+
+      const wtMod = path.join(wt, 'mod');
+      const mainMod = path.join(repoRoot, 'mod');
+      expect(await resolveMemoryScopeKey(wtMod)).toBe(mainMod);
+      expect(await resolveMemoryScopeKey(mainMod)).toBe(mainMod);
+    } finally {
+      try {
+        await fs.rm(tmpRoot, { recursive: true, force: true, maxRetries: 3 });
+      } catch {
+        /* Windows 上 git 只读对象偶发 EPERM — temp 目录交给 OS 清理 */
+      }
+    }
+  });
+
   it('非 git 目录原样返回', async () => {
     const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'scope-resolver-nogit-')));
     try {

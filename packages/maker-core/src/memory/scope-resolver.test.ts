@@ -76,19 +76,26 @@ describe('resolveMemoryScopeKey — fake probe 回落与缓存', () => {
     };
 
   /**
-   * resolver 的两种探测: rev-parse 单次返回 toplevel/git-dir/common-dir 三行;
-   * 仅在 gitdir ≠ common-dir 且 common-dir basename 为 .git 时再调
+   * resolver 的两种探测: rev-parse 单次返回 toplevel/git-dir/common-dir/
+   * superproject 四行 (无 superproject 时第四行为空);
+   * 仅在真 linked worktree 或 worktree 内 submodule 时再调
    * `worktree list --porcelain` 取主仓根。不传 mainRoot 表示该用例不允许
    * 出现第二次 spawn (在更早的分支就已回落)。
    */
   const probeFor =
-    (toplevel: string, gitDir: string, commonDir: string, mainRoot?: string): GitProbe =>
+    (
+      toplevel: string,
+      gitDir: string,
+      commonDir: string,
+      mainRoot?: string,
+      superproject = '',
+    ): GitProbe =>
     async (args) => {
       if (args.includes('worktree')) {
         if (mainRoot === undefined) throw new Error('worktree list should not be spawned');
         return `worktree ${mainRoot}\n`;
       }
-      return `${toplevel}\n${gitDir}\n${commonDir}\n`;
+      return `${toplevel}\n${gitDir}\n${commonDir}\n${superproject}\n`;
     };
 
   it('git 不存在 (ENOENT) → 原样返回', async () => {
@@ -117,6 +124,32 @@ describe('resolveMemoryScopeKey — fake probe 回落与缓存', () => {
     const probe = probeFor('/fake/checkout', '/some/storage/.git', '/some/storage/.git');
     expect(await resolveMemoryScopeKey('/fake/checkout', null, { execGit: probe })).toBe(
       '/fake/checkout',
+    );
+  });
+
+  it('主仓内 submodule (gitdir == common-dir + superproject == 主仓根) → 原样返回', async () => {
+    // 有 superproject 时仍会调 worktree list 确认外层不是 linked worktree;
+    // 主仓根与 superproject 相同则保持原路径。
+    const probe = probeFor(
+      '/main/mod',
+      '/main/.git/modules/mod',
+      '/main/.git/modules/mod',
+      '/main',
+      '/main',
+    );
+    expect(await resolveMemoryScopeKey('/main/mod', null, { execGit: probe })).toBe('/main/mod');
+  });
+
+  it('linked worktree 内 submodule → 主仓 submodule 路径 (Codex #2399 P1)', async () => {
+    const probe = probeFor(
+      '/wt/mod',
+      '/main/.git/worktrees/wt/modules/mod',
+      '/main/.git/worktrees/wt/modules/mod',
+      '/main',
+      '/wt',
+    );
+    expect(await resolveMemoryScopeKey('/wt/mod', null, { execGit: probe })).toBe(
+      path.join(path.resolve('/main'), 'mod'),
     );
   });
 

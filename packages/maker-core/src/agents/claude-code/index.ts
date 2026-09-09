@@ -1494,9 +1494,11 @@ export class ClaudeCodeAgent extends BaseAgent {
     const makerMemoryEnabled = makerMemoryFlag === true && !!makerMemory;
     // SSH remote 的 workingDir 是远端路径 — store 定位统一经 scope key;
     // 本地会话额外做 git worktree 归一化 (#2379)。已注入的 makerMemoryScopeKey
-    // (含 bot:) 原样透传, 探测失败不 spawn git。
-    const memoryScopeKey =
-      opts.makerMemoryScopeKey ?? (await resolveMemoryScopeKey(opts.workingDir, opts.remoteHostId));
+    // (含 bot:) 原样透传。Maker Memory 关闭时跳过 git 探测 (Codex #2399 P1):
+    // 解析结果本就不会被用, 失败还能空耗 3s timeout。
+    const memoryScopeKey = makerMemoryEnabled
+      ? (opts.makerMemoryScopeKey ?? (await resolveMemoryScopeKey(opts.workingDir, opts.remoteHostId)))
+      : (opts.makerMemoryScopeKey ?? opts.workingDir);
     // This per-session injection flag must not mutate the shared manager.
     if (makerMemoryEnabled && makerMemory) {
       try {
