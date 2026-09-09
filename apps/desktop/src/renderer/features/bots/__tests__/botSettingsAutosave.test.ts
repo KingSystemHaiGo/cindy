@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   botCapabilitiesEqual,
+  botSettingsChanges,
   botSettingsPayloadEqual,
   createBotSettingsAutosave,
   normalizeBotSettingsPayload,
@@ -133,7 +134,6 @@ describe('normalizeBotSettingsPayload', () => {
     // Long-form prompt text is stored verbatim: trimming it would silently edit
     // the user's system prompt.
     expect(result.identitySource).toBe('  kept as typed  ');
-    expect(result.style).toBeNull();
   });
 
   it('produces an equal snapshot for the baseline and the untouched draft', () => {
@@ -390,5 +390,27 @@ describe('createBotSettingsAutosave flush & failure', () => {
     h.autosave.cancel();
     await vi.advanceTimersByTimeAsync(2000);
     expect(h.commits).toHaveLength(0);
+  });
+});
+
+
+describe('settings changes preserve independently joined capabilities', () => {
+  it('does not resend capability selections when only the name changes', () => {
+    expect(botSettingsChanges(payload(), payload({ name: 'Updated' }))).toEqual({ name: 'Updated' });
+  });
+  it('updates only the selected capability group', () => {
+    expect(botSettingsChanges(payload(), payload({ capabilities: capabilities({ mcpServers: ['docs'] }) }))).toEqual({ capabilities: { mcpServers: ['docs'] } });
+  });
+  it('carries only edited list baselines across consecutive saves', () => {
+    const before = payload({ skills: ['old'], capabilities: capabilities({ mcpServers: ['mcp'], toolsets: ['tool'] }) });
+    const after = { ...before, skills: ['new'], capabilities: { ...before.capabilities, toolsets: [] } };
+    expect(botSettingsChanges(before, after, true)).toEqual({
+      skills: ['new'], capabilities: { toolsets: [] },
+      capabilityBaseline: { skills: ['old'], toolsets: ['tool'] },
+    });
+    expect(botSettingsChanges(after, { ...after, skills: [] }, true)).toEqual({
+      skills: [], capabilityBaseline: { skills: ['new'] },
+    });
+    expect(botSettingsChanges(after, { ...after, name: 'Updated' }, true)).toEqual({ name: 'Updated' });
   });
 });

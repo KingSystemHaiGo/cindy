@@ -17,6 +17,7 @@ import type { BotGender } from '../../../shared/botGender';
 import { normalizeBotStyle, type BotCommunicationStyle } from '../../../shared/botStyle';
 import { BOT_FAILURE_REASONS, type BotFailureReason } from '../../../shared/botFailureReason';
 import type { BotTemplatePresetId } from '../../../shared/botTemplatePreset';
+import type { BotCapabilityBaseline } from '../../../shared/botCapabilitySelection';
 import { NEW_BOT_DEFAULT_PERMISSIONS, normalizeBotPermissions } from './botCapabilityDefaults';
 import {
   BOT_MODEL_CHAIN_MAX,
@@ -947,26 +948,23 @@ export async function addBotProfileAndWait(input: CreateBotProfileInput): Promis
 }
 
 export type BotProfileUpdatePatch = Partial<
-  Omit<
-    Pick<
-      BotProfile,
-      | 'name'
-      | 'description'
-      | 'identitySource'
-      | 'userContextSource'
-      | 'style'
-      | 'avatar'
-      | 'avatarColor'
-      | 'enabled'
-      | 'skills'
-      | 'capabilities'
-      | 'canonicalSessionId'
-      | 'sessions'
-    >,
-    'style'
+  Pick<
+    BotProfile,
+    | 'name'
+    | 'description'
+    | 'identitySource'
+    | 'userContextSource'
+    | 'avatar'
+    | 'avatarColor'
+    | 'enabled'
+    | 'skills'
+    | 'canonicalSessionId'
+    | 'sessions'
   >
 > & {
   avatarUploadToken?: string;
+  capabilities?: Partial<BotCapabilities>;
+  capabilityBaseline?: BotCapabilityBaseline;
   /** 显式 null 表示清掉沟通风格；undefined 表示本次不改。 */
   style?: BotCommunicationStyle | null;
 };
@@ -975,7 +973,7 @@ export function updateBotProfile(id: string, patch: BotProfileUpdatePatch): Prom
   ensureProfileOwner();
   const before = profiles.find((bot) => bot.id === id);
   if (!before) return Promise.reject(new Error('Bot not found'));
-  const { avatarUploadToken, ...profilePatch } = patch;
+  const { avatarUploadToken, capabilityBaseline, ...profilePatch } = patch;
   const { style: patchStyle, ...restPatch } = profilePatch;
   const optimisticPatch: Partial<BotProfile> = { ...restPatch };
   if (Object.prototype.hasOwnProperty.call(profilePatch, 'style')) {
@@ -989,28 +987,27 @@ export function updateBotProfile(id: string, patch: BotProfileUpdatePatch): Prom
   const owner = getDataOwnerGeneration();
   const isLatestWrite = () => isDataOwnerGenerationCurrent(owner)
     && profileWriteGenerations.get(id) === generation;
-  profiles = profiles.map((bot) => {
-    if (bot.id !== id) return bot;
-    const next = { ...bot, ...optimisticPatch };
+  const applyPatch = (bot: BotProfile): BotProfile => {
+    const next = {
+      ...bot,
+      ...optimisticPatch,
+      capabilities: { ...bot.capabilities, ...optimisticPatch.capabilities },
+    };
     if (Object.prototype.hasOwnProperty.call(profilePatch, 'style') && !optimisticPatch.style) {
       delete next.style;
     }
     return next;
-  });
+  };
+  profiles = profiles.map((bot) => (bot.id === id ? applyPatch(bot) : bot));
   emit();
-  const optimistic = profiles.find((bot) => bot.id === id) ?? (() => {
-    const next = { ...before, ...optimisticPatch };
-    if (Object.prototype.hasOwnProperty.call(profilePatch, 'style') && !optimisticPatch.style) {
-      delete next.style;
-    }
-    return next;
-  })();
+  const optimistic = profiles.find((bot) => bot.id === id) ?? applyPatch(before);
   const api = botsApi();
   if (!api) return Promise.resolve(optimistic);
   return api
     .update({
       id,
       ...profilePatch,
+      ...(capabilityBaseline ? { capabilityBaseline } : {}),
       ...(avatarUploadToken ? { avatarUploadToken } : {}),
       ...(profilePatch.avatar !== undefined || avatarUploadToken
         ? { expectedAvatar: before.avatar }
