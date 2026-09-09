@@ -221,7 +221,7 @@ describe('runLegacyShardMigration — 执行', () => {
     await expect(fs.stat(path.join(memoryRoot, wtDir))).rejects.toThrow();
     const target = path.join(memoryRoot, mainDir);
     const meta = JSON.parse(await fs.readFile(path.join(target, 'meta.json'), 'utf8'));
-    expect(meta.absPath).toBe(mainRepo);
+    expect(meta.absPath).toBe(fwd(mainRepo));
     // 分片文件原样保留
     const rec = await fs.readFile(path.join(target, 'feedback_a.md'), 'utf8');
     expect(rec).toContain('body-a');
