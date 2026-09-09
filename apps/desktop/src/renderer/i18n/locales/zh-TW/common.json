@@ -7307,6 +7307,16 @@
       "thisDevice": "這台電腦",
       "offlineDescription": "{{name}} 暫時離線，{{device}} 重新連線後就能繼續聊。",
       "preparing": "正在等夥伴準備好…"
+    },
+    "capabilities": {
+      "title": "能力",
+      "search": "搜尋能力",
+      "loading": "載入中…",
+      "skill": "技能",
+      "mcp": "MCP",
+      "toolset": "內建工具",
+      "unavailable": "無法使用",
+      "empty": "沒有符合的能力"
     }
   },
   "common": {
@@ -7781,7 +7791,7 @@
           },
           "bypassPermissions": {
             "label": "完全訪問",
-            "description": "常規工具無需詢問直接執行；安裝、更新或解除安裝 Pi 擴展仍需確認。風險最高，只適合可信任務。"
+            "description": "允許修改任意檔案並執行聯網命令，無需再次確認。風險最高，只適合可信任務。"
           }
         }
       }

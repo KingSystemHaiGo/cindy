@@ -7307,6 +7307,16 @@
       "thisDevice": "这台电脑",
       "offlineDescription": "{{name}} 暂时离线，{{device}} 重新联网后就能继续聊。",
       "preparing": "正在等伙伴准备好…"
+    },
+    "capabilities": {
+      "title": "能力",
+      "search": "搜索能力",
+      "loading": "加载中…",
+      "skill": "技能",
+      "mcp": "MCP",
+      "toolset": "内置工具",
+      "unavailable": "不可用",
+      "empty": "没有匹配的能力"
     }
   },
   "common": {
@@ -7781,7 +7791,7 @@
           },
           "bypassPermissions": {
             "label": "完全访问",
-            "description": "常规工具无需询问直接执行；安装、更新或卸载 Pi 扩展仍需确认。风险最高，只适合可信任务。"
+            "description": "允许修改任意文件并运行联网命令，无需再次确认。风险最高，只适合可信任务。"
           }
         }
       }
