@@ -7145,6 +7145,7 @@
           "normal": "自然に"
         },
         "bannedPhrases": "使わない言い回し",
+        "bannedPhrasesHint": "改行またはカンマ区切り。最大 40 件。超えた分は保存時に切り詰めます。",
         "languageHabits": "その他の話し方"
       }
     },

@@ -179,6 +179,7 @@ export function BotCommunicationStyleFields({
 
         <label className="flex min-w-0 flex-col text-12 text-[var(--text-secondary)]">
           {t('bots.profile.style.bannedPhrases')}
+          <p className="mt-0.5 text-12 leading-5">{t('bots.profile.style.bannedPhrasesHint')}</p>
           <Textarea
             aria-label={t('bots.profile.style.bannedPhrases')}
             value={style.bannedPhrases ?? ''}

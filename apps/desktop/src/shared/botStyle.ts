@@ -28,6 +28,7 @@ export const BOT_STYLE_LIMITS = {
   addressUserAs: 80,
   selfName: 80,
   bannedPhrases: 1000,
+  bannedPhraseItems: 40,
   languageHabits: 2000,
 } as const;
 
@@ -79,7 +80,7 @@ export function normalizeBotStyle(value: unknown): BotCommunicationStyle | undef
   if (selfName) next.selfName = selfName;
   if (isReplyLength(raw.replyLength)) next.replyLength = raw.replyLength;
   if (isEmojiDensity(raw.emojiDensity)) next.emojiDensity = raw.emojiDensity;
-  const bannedPhrases = clipText(raw.bannedPhrases, BOT_STYLE_LIMITS.bannedPhrases);
+  const bannedPhrases = clipBannedPhrases(raw.bannedPhrases);
   if (bannedPhrases) next.bannedPhrases = bannedPhrases;
   const languageHabits = clipText(raw.languageHabits, BOT_STYLE_LIMITS.languageHabits);
   if (languageHabits) next.languageHabits = languageHabits;
@@ -117,7 +118,14 @@ function splitBannedPhrases(text: string): string[] {
     .split(/[\n,，;；]+/)
     .map((item) => item.trim())
     .filter(Boolean)
-    .slice(0, 40);
+    .slice(0, BOT_STYLE_LIMITS.bannedPhraseItems);
+}
+
+function clipBannedPhrases(value: unknown): string | undefined {
+  const text = clipText(value, BOT_STYLE_LIMITS.bannedPhrases);
+  if (!text) return undefined;
+  const items = splitBannedPhrases(text);
+  return items.length > 0 ? items.join('\n') : undefined;
 }
 
 /**

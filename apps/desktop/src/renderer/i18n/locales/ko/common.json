@@ -7145,6 +7145,7 @@
           "normal": "자연스럽게"
         },
         "bannedPhrases": "쓰지 않을 말",
+        "bannedPhrasesHint": "줄바꿈 또는 쉼표로 구분. 최대 40개, 초과분은 저장 시 잘립니다.",
         "languageHabits": "그 밖의 말버릇"
       }
     },

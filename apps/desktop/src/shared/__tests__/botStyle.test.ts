@@ -45,6 +45,18 @@ describe('normalizeBotStyle', () => {
     });
     expect(next?.languageHabits).toHaveLength(BOT_STYLE_LIMITS.languageHabits);
   });
+
+  it('keeps the first 40 banned phrases for persistence and prompt rendering', () => {
+    const items = Array.from({ length: BOT_STYLE_LIMITS.bannedPhraseItems + 1 }, (_, i) => `禁${i + 1}`);
+    const next = normalizeBotStyle({ bannedPhrases: items.join('\n') });
+    const saved = next?.bannedPhrases?.split('\n') ?? [];
+    expect(saved).toHaveLength(BOT_STYLE_LIMITS.bannedPhraseItems);
+    expect(saved).toEqual(items.slice(0, BOT_STYLE_LIMITS.bannedPhraseItems));
+    const guidance = buildBotStyleGuidance(next);
+    expect(guidance).toContain('「禁1」');
+    expect(guidance).toContain(`「禁${BOT_STYLE_LIMITS.bannedPhraseItems}」`);
+    expect(guidance).not.toContain(`「禁${BOT_STYLE_LIMITS.bannedPhraseItems + 1}」`);
+  });
 });
 
 describe('botStyleEqual', () => {

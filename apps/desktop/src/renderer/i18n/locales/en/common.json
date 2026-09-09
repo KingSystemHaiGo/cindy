@@ -7147,6 +7147,7 @@
           "normal": "Natural"
         },
         "bannedPhrases": "Phrases to avoid",
+        "bannedPhrasesHint": "One phrase per line or comma. Up to 40 phrases; extras are truncated when saved.",
         "languageHabits": "Other language habits"
       }
     },

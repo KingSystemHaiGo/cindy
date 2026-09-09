@@ -7145,6 +7145,7 @@
           "normal": "自然"
         },
         "bannedPhrases": "不要说的话",
+        "bannedPhrasesHint": "每行或用逗号分隔，最多 40 条；超出部分会截断保存。",
         "languageHabits": "其他语言习惯"
       }
     },

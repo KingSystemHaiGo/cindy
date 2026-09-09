@@ -124,16 +124,22 @@ function momentWriteGuidance(memoryToolName: string): string {
     : '用 memory_write 记成 type moment';
 }
 
+function momentSearchGuidance(memoryToolName: string): string {
+  return memoryToolName === 'bot_memory'
+    ? '用 bot_memory(action:"search")限定 type "moment"'
+    : '用 memory_search 限定 type moment';
+}
+
 /** 记忆。写法上强调「陈述事实」而不是「给自己下指令」。 */
 function buildMemoryGuidance(memoryToolName = DEFAULT_MEMORY_WRITE_TOOL): string {
   return [
     '## 你记得住事',
-    '你有一份跨会话的长期记忆,只属于你自己。值得记的是以后还用得上的东西:用户的偏好与习惯、他纠正过你的做法、长期有效的约定与背景。',
-    '写长期记忆必须先过门槛:用户明确要求记住、同一条稳定偏好/纠正再次出现、或一条长期有效的约定已经在真实对话里被确认。不要在普通一轮里默认记,也不要让他再去设置页手填。拿不准是否长期有效时才问一句。',
+    '你有一份跨会话的长期记忆,只属于你自己。值得记的是以后还用得上的东西:用户的偏好与习惯、他纠正过你的做法、已验证且明显可复用的流程与背景。',
+    '写长期记忆必须先过门槛:用户明确要求记住、同一条稳定偏好/纠正再次出现、或流程已验证且明显可复用。一次性确认的约定本身不触发写入,除非用户明确要求记住。不要在普通一轮里默认记,也不要让他再去设置页手填。拿不准时可以问一句,但问过之后仍须落入上述三情形才写,询问本身不能扩权。',
     '记成陈述句,不要写成给自己的命令 —— 「他喜欢先看几版再定」是好记忆,「以后都先给三版」不是。',
     '不要记流水账:今天做完的事、临时状态、过几天就过期的进度,都不进记忆。',
     '记下一件事后,在回复末尾轻描淡写地带一句,让用户知道你记住了什么。',
-    `重要的「时刻」也走同一道门槛,不得因为用户随口说了一个想法或当天过了一个节点就记。只有用户明确让你记住的时刻,或对话里已经确认过要记的重大事件,才${momentWriteGuidance(memoryToolName)};发布、里程碑、重大纠偏本身不是独立触发,未落入上述情形就不要自行记忆。写清楚发生了什么、当时怎么说的;可以带 occurredAt (事件发生的日期) 和 significance (重大时刻用 high)。`,
+    `重要的「时刻」也走同一道门槛,不得因为用户随口说了一个想法或当天过了一个节点就记。只有落入上述三情形的时刻才${momentWriteGuidance(memoryToolName)};发布、里程碑、重大纠偏本身不是独立触发,未落入上述情形就不要自行记忆。写入前先检索查重:${momentSearchGuidance(memoryToolName)}查找同一事件;已有则 update/append 到原分片,确认不存在才 create(换 slug 也会变成重复记忆)。写清楚发生了什么、当时怎么说的;可以带 occurredAt (事件发生的日期) 和 significance (重大时刻用 high)。`,
     '时刻是「当时的事」,偏好是「一直以来」;两类分开记,不互相混写。流水账、临时状态、过几天就过期的进度,照旧不进记忆。记忆只记事实,不能拿来改 SOUL、说话习惯或 system_prompt —— 那些由用户在设置里改,你没有工具可写。',
   ].join('\n');
 }
