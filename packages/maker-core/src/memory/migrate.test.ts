@@ -16,11 +16,12 @@ import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
+  deriveCanonicalFromCindyWorktreePath,
   planLegacyShardMigration,
   runLegacyShardMigration,
   type LegacyShardMigrationDeps,
 } from './migrate.js';
-import { sanitizeWorkdir } from './storage.js';
+import { memoryScopeDirName, sanitizeWorkdir } from './storage.js';
 
 /** 临时 memory 根; 每个用例前重建。 */
 let tmpRoot: string;
@@ -556,6 +557,7 @@ describe('runLegacyShardMigration — 执行', () => {
     const mainRepo = path.join(tmpRoot, 'repo');
     await fs.mkdir(path.join(mainRepo, '.git'), { recursive: true });
     const coincidental = path.join(mainRepo, '.cindy-worktrees', 'feat-x');
+    await fs.mkdir(coincidental, { recursive: true }); // 同名目录真实存在, 区别于 worktree remove
     const wtDir = sanitizeWorkdir(coincidental);
     await makeShard(wtDir, { absPath: coincidental, files: { 'feedback_a.md': 'X' } });
 
@@ -565,6 +567,50 @@ describe('runLegacyShardMigration — 执行', () => {
     const shard = plan.all.find((s) => s.dir.endsWith(wtDir));
     expect(shard?.isLegacy).toBe(false);
     expect(shard?.canonicalScopeKey).toBe(coincidental);
+  });
+
+  it('git worktree remove 后无登记 → 归档分片仍静态推导 (Codex 第十七轮)', async () => {
+    // Session 清理走 git worktree remove: 托管目录与 .git/worktrees/<name> 都没了,
+    // 只剩 maker-memory 分片 + meta.absPath 的托管形态。
+    const mainRepo = path.join(tmpRoot, 'repo');
+    await fs.mkdir(path.join(mainRepo, '.git'), { recursive: true });
+    const archivedWt = path.join(mainRepo, '.cindy-worktrees', 'feat-x');
+    const wtDir = sanitizeWorkdir(archivedWt);
+    await makeShard(wtDir, { absPath: archivedWt, files: { 'feedback_a.md': 'X' } });
+    // 不创建 worktree 目录、不登记 — 模拟 remove 之后
+
+    const plan = await planLegacyShardMigration(memoryRoot);
+    expect(plan.mergeCandidates).toHaveLength(1);
+    expect(plan.mergeCandidates[0].canonicalScopeKey).toBe(mainRepo);
+    expect(plan.mergeCandidates[0].isLegacy).toBe(true);
+  });
+
+  it('根盘托管路径推导保留 C:/ 而不是 C: (Codex 第十七轮)', () => {
+    const derived = deriveCanonicalFromCindyWorktreePath('C:/.cindy-worktrees/name');
+    expect(derived).toBe('C:/');
+    expect(memoryScopeDirName(derived!)).toBe('C--');
+    expect(deriveCanonicalFromCindyWorktreePath('C:/.cindy-worktrees/name/apps/a')).toBe(
+      path.join('C:/', 'apps', 'a'),
+    );
+    expect(deriveCanonicalFromCindyWorktreePath('/.cindy-worktrees/name')).toBe(
+      path.parse('/.cindy-worktrees/name').root || '/',
+    );
+  });
+
+  it('meta.json 为 JSON null → 该分片 skipped, 其余继续 (Codex 第十七轮)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const worktree = path.join(tmpRoot, 'repo-wt');
+    const wtDir = sanitizeWorkdir(worktree);
+    await makeShard(wtDir, { absPath: worktree, files: { 'feedback_a.md': 'X' } });
+    const bad = path.join(memoryRoot, 'bad-null-meta');
+    await fs.mkdir(bad, { recursive: true });
+    await fs.writeFile(path.join(bad, 'meta.json'), 'null', 'utf8');
+    await fs.writeFile(path.join(bad, 'feedback_a.md'), 'x', 'utf8');
+
+    const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+    expect(plan.skipped.some((s) => s.dir === bad)).toBe(true);
+    expect(plan.mergeCandidates).toHaveLength(1);
+    expect(plan.mergeCandidates[0].dir.endsWith(wtDir)).toBe(true);
   });
 
   it('慢路径合并: plan 后写入的合法分片被一并合并, 数据不丢 (Codex 第四轮: 快照后写入)', async () => {

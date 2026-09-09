@@ -142,9 +142,24 @@ export async function planLegacyShardMigration(
 
     let meta: ShardMeta | null = null;
     try {
-      meta = JSON.parse(await fs.readFile(path.join(dir, 'meta.json'), 'utf8')) as ShardMeta;
+      const parsed: unknown = JSON.parse(
+        await fs.readFile(path.join(dir, 'meta.json'), 'utf8'),
+      );
+      // JSON.parse("null") / 数组 / 非对象通过 try, 但 meta.absPath 会抛掉整份计划
+      // (Codex review on #2519 第十七轮)。{}、缺 absPath 也当无效 meta。
+      if (
+        parsed === null ||
+        typeof parsed !== 'object' ||
+        Array.isArray(parsed) ||
+        typeof (parsed as ShardMeta).absPath !== 'string' ||
+        (parsed as ShardMeta).absPath.trim() === ''
+      ) {
+        plan.skipped.push(await buildSkippedInfo(dir, entry));
+        continue;
+      }
+      meta = parsed as ShardMeta;
     } catch {
-      // 无 meta.json → 不猜不删, 跳过并报告 (目录名以 ssh- 开头时同样跳过)
+      // 无 meta.json / 非 JSON → 不猜不删, 跳过并报告
       plan.skipped.push(await buildSkippedInfo(dir, entry));
       continue;
     }
@@ -171,14 +186,14 @@ export async function planLegacyShardMigration(
     // (Codex review on #2519)。
     //
     // 仅当该路径**不是活 git 仓库**、且能证明是 Cindy 托管 worktree 时才
-    // 推导 (Codex review on #2519 第十二/十六轮): 普通仓内恰好有同名
-    // `.cindy-worktrees/<name>` 目录时, resolver 正确返回原样; 仅凭目录名
-    // 止步会忽略上层 `.git`, 把普通 checkout 误并进主仓 scope。活仓库跳过
-    // 推导; 无托管证据 (worktree `.git` 或 `<main>/.git/worktrees/<name>`)
-    // 也不推导。
+    // 推导 (Codex review on #2519 第十二/十六/十七轮): 普通仓内恰好有同名
+    // `.cindy-worktrees/<name>` 目录时, resolver 正确返回原样, 不推导。
+    // `git worktree remove` 会删掉 worktree 目录与 `.git/worktrees/<name>` 登记,
+    // 但 meta.absPath 仍是托管形态 — 记 unregistered-legacy, 仍静态推导,
+    // 否则归档分片永远孤儿。
     if (canonicalScopeKey === (meta.absPath || entry)) {
       const raw = meta.absPath || entry;
-      if (!(await isLiveGitRepo(raw)) && (await hasManagedWorktreeEvidence(raw))) {
+      if (!(await isLiveGitRepo(raw)) && (await shouldDeriveArchivedManagedWorktree(raw))) {
         const derived = deriveCanonicalFromCindyWorktreePath(raw);
         if (derived) canonicalScopeKey = derived;
       }
@@ -258,6 +273,29 @@ async function buildSkippedInfo(dir: string, entry: string): Promise<LegacyShard
  *   /Users/me/other/wt (无托管段)            → null
  */
 const MANAGED_WORKTREE_DIRS = ['.cindy-worktrees', '.xdt-worktrees'];
+const WINDOWS_DRIVE_RE = /^[A-Za-z]:$/;
+
+/**
+ * 把托管段之前的路径段还原成主仓根。根盘 / POSIX 根不能用 join 丢分隔符:
+ * `C:\\.cindy-worktrees\\name` 的前缀是 `C:`, 必须还原成 `C:/` 而不是 `C:`
+ * (`C:` → sanitize `C-`, `C:/` → `C--`; Codex review on #2519 第十七轮);
+ * POSIX `/.cindy-worktrees/name` 前缀为空, 必须还原成 `/` 而不是拒绝。
+ */
+function prefixSegmentsToMainRoot(prefixSegs: string[], original: string): string | null {
+  const meaningful = prefixSegs.filter((s) => s.length > 0);
+  if (meaningful.length === 0) {
+    return path.parse(original).root || '/';
+  }
+  if (meaningful.length === 1 && WINDOWS_DRIVE_RE.test(meaningful[0])) {
+    const root = path.parse(original).root;
+    if (root && WINDOWS_DRIVE_RE.test(root.replace(/[\\/]+$/, ''))) {
+      return root.endsWith('/') || root.endsWith('\\') ? root.replace(/\\/g, '/') : `${root}/`;
+    }
+    return `${meaningful[0]}/`;
+  }
+  const joined = prefixSegs.join(path.sep);
+  return joined.length > 0 ? joined : null;
+}
 
 export function deriveCanonicalFromCindyWorktreePath(absPath: string): string | null {
   // Desktop 存储会把 Windows workingDir 归一化为正斜杠 (C:/repo/.cindy-...),
@@ -269,9 +307,9 @@ export function deriveCanonicalFromCindyWorktreePath(absPath: string): string | 
     // segments[i] = 托管段; segments[i+1] = worktree 名 (必须存在)
     const worktreeName = segments[i + 1];
     if (worktreeName.length === 0) continue;
-    const mainRoot = segments.slice(0, i).join(path.sep);
-    if (mainRoot.length === 0) continue;
-    const subPath = segments.slice(i + 2).join(path.sep);
+    const mainRoot = prefixSegmentsToMainRoot(segments.slice(0, i), absPath);
+    if (mainRoot === null) continue;
+    const subPath = segments.slice(i + 2).filter((s) => s.length > 0).join(path.sep);
     return subPath ? path.join(mainRoot, subPath) : mainRoot;
   }
   return null;
@@ -565,16 +603,22 @@ async function countShardFiles(dir: string): Promise<number> {
  * 但遍历祖先对**已归档的托管 worktree** 误伤: /repo/.cindy-worktrees/<name>/
  * 的 <name> 已删除后 worktree 无 .git, 而主仓 /repo/.git 仍存在 — 遍历命中
  * 主仓标记会判活仓库、跳过静态推导, 记忆永远孤儿 (Codex review on #2519
- * 第十五轮)。因此仅在**有托管证据**时遍历才止步于托管 worktree 根: 该根
- * 及以下有 .git 才算活仓库, 主仓祖先不参与判定。普通仓内同名目录没有
- * worktree `.git`、也没有 `<main>/.git/worktrees/<name>` 登记时, 不把该段
- * 当托管根, 继续向上找真正的仓库标记 (Codex review on #2519 第十六轮)。
+ * 第十五轮)。因此仅在「有托管证据」或「托管根已不在磁盘」(git worktree
+ * remove 清掉目录+登记) 时遍历才止步于托管 worktree 根。普通仓内同名目录
+ * 仍然存在且无登记, 不把该段当托管根, 继续向上找真正的仓库标记。
  * 非托管形态保持遍历到根的行为。
  */
 async function isLiveGitRepo(p: string): Promise<boolean> {
   const abs = path.resolve(p);
-  const stop =
-    (await hasManagedWorktreeEvidence(abs)) ? managedWorktreeRoot(abs) : null;
+  const managed = managedWorktreeRoot(abs);
+  let stop: string | null = null;
+  if (managed) {
+    const evidence = await hasManagedWorktreeEvidence(abs);
+    const rootStillThere = await dirExists(managed);
+    // 登记还在, 或 worktree remove 后目录已消失 → 止步托管根, 不把主仓 .git
+    // 当活仓库。目录还在且无登记 → 普通仓同名路径, 继续向上。
+    if (evidence || !rootStillThere) stop = managed;
+  }
   let cur = abs;
   for (;;) {
     try {
@@ -617,6 +661,20 @@ async function hasManagedWorktreeEvidence(absPath: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * 是否应对已归档托管路径做静态推导。
+ * - 仍有 worktree `.git` 或 `.git/worktrees/<name>` 登记 → 是托管, 推导
+ * - `git worktree remove` 后目录与登记都没了, 但 meta.absPath 仍是托管形态 →
+ *   unregistered-legacy, 仍推导 (否则归档分片孤儿; Codex #2519 第十七轮)
+ * - 普通仓内同名目录还在磁盘上、且无登记 → 不推导 (第十六轮护栏)
+ */
+async function shouldDeriveArchivedManagedWorktree(absPath: string): Promise<boolean> {
+  const root = managedWorktreeRoot(absPath);
+  if (!root) return false;
+  if (await hasManagedWorktreeEvidence(absPath)) return true;
+  return !(await dirExists(root));
 }
 
 /**
