@@ -529,7 +529,7 @@ export class GoalController {
     type: GoalRunEventType,
     goalSessionId: string,
     state: Pick<GoalState, 'turnsUsed' | 'tokensUsed' | 'noProgressStreak' | 'budgetTokens' | 'maxTurns' | 'noProgressLimit'> | null,
-    extra?: Pick<Partial<GoalRunEvent>, 'from' | 'to' | 'generation' | 'lifecycleId' | 'at'> & {
+    extra?: Pick<Partial<GoalRunEvent>, 'from' | 'to' | 'generation' | 'lifecycleId' | 'at' | 'turnIndex'> & {
       reason?: string | null;
     },
   ): void {
@@ -539,7 +539,7 @@ export class GoalController {
     const evt: GoalRunEvent = {
       type,
       goalSessionId,
-      turnIndex: (state?.turnsUsed ?? 0) + (type === 'turn-dispatched' ? 1 : 0),
+      turnIndex: extra?.turnIndex ?? (state?.turnsUsed ?? 0) + (type === 'turn-dispatched' ? 1 : 0),
       ...(state
         ? {
             budget: {
@@ -1257,6 +1257,15 @@ export class GoalController {
     // drain。反过来，若当前跑的是用户 turn，清目标不应误停用户正在做的工作。
     const hasActiveGoalTurn = this.goalTurnsInFlight.has(sessionId);
     const previousBoundary = this.turns.get(sessionId);
+    // 越过 onDispatching 后清目标:cleared 必须沿用被中断派发的
+    // lifecycle/generation/turnIndex,不能绑到下面 freshTurn 的 clearBoundary
+    // (Codex #2107 P2)。turn-dispatched 属于旧 boundary 且序号为 turnsUsed + 1。
+    const interruptedDispatch = hasActiveGoalTurn && previousBoundary
+      ? {
+          lifecycleId: previousBoundary.lifecycleId,
+          generation: previousBoundary.generation,
+        }
+      : null;
     this.stopSession(sessionId);
     const clearBoundary = freshTurn(
       true,
@@ -1296,16 +1305,17 @@ export class GoalController {
     if (this.turns.get(sessionId) !== clearBoundary) return;
     await this.trackPersistence(clearBoundary, this.deps.storage.clear(sessionId));
     if (this.turns.get(sessionId) !== clearBoundary) return;
-    if (auditSnapshot) {
-      this.recordRunEvent('cleared', sessionId, auditSnapshot, {
-        from: auditSnapshot.status,
-        reason: 'cleared by user',
-      });
-    } else {
-      this.recordRunEvent('cleared', sessionId, null, {
-        reason: 'cleared by user',
-      });
-    }
+    this.recordRunEvent('cleared', sessionId, auditSnapshot, {
+      from: auditSnapshot?.status,
+      reason: 'cleared by user',
+      ...(interruptedDispatch
+        ? {
+            lifecycleId: interruptedDispatch.lifecycleId,
+            generation: interruptedDispatch.generation,
+            turnIndex: (auditSnapshot?.turnsUsed ?? 0) + 1,
+          }
+        : {}),
+    });
     this.deps.emitStatus({ sessionId, goal: null });
     this.turns.delete(sessionId);
   }
@@ -2375,7 +2385,18 @@ export class GoalController {
         }),
       );
       if (!isCurrent()) return true;
-      if (blocked) this.emit(blocked);
+      if (blocked) {
+        this.emit(blocked);
+        // 派发失败落盘 blocked 后补发 active→blocked,否则审计流仍显示 active
+        // (Codex #2107 P2)。
+        this.recordRunEvent('state-transition', sessionId, blocked, {
+          from: 'active',
+          to: 'blocked',
+          reason: lastReason,
+          lifecycleId: boundary.lifecycleId,
+          generation: boundary.generation,
+        });
+      }
     } catch (persistError) {
       this.deps.logger.error('[goal] failed to persist dispatch failure', {
         sessionId,

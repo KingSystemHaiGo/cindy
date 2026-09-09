@@ -14,7 +14,7 @@ import type { GoalStatus } from './types';
 export type GoalRunEventType =
   | 'turn-dispatched' // 本轮已派发给 agent(onDispatching 真实派发边界,accepted:false 不产生)
   | 'turn-finalized' // 本轮收口(finalizeTurn 决策后,含完整预算快照)
-  | 'state-transition' // 状态迁移(prev → next,含 quota override 改判)
+  | 'state-transition' // 状态迁移(prev → next,含 quota override 改判、派发失败转 blocked)
   | 'budget-consumed' // 预算检查命中(超限转 budgetLimited,含 preflight 停止)
   | 'stall-detected' // 连续空轮撞 noProgressLimit
   | 'resumed' // 手动 resume / resumeActiveGoals 续跑

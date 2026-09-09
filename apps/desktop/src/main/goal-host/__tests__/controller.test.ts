@@ -3870,6 +3870,49 @@ describe('GoalController', () => {
     expect(events.some((e) => e.type === 'cleared')).toBe(false);
   });
 
+  it('binds cleared to the interrupted dispatch lifecycle after onDispatching', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    await startGoal(local);
+    await tick();
+    const dispatched = events.filter((e) => e.type === 'turn-dispatched');
+    expect(dispatched.length).toBeGreaterThanOrEqual(1);
+    const dispatch = dispatched[0]!;
+
+    await local.controller.clearGoal('s1');
+
+    const cleared = events.filter((e) => e.type === 'cleared');
+    expect(cleared).toHaveLength(1);
+    expect(cleared[0]).toMatchObject({
+      lifecycleId: dispatch.lifecycleId,
+      generation: dispatch.generation,
+      turnIndex: dispatch.turnIndex,
+      reason: 'cleared by user',
+    });
+  });
+
+  it('records active→blocked state-transition when dispatch send fails', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    vi.spyOn(local.session, 'send').mockImplementation(async () => {
+      throw new Error('provider unavailable');
+    });
+
+    await local.controller.setGoal({ sessionId: 's1', objective: 'ship it' });
+    await vi.waitFor(async () => {
+      expect(await local.storage.get('s1')).toMatchObject({
+        status: 'blocked',
+        lastReason: expect.stringContaining('provider unavailable'),
+      });
+    });
+
+    const blocked = events.filter(
+      (e) => e.type === 'state-transition' && e.from === 'active' && e.to === 'blocked',
+    );
+    expect(blocked.length).toBeGreaterThanOrEqual(1);
+    expect(blocked[0]?.reason).toContain('provider unavailable');
+  });
+
   // ── updateGoal(纯代码改目标 / 上限,不写默认 override) ──
   it('updateGoal resumes a budgetLimited max-turns goal when the new maxTurns allows more turns', async () => {
     await h.storage.set(seededGoal({ status: 'budgetLimited', turnsUsed: 5, maxTurns: 5, lastReason: 'max turns reached' }));
