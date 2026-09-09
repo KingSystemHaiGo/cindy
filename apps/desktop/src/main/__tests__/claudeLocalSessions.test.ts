@@ -580,6 +580,30 @@ describe('parseClaudeCodeMessageLine', () => {
     }
   });
 
+  it('classifies a first top-level event after the scan window as windowLimit, not noEvents', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-window-limit-'));
+    const file = path.join(dir, `${sdkSessionId}.jsonl`);
+    const noise = Array.from({ length: 400 }, (_, i) =>
+      line({ type: 'system', cwd: '/tmp/project', uuid: `noise-${i}` }),
+    );
+    const lateUser = line({
+      type: 'user',
+      uuid: 'late-user',
+      cwd: '/tmp/project',
+      message: { role: 'user', content: 'hello after the scan window' },
+    });
+    fs.writeFileSync(file, `${[...noise, lateUser].join('\n')}\n`);
+
+    try {
+      expect(await readClaudeCodeSessionScanSummaryResult(file)).toEqual({
+        kind: 'rejected',
+        reason: 'windowLimit',
+      });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('classifies unreadable files and missing top-level events', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-reject-reasons-'));
     const missing = path.join(dir, 'missing.jsonl');

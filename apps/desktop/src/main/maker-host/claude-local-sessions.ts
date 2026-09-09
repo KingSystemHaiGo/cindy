@@ -503,8 +503,11 @@ async function readScanSummaryFromHead(
   }
 
   if (readFailed && !sawTopLevelEvent) return { kind: 'rejected', reason: 'unreadable' };
-  if (!sawTopLevelEvent) return { kind: 'rejected', reason: 'noEvents' };
+  // 行限命中可能发生在第一条顶层事件被处理之前(前 400 行全是 system/噪声),
+  // 此时 sawTopLevelEvent 仍为 false。先判 windowLimit,避免把扫描窗口截断误报成 noEvents
+  // (Codex #1807 P1)。
   if (hitLineLimitBeforeTitle) return { kind: 'rejected', reason: 'windowLimit' };
+  if (!sawTopLevelEvent) return { kind: 'rejected', reason: 'noEvents' };
   if (!isLikelySessionId(sdkSessionId)) return { kind: 'rejected', reason: 'invalidId' };
   return {
     kind: 'ok',
