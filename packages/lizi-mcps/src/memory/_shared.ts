@@ -13,7 +13,11 @@
  * thread 的真实 workingDir。
  */
 
-import { resolveMemoryScopeKey, type MakerMemoryStore } from '@cindy/maker-core';
+import {
+  resolveMemoryScopeKey,
+  type MakerMemoryManager,
+  type MakerMemoryStore,
+} from '@cindy/maker-core';
 
 import type { MemoryToolResult } from '../cindy_memoryToolRegistry.js';
 import type { MemoryMcpDeps } from '../types.js';
@@ -30,15 +34,23 @@ export function buildJsonResult(payload: unknown, isError = false): MemoryToolRe
  * 拿当前 session 绑定 workdir 的 Store. manager 不可用 (没注入 / disabled) 时
  * 返 MAKER_MEMORY_NOT_READY 错误, 调用方按 plan 决定是否提示用户开 mode。
  */
+export type WithStoreContext = {
+  store: MakerMemoryStore;
+  /** 解析后的 session scope key (linked worktree 已归一到主仓)。 */
+  scopeKey: string;
+  manager: MakerMemoryManager;
+};
+
 export async function withStore(
   deps: MemoryMcpDeps,
-  fn: (store: MakerMemoryStore, scopeKey: string) => Promise<unknown>,
+  fn: (store: MakerMemoryStore, ctx: WithStoreContext) => Promise<unknown>,
 ): Promise<MemoryToolResult> {
   let store: MakerMemoryStore;
-  let scopeKey = '';
+  let manager: MakerMemoryManager;
+  let scopeKey: string;
   let scopeAtEntry: string | null = null;
   try {
-    const manager = deps.getManager();
+    manager = deps.getManager();
     if (!manager.isEnabled()) {
       return buildJsonResult(
         { ok: false, code: 'MAKER_MEMORY_NOT_READY', message: 'maker memory disabled (mode != "maker")' },
@@ -52,9 +64,9 @@ export async function withStore(
     const ctx = deps.getSessionContext?.();
     const workdir = ctx?.workingDir ?? deps.workdir;
     // SSH remote 会话 (ctx 带 remoteHostId) 的 workdir 是远端路径 — 经 scope
-    // key 定位, 与 agent 启动注入 (claude-code/codex index.ts) 同一键规则。
-    // scopeKey 透传给 fn (#4124): memory_write 需要 scope 判定 bot-only 类型
-    // (moment 仅伙伴记忆可用), 门禁在 store 层 + MCP 边界双重强制。
+    // key 定位, 与 agent 启动注入 (claude-code/codex index.ts) 同一键规则;
+    // 本地会话在此额外做 git worktree 归一化 (#2379)。已注入的 memoryScopeKey
+    // (含 bot: / ssh:) 原样透传, 不再二次解析。
     //
     // 本地路径的外层 resolveMemoryScopeKey 缓存未命中时最长数秒 (Codex
     // #2519 3971991054)。该 await 发生在 getStore 的 owner 守卫之前: 期间切
@@ -66,16 +78,20 @@ export async function withStore(
     } else {
       const resolveScope = deps.resolveMemoryScopeKey ?? resolveMemoryScopeKey;
       scopeKey = await resolveScope(workdir, ctx?.remoteHostId);
-      if (scopeAtEntry !== null && manager.currentOwnerScopeKey?.() !== scopeAtEntry) {
-        return buildJsonResult(
-          {
-            ok: false,
-            code: 'MAKER_MEMORY_NOT_READY',
-            message: 'owner scope changed during scope resolve; refusing to open store',
-          },
-          true,
-        );
-      }
+    }
+    // git 探测是 await: 期间 logout / 切账号会换 owner, 甚至换掉 getManager()
+    // 绑定的 manager。必须在 getStore 前按入口 scope 复核, 否则会把解析到的
+    // key 开到新 owner 的池里 (Codex #2399 P1 / #2519 3971991054)。
+    manager = deps.getManager();
+    if (scopeAtEntry !== null && manager.currentOwnerScopeKey?.() !== scopeAtEntry) {
+      return buildJsonResult(
+        {
+          ok: false,
+          code: 'MAKER_MEMORY_NOT_READY',
+          message: 'owner scope changed during scope resolve; refusing to open store',
+        },
+        true,
+      );
     }
     store = await manager.getStore(scopeKey);
   } catch (err) {
@@ -83,7 +99,7 @@ export async function withStore(
     return buildJsonResult({ ok: false, code, message }, true);
   }
   try {
-    const data = await fn(store, scopeKey);
+    const data = await fn(store, { store, scopeKey, manager });
     // 操作后复核: owner 在 fn 执行期间切换 → 结果不可信, 不得按成功返回。
     if (scopeAtEntry !== null && deps.getManager().currentOwnerScopeKey?.() !== scopeAtEntry) {
       return buildJsonResult(

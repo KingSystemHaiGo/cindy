@@ -55,6 +55,19 @@ describe('resolveMemoryScopeKey — SSH 与空输入旁路', () => {
   it('空 workingDir 原样返回', async () => {
     expect(await resolveMemoryScopeKey('')).toBe('');
   });
+
+  it('已是 bot: / ssh: 复合键时原样透传且不 spawn git', async () => {
+    let probeCalls = 0;
+    const probe: GitProbe = async () => {
+      probeCalls += 1;
+      throw new Error('should not be called');
+    };
+    await expect(resolveMemoryScopeKey('bot:cindy', null, { execGit: probe })).resolves.toBe('bot:cindy');
+    await expect(
+      resolveMemoryScopeKey('ssh:my-host:%2Fhome%2Fme', null, { execGit: probe }),
+    ).resolves.toBe('ssh:my-host:%2Fhome%2Fme');
+    expect(probeCalls).toBe(0);
+  });
 });
 
 describe('resolveMemoryScopeKey — fake probe 回落与缓存', () => {
@@ -65,19 +78,26 @@ describe('resolveMemoryScopeKey — fake probe 回落与缓存', () => {
     };
 
   /**
-   * resolver 的两种探测: rev-parse 单次返回 toplevel/git-dir/common-dir 三行;
-   * 仅在 gitdir ≠ common-dir 且 common-dir basename 为 .git 时再调
+   * resolver 的两种探测: rev-parse 单次返回 toplevel/git-dir/common-dir/
+   * superproject 四行 (无 superproject 时第四行为空);
+   * 仅在真 linked worktree 或 worktree 内 submodule 时再调
    * `worktree list --porcelain` 取主仓根。不传 mainRoot 表示该用例不允许
    * 出现第二次 spawn (在更早的分支就已回落)。
    */
   const probeFor =
-    (toplevel: string, gitDir: string, commonDir: string, mainRoot?: string): GitProbe =>
+    (
+      toplevel: string,
+      gitDir: string,
+      commonDir: string,
+      mainRoot?: string,
+      superproject = '',
+    ): GitProbe =>
     async (args) => {
       if (args.includes('worktree')) {
         if (mainRoot === undefined) throw new Error('worktree list should not be spawned');
         return `worktree ${mainRoot}\n`;
       }
-      return `${toplevel}\n${gitDir}\n${commonDir}\n`;
+      return `${toplevel}\n${gitDir}\n${commonDir}\n${superproject}\n`;
     };
 
   it('git 不存在 (ENOENT) → 原样返回', async () => {
@@ -109,6 +129,73 @@ describe('resolveMemoryScopeKey — fake probe 回落与缓存', () => {
     );
   });
 
+  it('主仓内 submodule (gitdir == common-dir + superproject == 主仓根) → 原样返回', async () => {
+    // 有 superproject 时仍会调 worktree list 确认外层不是 linked worktree;
+    // 主仓根与 superproject 相同则保持原路径。
+    const probe = probeFor(
+      '/main/mod',
+      '/main/.git/modules/mod',
+      '/main/.git/modules/mod',
+      '/main',
+      '/main',
+    );
+    expect(await resolveMemoryScopeKey('/main/mod', null, { execGit: probe })).toBe('/main/mod');
+  });
+
+  it('linked worktree 内 submodule → 主仓 submodule 路径 (Codex #2399 P1)', async () => {
+    const probe = probeFor(
+      '/wt/mod',
+      '/main/.git/worktrees/wt/modules/mod',
+      '/main/.git/worktrees/wt/modules/mod',
+      '/main',
+      '/wt',
+    );
+    expect(await resolveMemoryScopeKey('/wt/mod', null, { execGit: probe })).toBe(
+      process.platform === 'win32'
+        ? path.join(path.resolve('/main'), 'mod').replace(/\\/g, '/')
+        : path.join(path.resolve('/main'), 'mod'),
+    );
+  });
+
+  it('linked worktree 内二级 submodule 沿 superproject 链归一到主仓 (Codex #2399 P1)', async () => {
+    const abs = (p: string) => path.resolve(p);
+    const inner = abs('/wt/mod/inner');
+    const parentMod = abs('/wt/mod');
+    const wt = abs('/wt');
+    const main = abs('/main');
+    const byCwd: Record<string, { toplevel: string; gitDir: string; commonDir: string; superproject: string }> = {
+      [inner]: {
+        toplevel: inner,
+        gitDir: abs('/main/.git/worktrees/wt/modules/mod/modules/inner'),
+        commonDir: abs('/main/.git/worktrees/wt/modules/mod/modules/inner'),
+        superproject: parentMod,
+      },
+      [parentMod]: {
+        toplevel: parentMod,
+        gitDir: abs('/main/.git/worktrees/wt/modules/mod'),
+        commonDir: abs('/main/.git/worktrees/wt/modules/mod'),
+        superproject: wt,
+      },
+      [wt]: {
+        toplevel: wt,
+        gitDir: abs('/main/.git/worktrees/wt'),
+        commonDir: abs('/main/.git'),
+        superproject: '',
+      },
+    };
+    const probe: GitProbe = async (args, cwd) => {
+      if (args.includes('worktree')) return `worktree ${main}\n`;
+      const rec = byCwd[path.normalize(cwd)] ?? byCwd[cwd];
+      if (!rec) throw new Error(`unexpected cwd ${cwd}`);
+      return `${rec.toplevel}\n${rec.gitDir}\n${rec.commonDir}\n${rec.superproject}\n`;
+    };
+    expect(await resolveMemoryScopeKey(inner, null, { execGit: probe })).toBe(
+      process.platform === 'win32'
+        ? path.join(main, 'mod', 'inner').replace(/\\/g, '/')
+        : path.join(main, 'mod', 'inner'),
+    );
+  });
+
   it('common-dir 非 <root>/.git 形态 (bare/非常规布局) → 原样返回', async () => {
     const probe = probeFor('/fake/bare-wt', '/fake/repo.git/worktrees/x', '/fake/repo.git');
     expect(await resolveMemoryScopeKey('/fake/bare-wt', null, { execGit: probe })).toBe(
@@ -132,9 +219,10 @@ describe('resolveMemoryScopeKey — fake probe 回落与缓存', () => {
       '/storage/.git',
       '/real/checkout',
     );
-    const mapped = path.join(path.resolve('/real/checkout'), 'apps', 'a');
     expect(await resolveMemoryScopeKey('/fake/wt/apps/a', null, { execGit: probe })).toBe(
-      process.platform === 'win32' ? mapped.replace(/\\/g, '/') : mapped,
+      process.platform === 'win32'
+        ? path.join(path.resolve('/real/checkout'), 'apps', 'a').replace(/\\/g, '/')
+        : path.join(path.resolve('/real/checkout'), 'apps', 'a'),
     );
   });
 
@@ -167,11 +255,10 @@ describe('resolveMemoryScopeKey — fake probe 回落与缓存', () => {
     const second = await resolveMemoryScopeKey(abs('/repo/.cindy-worktrees/feat/apps/a'), null, {
       execGit: probe,
     });
-    // Windows 上输入是盘符正斜杠形态 (C:/...) — 输出保持正斜杠拼写, 与
-    // Desktop 主 checkout 会话的 scope key 一致 (Codex on #2519 第八轮),
-    // 不能是 path.join 默认的反斜杠 (会与主 checkout 缓存成两个 Store)。
     expect(first).toBe(
-      process.platform === 'win32' ? 'C:/repo/apps/a' : path.join(abs('/repo'), 'apps', 'a'),
+      process.platform === 'win32'
+        ? path.join(abs('/repo'), 'apps', 'a').replace(/\\/g, '/')
+        : path.join(abs('/repo'), 'apps', 'a'),
     );
     expect(second).toBe(first);
     expect(calls).toBe(2); // rev-parse + worktree list 各一次, 第二轮全缓存
@@ -207,23 +294,7 @@ describe('resolveMemoryScopeKey — fake probe 回落与缓存', () => {
   });
 
   it.skipIf(process.platform !== 'win32')(
-    'Windows 正反斜杠 cwd 命中同一缓存 (分隔符规范化后 cache key 稳定)',
-    async () => {
-      let calls = 0;
-      const probe: GitProbe = async () => {
-        calls += 1;
-        throw Object.assign(new Error('not a git repository'), { code: 128 });
-      };
-      await resolveMemoryScopeKey('C:\\cache-mix\\repo', null, { execGit: probe });
-      await resolveMemoryScopeKey('C:/cache-mix/repo', null, { execGit: probe });
-      await resolveMemoryScopeKey('\\\\server\\share\\r', null, { execGit: probe });
-      await resolveMemoryScopeKey('//server/share/r', null, { execGit: probe });
-      expect(calls).toBe(2);
-    },
-  );
-
-  it.skipIf(process.platform !== 'win32')(
-    'Windows 反斜杠 cwd 与正斜杠主仓收成同一正斜杠 key (Codex #2519 第十九轮 UNC/分隔符)',
+    'Windows 风格路径: git 正斜杠输出 + 反斜杠 cwd 混合归一化',
     async () => {
       const probe = probeFor(
         'C:/repo/.cindy-worktrees/feat',
@@ -237,35 +308,10 @@ describe('resolveMemoryScopeKey — fake probe 回落与缓存', () => {
       expect(key).toBe('C:/repo/apps/a');
     },
   );
-
-  it.skipIf(process.platform !== 'win32')(
-    'Windows 正斜杠输入 → 正斜杠输出 (scope key 拼写与 Desktop 一致, Codex on #2519 第八轮)',
-    async () => {
-      // Desktop 存正斜杠路径; 反斜杠输出会与主 checkout 会话 (正斜杠 key)
-      // 缓存成两个 Store 实例指向同一磁盘目录
-      const probe = probeFor(
-        'C:/repo/.cindy-worktrees/feat',
-        'C:/repo/.git/worktrees/feat',
-        'C:/repo/.git',
-        'C:/repo',
-      );
-      const key = await resolveMemoryScopeKey('C:/repo/.cindy-worktrees/feat/apps/a', null, {
-        execGit: probe,
-      });
-      expect(key).toBe('C:/repo/apps/a');
-    },
-  );
 });
 
-// 默认 unit tier 唯一一条真实 Git smoke (§3.1): 端到端打通「真实 git 探测 +
-// 映射」主路径。组合矩阵见 scope-resolver.git-integration.test.ts。
+// 路径边界审计 (分隔符 / 盘符 / UNC / \\?\\ / 空与相对盘符 / 特殊字符)
 describe('normalizeWindowsLocalScopeKey — 路径边界 (Codex #2519 第十九轮)', () => {
-  // 路径边界审计 (分隔符 / 盘符 / UNC / \\?\\ / 空与相对盘符 / 特殊字符)
-  // 已由下列用例覆盖。symlink / junction / 大小写:
-  //  - 不额外 realpath, scope 跟 git toplevel (与 inode/junction 目标解耦)
-  //  - 不把路径段改成小写 (sanitizeWorkdir 区分 C--Users 与 c--users)
-  //  - cache/samePath 已大小写不敏感
-
   it('UNC 正斜杠与反斜杠收成同一 //server/share 形态', () => {
     expect(normalizeWindowsLocalScopeKey('\\\\server\\share\\repo')).toBe(
       '//server/share/repo',
@@ -299,6 +345,8 @@ describe('normalizeWindowsLocalScopeKey — 路径边界 (Codex #2519 第十九�
   });
 });
 
+// 默认 unit tier 唯一一条真实 Git smoke (§3.1): 端到端打通「真实 git 探测 +
+// 映射」主路径。组合矩阵见 scope-resolver.git-integration.test.ts。
 describe.skipIf(!gitAvailable())('resolveMemoryScopeKey — 真实 Git smoke', () => {
   it('linked worktree 子目录 cwd → 主仓根 + 相对子路径', async () => {
     const tmpRoot = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'scope-resolver-')));

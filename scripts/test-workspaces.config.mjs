@@ -258,7 +258,7 @@ export default {
         unit: {
           status: 'required',
           command: unitVitestCommand(1, 'forks'),
-          exclude: ['**/*.git-integration.test.ts', '**/*.integration.test.ts', '**/*.e2e.test.ts'],
+          exclude: ['**/*.integration.test.ts', '**/*.e2e.test.ts', '**/*.git-integration.test.ts'],
         },
         'git-integration': {
           status: 'manual',

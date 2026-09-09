@@ -168,6 +168,98 @@ describe.skipIf(!gitAvailable())('resolveMemoryScopeKey — 真实临时 git 仓
     }
   });
 
+  it('linked worktree 内初始化过的 submodule → 主仓 submodule 路径 (Codex #2399 P1)', async () => {
+    const tmpRoot = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'scope-resolver-sub-')));
+    const subRepo = path.join(tmpRoot, 'sub');
+    const repoRoot = path.join(tmpRoot, 'repo');
+    const wt = path.join(tmpRoot, 'wt');
+    const git = (args: string[], cwd: string, extraEnv?: NodeJS.ProcessEnv) =>
+      execFileSync('git', args, {
+        cwd,
+        stdio: 'ignore',
+        env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
+      });
+    try {
+      await fs.mkdir(subRepo, { recursive: true });
+      git(['init'], subRepo);
+      git(['config', 'user.email', 'test@example.com'], subRepo);
+      git(['config', 'user.name', 'scope-resolver-test'], subRepo);
+      await fs.writeFile(path.join(subRepo, 'README'), 'sub\n');
+      git(['add', '.'], subRepo);
+      git(['commit', '-m', 'sub'], subRepo);
+
+      await fs.mkdir(repoRoot, { recursive: true });
+      git(['init'], repoRoot);
+      git(['config', 'user.email', 'test@example.com'], repoRoot);
+      git(['config', 'user.name', 'scope-resolver-test'], repoRoot);
+      git(['-c', 'protocol.file.allow=always', 'submodule', 'add', subRepo, 'mod'], repoRoot);
+      git(['commit', '-m', 'add sub'], repoRoot);
+      git(['worktree', 'add', '-b', 'wt-branch', wt], repoRoot);
+      git(['-c', 'protocol.file.allow=always', 'submodule', 'update', '--init'], wt);
+
+      const wtMod = path.join(wt, 'mod');
+      const mainMod = path.join(repoRoot, 'mod');
+      expectScope(await resolveMemoryScopeKey(wtMod), mainMod);
+      expectScope(await resolveMemoryScopeKey(mainMod), mainMod);
+    } finally {
+      try {
+        await fs.rm(tmpRoot, { recursive: true, force: true, maxRetries: 3 });
+      } catch {
+        /* Windows 上 git 只读对象偶发 EPERM — temp 目录交给 OS 清理 */
+      }
+    }
+  });
+
+  it('linked worktree 内二级 submodule → 主仓嵌套路径 (Codex #2399 P1)', async () => {
+    const tmpRoot = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'scope-resolver-nested-sub-')));
+    const innerRepo = path.join(tmpRoot, 'inner');
+    const midRepo = path.join(tmpRoot, 'mid');
+    const repoRoot = path.join(tmpRoot, 'repo');
+    const wt = path.join(tmpRoot, 'wt');
+    const git = (args: string[], cwd: string) =>
+      execFileSync('git', args, {
+        cwd,
+        stdio: 'ignore',
+        env: { ...process.env, GIT_ALLOW_PROTOCOL: 'file' },
+      });
+    try {
+      await fs.mkdir(innerRepo, { recursive: true });
+      git(['init'], innerRepo);
+      git(['config', 'user.email', 'test@example.com'], innerRepo);
+      git(['config', 'user.name', 'scope-resolver-test'], innerRepo);
+      await fs.writeFile(path.join(innerRepo, 'README'), 'inner\n');
+      git(['add', '.'], innerRepo);
+      git(['commit', '-m', 'inner'], innerRepo);
+
+      await fs.mkdir(midRepo, { recursive: true });
+      git(['init'], midRepo);
+      git(['config', 'user.email', 'test@example.com'], midRepo);
+      git(['config', 'user.name', 'scope-resolver-test'], midRepo);
+      git(['-c', 'protocol.file.allow=always', 'submodule', 'add', innerRepo, 'inner'], midRepo);
+      git(['commit', '-m', 'add inner'], midRepo);
+
+      await fs.mkdir(repoRoot, { recursive: true });
+      git(['init'], repoRoot);
+      git(['config', 'user.email', 'test@example.com'], repoRoot);
+      git(['config', 'user.name', 'scope-resolver-test'], repoRoot);
+      git(['-c', 'protocol.file.allow=always', 'submodule', 'add', midRepo, 'mod'], repoRoot);
+      git(['commit', '-m', 'add mid'], repoRoot);
+      git(['worktree', 'add', '-b', 'wt-nested', wt], repoRoot);
+      git(['-c', 'protocol.file.allow=always', 'submodule', 'update', '--init', '--recursive'], wt);
+
+      const wtInner = path.join(wt, 'mod', 'inner');
+      const mainInner = path.join(repoRoot, 'mod', 'inner');
+      expectScope(await resolveMemoryScopeKey(wtInner), mainInner);
+      expectScope(await resolveMemoryScopeKey(mainInner), mainInner);
+    } finally {
+      try {
+        await fs.rm(tmpRoot, { recursive: true, force: true, maxRetries: 3 });
+      } catch {
+        /* Windows 上 git 只读对象偶发 EPERM — temp 目录交给 OS 清理 */
+      }
+    }
+  });
+
   it('非 git 目录原样返回', async () => {
     const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'scope-resolver-nogit-')));
     try {

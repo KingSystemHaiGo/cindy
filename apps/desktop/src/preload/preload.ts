@@ -504,6 +504,7 @@ function createIpcFanOut(channel: string): FanOut {
 // 老 7 个 fanOut + fanOutUserMessagePersisted 一起拿掉。
 const fanOutUpdateStatus = createIpcFanOut('update-status');
 const fanOutSkillhubLocalStateChanged = createIpcFanOut('skillhub:local-state-changed');
+const fanOutDatabaseSizeWarningChanged = createIpcFanOut('database-size-warning:changed');
 const fanOutDbSlimmingStartupProgress = createIpcFanOut(
   DB_SLIMMING_STARTUP_PROGRESS_CHANGED_CHANNEL,
 );
@@ -4060,6 +4061,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
       error?: string;
       blobs: { totalCount: number; totalBytes: number; cacheCount: number; cacheBytes: number };
       legacy: { bytes: number; fileCount: number };
+      fixedCaches: {
+        legacyImages: { bytes: number; fileCount: number };
+        chatAttachments: { bytes: number; fileCount: number };
+      };
       deadDirs: Array<{
         name: string;
         exists: boolean;
@@ -5081,6 +5086,37 @@ contextBridge.exposeInMainWorld('electronAPI', {
       userId: string,
     ): Promise<{ ready: true } | { ready: false; error: { code: string; message: string } }> =>
       ipcRenderer.invoke('local-db:ensure-ready', userId),
+    databaseSizeWarning: {
+      // Settings and the startup capacity snapshot are local to this device's
+      // shared Electron userData profile; they are not synced across devices
+      // or persisted in the cloud account.
+      getSettings: (): Promise<{
+        thresholdGiB: number;
+        disabled: boolean;
+        isCustomized?: boolean;
+        defaultThresholdGiB: number;
+      }> => ipcRenderer.invoke('database-size-warning:get-settings'),
+      setSettings: (settings: {
+        thresholdGiB?: number;
+        disabled?: boolean;
+      }): Promise<{
+        thresholdGiB: number;
+        disabled: boolean;
+        isCustomized?: boolean;
+        defaultThresholdGiB: number;
+      }> => ipcRenderer.invoke('database-size-warning:set-settings', settings),
+      resetSettings: (): Promise<{
+        thresholdGiB: number;
+        disabled: boolean;
+        isCustomized?: boolean;
+        defaultThresholdGiB: number;
+      }> => ipcRenderer.invoke('database-size-warning:reset-settings'),
+      getStatus: (): Promise<{ databaseBytes: number | null }> =>
+        ipcRenderer.invoke('database-size-warning:get-status'),
+      measure: (): Promise<{ databaseBytes: number | null }> =>
+        ipcRenderer.invoke('database-size-warning:measure'),
+      onChanged: (callback: () => void) => fanOutDatabaseSizeWarningChanged(callback),
+    },
     maintenance: {
       scan: (
         input: import('../shared/localDbMaintenance').DbSlimmingScanInput,
@@ -5795,8 +5831,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
       dataOwnerId: string | null,
       ownerGeneration: number,
       map: Record<string, boolean>,
+      policy?: import('../shared/modelVisibility').ModelVisibilityPolicy,
     ): Promise<void> =>
-      ipcRenderer.invoke('maker:model-visibility:sync', dataOwnerId, ownerGeneration, map),
+      ipcRenderer.invoke('maker:model-visibility:sync', dataOwnerId, ownerGeneration, map, policy),
     claimLegacyModelVisibilityOwner: (): ModelVisibilityLegacyOwnerClaim => {
       const value: unknown = ipcRenderer.sendSync('maker:model-visibility:legacy-owner-claim-sync');
       return isModelVisibilityLegacyOwnerClaim(value)
