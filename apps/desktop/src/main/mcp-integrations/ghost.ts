@@ -1,3 +1,5 @@
+import { getBotAuthorizationService } from '../maker-ipc/botAuthorizationService.js';
+import { isBotAuthorizationSession } from '../maker-ipc/botAuthorizationHost.js';
 /**
  * ghost.ts — cindy-tools ghost 总机的 host 侧接线(docs/dev-rules/plugin-security-and-authoring.md)。
  * ---------------------------------------------------------------------------
@@ -1360,6 +1362,16 @@ export function getCindyGhostsMcpDeps(
     message: '当前伙伴配置未启用该插件；不要重试，改用已授权能力，或让用户更新伙伴配置后再试。',
   });
   return {
+    connectAccount: async (target) => {
+      if (target.kind === 'plugin' && !isGhostAllowedByFrozenProfile(target.id))
+        return frozenProfileDenied();
+      const context = resolveSessionContext();
+      const sessionId = ghostSetupInteractionSessionId(context);
+      if (!sessionId) return { ok: false, errorCode: 'NO_SESSION_CONTEXT' };
+      const service = getBotAuthorizationService();
+      if (!service) return { ok: false, errorCode: 'HOST_NOT_READY' };
+      return service.request(sessionId, target);
+    },
     callMedia: async (request) => {
       const sessionContext = resolveSessionContext();
       const sessionId = sessionContext?.sessionId;
@@ -1546,6 +1558,13 @@ export function getCindyGhostsMcpDeps(
           errorCode: 'INTERNAL',
           message: '插件设置通道尚未就绪，本次调用未执行。',
         };
+      }
+      const authorizationSessionId = ghostSetupInteractionSessionId(sessionContext);
+      const authorizationService = getBotAuthorizationService();
+      if (authorizationService && authorizationSessionId && await isBotAuthorizationSession(authorizationSessionId)) {
+        const service = authorizationService;
+        const card = await service.request(authorizationSessionId, { kind: 'plugin', id: ghostId, ...(setupPlan && getGhostSetupAssessment(ghostId).reauthSuggest ? { reauthorize: true } : {}) }, setupPlan);
+        if (!card.ok) return card;
       }
       const setup = await setupCoordinator.ensureReady({
         sessionId: ghostSetupInteractionSessionId(sessionContext),

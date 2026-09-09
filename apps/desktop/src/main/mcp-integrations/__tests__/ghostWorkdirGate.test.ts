@@ -133,6 +133,13 @@ vi.mock('../../logger.js', () => ({
 // Claude 走建线闭包 ctx；Codex / Pi 用此 mock 模拟 HTTP bridge 的 ALS 恢复。
 vi.mock('@cindy/mcps', () => ({ getLiziMcpSessionContext: () => alsSessionContextMock() }));
 
+const isAuthorizationSessionMock = vi.fn(async () => false);
+vi.mock('../../maker-ipc/botAuthorizationHost.js', () => ({ isBotAuthorizationSession: isAuthorizationSessionMock }));
+const authorizationRequestMock = vi.fn(async () => ({ ok: true as const }));
+vi.mock('../../maker-ipc/botAuthorizationService.js', () => ({
+  getBotAuthorizationService: () => ({ request: authorizationRequestMock }),
+}));
+
 const WORKDIR = '/proj/alpha';
 const listMock = vi.fn<() => unknown[]>(() => []);
 const activeSessionAvailableMock = vi.fn((_ghostId: string) => true);
@@ -299,6 +306,8 @@ function clearAllPrefs(): void {
 }
 
 beforeEach(() => {
+  authorizationRequestMock.mockClear();
+  isAuthorizationSessionMock.mockResolvedValue(false);
   fs.mkdirSync(outsideDir, { recursive: true });
   listMock.mockReset();
   listMock.mockReturnValue([chipGhost('art'), chipGhost('other')]);
@@ -737,6 +746,28 @@ describe('写路径 roundtrip(真实存储,tmp userData)', () => {
     expect(isGhostDisabledForWorkdir('art', 'E:\\REPO\\')).toBe(true);
     setGhostDisabledForWorkdir('E:\\REPO\\', 'art', false);
     expect(isGhostDisabledForWorkdir('art', 'E:/Repo')).toBe(false);
+  });
+});
+
+describe('connect_account frozen plugin policy', () => {
+  it.each([
+    { __cindyAllowedBuiltinPluginIds: ['other'] },
+    { __cindyDisabledBuiltinPluginIds: ['art'] },
+  ])('rejects a disabled plugin before creating a card: %j', async (policy) => {
+    const deps = makeDeps('claude-code', 'bot-session', 'bot-instance', policy);
+    await expect(deps.connectAccount!({ kind: 'plugin', id: 'art' })).resolves.toMatchObject({
+      ok: false, errorCode: 'GHOST_DISABLED_IN_WORKDIR',
+    });
+    expect(authorizationRequestMock).not.toHaveBeenCalled();
+  });
+
+  it('allows an enabled plugin and keeps Host login independent of plugin policy', async () => {
+    const deps = makeDeps('claude-code', 'bot-session', 'bot-instance', {
+      __cindyAllowedBuiltinPluginIds: ['art'],
+    });
+    await deps.connectAccount!({ kind: 'plugin', id: 'art' });
+    await deps.connectAccount!({ kind: 'host', id: 'grok' });
+    expect(authorizationRequestMock).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -2163,4 +2194,19 @@ describe('Host Auto review', () => {
     expect(dispatchMock).not.toHaveBeenCalled();
     expect(grantAttachmentsMock).not.toHaveBeenCalled();
   });
+});
+
+it.each([false, true])('only marks a teammate setup plan as reauthorization with a current suggestion (%s)', async (reauth) => {
+  listMock.mockReturnValue([chipGhost('art')]);
+  isAuthorizationSessionMock.mockResolvedValue(true);
+  const assessment = { state: 'ready' as const, revision: 1, groups: [],
+    ...(reauth ? { reauthSuggest: { ghostId: 'art', secretKey: 'account', missingScopes: ['write'],
+      missingScopeCount: 1, requirement: { ref: 'secret:account', kind: 'oauth' as const,
+        label: 'Account', action: { id: 'connect', kind: 'oauth_connect' as const } } } } : {}) };
+  setupAssessmentMock.mockReturnValue(assessment);
+  const setupPlan = { assessmentRevision: 1, steps: [] };
+  await makeDeps().callGhostTool({ ghostId: 'art', tool: 'run', args: {}, setupPlan });
+  expect(authorizationRequestMock).toHaveBeenCalledWith('s1', {
+    kind: 'plugin', id: 'art', ...(reauth ? { reauthorize: true } : {}),
+  }, setupPlan);
 });

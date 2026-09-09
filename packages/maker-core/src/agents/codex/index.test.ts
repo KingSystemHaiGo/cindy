@@ -22525,6 +22525,58 @@ describe('CodexAgent native fork anchor events', () => {
 });
 
 describe('CodexAgent.forkSdkSession', () => {
+  it('forks failed paginated history without rollback when no UI anchor was saved', async () => {
+    const agent = new CodexAgent(createDeps());
+    const host = installFakeHost(agent, method => {
+      if (method === Method.ThreadTurnsList) return {
+        data: [
+          { id: 'retry-2', status: 'failed', startedAt: 400 }, { id: 'retry-1', status: 'failed', startedAt: 300 },
+          { id: 'hidden-retry', status: 'failed', startedAt: 200 },
+          { id: 'failed-boundary', status: 'interrupted', startedAt: 100 },
+        ], nextCursor: null,
+      };
+      if (method === Method.ThreadRollback) throw new Error('paginated threads do not support thread/rollback');
+    }, { userAgent: 'mock-codex/0.153.4' });
+    await expect(agent.forkSdkSession({
+      sourceSdkSessionId: 'source', upToMessageId: undefined, tailTurnsToDrop: 2, forkAtTimestampMs: 110_123,
+    })).resolves.toMatchObject({ newSdkSessionId: 'fork-thread-id', usedNativeForkAnchor: true });
+    expect(host.request).toHaveBeenCalledWith(Method.ThreadFork, {
+      threadId: 'source', lastTurnId: 'failed-boundary', excludeTurns: true,
+    });
+    expect(host.request).not.toHaveBeenCalledWith(Method.ThreadRollback, expect.anything());
+    expect(host.unsubscribeThread).toHaveBeenCalledWith('fork-thread-id');
+  });
+
+  it('refuses visible counts without an event boundary when excluded native turns were retried', async () => {
+    const agent = new CodexAgent(createDeps());
+    const host = installFakeHost(agent, method => {
+      if (method === Method.ThreadTurnsList) return {
+        data: [
+          { id: 'excluded-retry', status: 'failed', startedAt: 300 },
+          { id: 'excluded-original', status: 'failed', startedAt: 200 },
+          { id: 'copied-silent-turn', status: 'failed', startedAt: 100 },
+        ], nextCursor: null,
+      };
+    }, { userAgent: 'mock-codex/0.153.4' });
+    await expect(agent.forkSdkSession({
+      sourceSdkSessionId: 'source', upToMessageId: undefined, tailTurnsToDrop: 1,
+    })).rejects.toMatchObject({ stage: 'source-prepare' });
+    expect(host.request).not.toHaveBeenCalled();
+    expect(host.unsubscribeThread).not.toHaveBeenCalled();
+  });
+
+  it('does not allocate a child or fall back to rollback if native boundary lookup fails', async () => {
+    const agent = new CodexAgent(createDeps());
+    const host = installFakeHost(agent, method => {
+      if (method === Method.ThreadTurnsList) throw new Error('native read failed');
+    }, { userAgent: 'mock-codex/0.153.4' });
+    await expect(agent.forkSdkSession({
+      sourceSdkSessionId: 'source', upToMessageId: undefined, tailTurnsToDrop: 1, forkAtTimestampMs: 110_123,
+    })).rejects.toMatchObject({ stage: 'source-prepare' });
+    expect(host.request).toHaveBeenCalledTimes(1);
+    expect(host.unsubscribeThread).not.toHaveBeenCalled();
+  });
+
   it('keeps a startup cause and records a concurrent host retirement failure', async () => {
     const cause = new Error('ECONNRESET');
     const agent = new CodexAgent(createDeps());
@@ -31448,6 +31500,52 @@ describe('CodexAgent context window reporting', () => {
 });
 
 describe('CodexAgent custom provider context window override', () => {
+  it.each([false, true])('applies SSH thread budgets and reset defaults without retiring the shared daemon (resume=%s)', async (resume) => {
+    const transport = new MockCodexTransport();
+    const getRemoteCodexTransport = vi.fn(() => transport);
+    let budget: number | null = 100_000;
+    let defaultWindow = 272_000;
+    const agent = new CodexAgent(createDeps({}, {
+      getRemoteCodexTransport,
+      resolveModelContextLimit: () => budget,
+      resolveCodexThreadContextWindow: () => budget ?? defaultWindow,
+    }));
+    const options = {
+      sessionId: 'ssh-context-budget', model: 'gpt-5.4', providerId: 'openai',
+      remoteHostId: 'ssh-context-host', workingDir: '/remote/repo',
+      ...(resume ? { resumeSessionId: '123e4567-e89b-12d3-a456-426614174000' } : {}),
+    };
+    const peer = await agent.startSession({ ...options, sessionId: 'ssh-peer', resumeSessionId: undefined });
+    let handle = await agent.startSession(options);
+    const checkConfig = (expected: number) => {
+      const method = resume ? Method.ThreadResume : Method.ThreadStart;
+      const request = transport.lines.map((line) => JSON.parse(line))
+        .filter((request) => request.method === method).at(-1);
+      expect(request.params.config).toMatchObject({
+        model_context_window: expected, model_auto_compact_token_limit: Math.floor(expected * 0.9),
+      });
+      if (resume) expect(request.params.threadId).toBe(options.resumeSessionId);
+    };
+    checkConfig(100_000);
+    budget = null;
+    expect(await handle.requiresModelSwitchRebuild?.('gpt-5.4', { providerId: 'openai' })).toBe(true);
+    await handle.close();
+    expect(transport.closed).toBe(false);
+    handle = await agent.startSession(options);
+    checkConfig(272_000);
+    defaultWindow = 128_000;
+    expect(await handle.requiresModelSwitchRebuild?.('gpt-5.4', { providerId: 'openai' })).toBe(true);
+    await handle.close();
+    handle = await agent.startSession(options);
+    checkConfig(128_000);
+    expect(getRemoteCodexTransport).toHaveBeenCalledTimes(1);
+    expect(createdStdioOptions).toHaveLength(0);
+    expect(transport.closed).toBe(false);
+    await handle.close();
+    await peer.close();
+    await agent.dispose();
+  });
+
   it('uses a one-session host and injects the explicit window with the real model slug', async () => {
     const agent = new CodexAgent(createDeps({}, {
       resolveCodexThreadContextWindow: async (providerId, modelId) =>

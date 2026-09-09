@@ -145,9 +145,9 @@ function remoteRosterKeys(): Set<string> {
 }
 
 function notifyRosterChanged(deviceId?: string): void {
-  // Presence includes controller-only phones. Only refresh devices whose roster
-  // was actually requested; reverse capability invokes to an iPhone are rejected
-  // and can tear down the peer link currently serving that phone's requests.
+  // Presence includes controller-only phones. Query only devices whose agent
+  // roster has actually been used; probing phones can reject the reverse link
+  // and interrupt their incoming remote-control connection.
   if (deviceId && !remoteRosterKeys().has(deviceId)) return;
   const key = cacheKeyOf(deviceId);
   if (!invalidateAgentsCache(key)) return;
@@ -304,6 +304,15 @@ export function __resetAvailableAgentsCacheForTest(): void {
   agentsCache.clear();
   inFlight.clear();
   agentsCacheInvalidationScheduled.clear();
+}
+
+/** Model pickers keep the current Harness visible while excluding unregistered runtimes. */
+export function useModelPickerAgents(current: RuntimeAgentKind, deviceId?: string | null): readonly RuntimeAgentKind[] | undefined {
+  const { availableVendors, loaded } = useAvailableAgents(deviceId);
+  if (!loaded) return undefined;
+  return (['claude-code', 'codex', 'pi'] as const).filter(
+    (agent) => agent === current || availableVendors.has(toVendor(agent)),
+  );
 }
 
 /** Synchronous projection of the same runtime roster used by the client picker. */

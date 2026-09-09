@@ -1,3 +1,4 @@
+import { snapshotDisabledSkillLaunch, currentDisabledSkillLaunchPaths, extendDisabledSkillLaunchPaths, type DisabledSkillLaunchSnapshot } from '../shared/skill-activation.js';
 /**
  * PiAgent —— pi coding agent(earendil-works/pi)接入。
  *
@@ -133,6 +134,7 @@ import {
   toolAutoReviewAction,
   type AutoReviewDecision,
 } from '../shared/auto-review-decision.js';
+import { applyPiDisabledSkillSettings, filterPiDisabledProjectSkills, piDisabledDiscoveryPaths } from './skill-activation.js';
 import type { ReviewableAction } from '../shared/auto-review.js';
 import { buildMemoryScopeKey } from '../../memory/storage.js';
 import { MAKER_MEMORY_RULES } from '../../memory/system-prompt.js';
@@ -1667,6 +1669,7 @@ export class PiAgent extends BaseAgent {
       contextWindow?: number;
       piCompactionPct?: number;
       packages?: readonly PiNativePackageEntry[];
+      disabledSkills?: DisabledSkillLaunchSnapshot;
     },
   ): Promise<string> {
     const built = this.buildCurrentPiSettingsJson(
@@ -1689,7 +1692,14 @@ export class PiAgent extends BaseAgent {
         ? Promise.resolve(null)
         : readOrNull(stableUserSettingsPath),
     ]);
-    return mergePiUserSettingsPassthrough(built, sessionContent, stableContent);
+    const merged = mergePiUserSettingsPassthrough(built, sessionContent, stableContent);
+    // Runtime rewrites use the startup bindings, never paths reconstructed from
+    // settings.json: those paths can now point to a different physical Skill.
+    if (opts.disabledSkills) {
+      return JSON.stringify(applyPiDisabledSkillSettings(JSON.parse(merged),
+        currentDisabledSkillLaunchPaths(opts.disabledSkills)), null, 2) + '\n';
+    }
+    return merged;
   }
 
   private async writePiRuntimeSettings(
@@ -1699,6 +1709,7 @@ export class PiAgent extends BaseAgent {
       contextWindow?: number;
       piCompactionPct?: number;
       packages?: readonly PiNativePackageEntry[];
+      disabledSkills?: DisabledSkillLaunchSnapshot;
     } = {},
   ): Promise<void> {
     const settingsJsonPath = joinRemotePosixPath(agentHome, 'settings.json');
@@ -1736,6 +1747,7 @@ export class PiAgent extends BaseAgent {
       piCompactionPct?: number;
       /** Host-installed roots/specs for Pi's own package discovery. */
       packages?: readonly PiNativePackageEntry[];
+      disabledSkills?: DisabledSkillLaunchSnapshot;
     } = {},
   ): Promise<{
     gatewayImageInputByModel: Map<string, boolean>;
@@ -1872,7 +1884,7 @@ export class PiAgent extends BaseAgent {
         continue;
       }
       const nativeModels = (
-        np.inheritModels ? np.models.filter((model) => model.api !== undefined || model.catalogAddition === true || this.deps.resolveModelContextLimit?.(np.sourceProviderId ?? np.id, model.id) != null) : np.models
+        np.inheritModels ? np.models.filter((model) => model.api !== undefined || model.catalogAddition === true) : np.models
       ).map((m) => {
         const contextWindow = this.deps.resolveModelContextLimit?.(np.sourceProviderId ?? np.id, m.id)
           ?? (m.contextWindow && m.contextWindow > 0 ? m.contextWindow : 128_000);
@@ -1901,6 +1913,16 @@ export class PiAgent extends BaseAgent {
         ...(np.api ? { api: np.api } : {}),
         // keyless(本机 Ollama 等)也要给 dummy key,否则 pi /model 不显示该模型。
         apiKey: np.apiKeyEnvVar ? `$${np.apiKeyEnvVar}` : 'pi-native-keyless',
+        // Preserve native protocol/compatibility metadata while applying Cindy's
+        // route default or explicit working window to inherited models as well.
+        ...(np.inheritModels ? {
+          modelOverrides: Object.fromEntries(np.models.flatMap((model) => {
+            const window = this.deps.resolveModelContextLimit?.(np.sourceProviderId ?? np.id, model.id)
+              ?? model.contextWindow;
+            return typeof window === 'number' && Number.isSafeInteger(window) && window > 0
+              ? [[model.wireId ?? model.id, { contextWindow: window }]] : [];
+          })),
+        } : {}),
         ...(np.headers && Object.keys(np.headers).length > 0 ? { headers: np.headers } : {}),
         ...(nativeModels.length > 0 ? { models: nativeModels } : {}),
       };
@@ -3062,6 +3084,10 @@ export class PiAgent extends BaseAgent {
     // snapshot. Freeze it once per new runtime, then assemble only its eligible
     // skills. Missing/throwing authorities and paths fail closed; never infer
     // approval from permission mode, MCP/plugin state, or caller vendor options.
+    const disabledSkillPaths = opts.remoteHostId || opts.botRuntimeProfile || reviewMode
+      ? [] : [...(this.deps.getDisabledSkillPaths?.() ?? [])];
+    let disabledSkillLaunch = snapshotDisabledSkillLaunch(disabledSkillPaths);
+    const disabledSkillSnapshot = disabledSkillLaunch.identities;
     let projectResourceAssembly = unavailablePiProjectResourceAssembly(
       reviewMode ? 'review-mode-project-resources-disabled' : 'approval-resolver-unavailable',
     );
@@ -3073,6 +3099,7 @@ export class PiAgent extends BaseAgent {
           ...(opts.remoteHostId ? { remoteHostId: opts.remoteHostId } : {}),
         });
         projectResourceAssembly = await assembleApprovedPiProjectResources(trustInput, opts.workingDir);
+        projectResourceAssembly = filterPiDisabledProjectSkills(projectResourceAssembly, currentDisabledSkillLaunchPaths(disabledSkillLaunch));
         projectResourceAssembly = await stageApprovedPiProjectResources(projectResourceAssembly, configHome);
       } catch {
         projectResourceAssembly = unavailablePiProjectResourceAssembly('approval-resolver-failed');
@@ -3149,6 +3176,18 @@ export class PiAgent extends BaseAgent {
           });
         }
       }
+    }
+
+    if (disabledSkillPaths.length > 0) {
+      const settingsPath = path.join(configHome, 'settings.json');
+      const settings = JSON.parse(await fs.readFile(settingsPath, 'utf8'));
+      disabledSkillLaunch = extendDisabledSkillLaunchPaths(disabledSkillLaunch,
+        piDisabledDiscoveryPaths(currentDisabledSkillLaunchPaths(disabledSkillLaunch), [
+          path.join(configHome, 'skills'), path.join(os.homedir(), '.agents', 'skills'),
+          ...managedPackageResources.skills.map((skill) => skill.path),
+        ]));
+      await fs.writeFile(settingsPath, JSON.stringify(applyPiDisabledSkillSettings(settings,
+        currentDisabledSkillLaunchPaths(disabledSkillLaunch)), null, 2) + '\n', { mode: 0o600 });
     }
 
     const nativePackageRoots = nativePackagePaths.map((entry) => (
@@ -5291,6 +5330,7 @@ export class PiAgent extends BaseAgent {
           contextWindow: ctx.contextWindow || startupContextWindow,
           piCompactionPct: sessionPiAutoCompactPct,
           packages: nativePackagePaths,
+          disabledSkills: disabledSkillLaunch,
         },
       );
       nativeProviders = previousProviders;
@@ -5369,6 +5409,7 @@ export class PiAgent extends BaseAgent {
             contextWindow: ctx.contextWindow || startupContextWindow,
             piCompactionPct: sessionPiAutoCompactPct,
             packages: nativePackagePaths,
+            disabledSkills: disabledSkillLaunch,
           },
         );
         gatewayApiByModel.clear();
@@ -5699,6 +5740,7 @@ export class PiAgent extends BaseAgent {
             contextWindow: nextWindow,
             piCompactionPct: sessionPiAutoCompactPct,
             packages: nativePackagePaths,
+            disabledSkills: disabledSkillLaunch,
           });
           if (!sdkSessionId) {
             throw new Error('pi: missing session path after model switch; cannot reload compaction settings');
@@ -5753,6 +5795,8 @@ export class PiAgent extends BaseAgent {
               fileOps,
               contextWindow: verifiedWindow,
               piCompactionPct: sessionPiAutoCompactPct,
+              packages: nativePackagePaths,
+              disabledSkills: disabledSkillLaunch,
             });
             const recalibrated = await proc.request({ type: 'switch_session', sessionPath: sdkSessionId });
             if (!recalibrated.success) {
@@ -5827,6 +5871,7 @@ export class PiAgent extends BaseAgent {
       getRuntimeCapabilities() {
         return runtimeCapabilityManifest;
       },
+      disabledSkillPaths: disabledSkillSnapshot,
       onRuntimeCapabilitiesChange(listener) {
         if (closed) {
           notifyRuntimeCapabilityListener(listener, undefined);
@@ -6334,6 +6379,18 @@ export class PiAgent extends BaseAgent {
         // was there becomes offerable again on the next durable poll.
         interactionResolverGeneration++;
         piSubagentApprovalDeferred.clear();
+      },
+
+      requiresModelSwitchRebuild(model, target) {
+        // Same-route configuration changes need models.json to be reloaded too.
+        // Ordinary route changes continue through Pi's existing switch_model path.
+        const provider = target?.providerId !== undefined ? target.providerId : mutableProviderId;
+        // The host stores XD (or null), while Pi runs the same gateway as cindy.
+        const contextSource = (id: string | null | undefined) =>
+          id == null || id === 'xd' || id === PI_PROVIDER_ID ? PI_PROVIDER_ID : id;
+        if (model !== mutableModel || contextSource(provider) !== contextSource(mutableProviderId)) return false;
+        const window = deps.resolveModelContextLimit?.(provider, model);
+        return typeof window === 'number' && window > 0 && window !== ctx.contextWindow;
       },
 
       async setModel(model: string, setOpts?: { providerId?: string | null; effort?: Effort }): Promise<void> {
@@ -6926,6 +6983,7 @@ export class PiAgent extends BaseAgent {
           description: skill.description,
           source: 'skill' as const,
           path: skill.path,
+          origin: 'package' as const,
           scope: 'user' as const,
           enabled: true,
           runtimeStatus: 'approved' as const,
