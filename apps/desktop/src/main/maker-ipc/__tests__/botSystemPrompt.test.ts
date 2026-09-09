@@ -324,6 +324,46 @@ describe('Bot Mode 的角色边界', () => {
     expect(worker).not.toContain('send_to_agent');
     expect(worker).not.toContain('start_session_task');
   });
+
+  it('botModeEnabled:false 时不注入说话习惯，即使传入 style', () => {
+    const style = {
+      tone: 'custom' as const,
+      customTone: '像实验室记录员一样说话',
+      addressUserAs: 'Chris',
+      selfName: '小助',
+    };
+    const worker = buildBotStableTier({
+      ...base,
+      capabilities: {
+        toolsets: [],
+        memoryEnabled: false,
+        partnerActionsEnabled: false,
+        ownSkillsEnabled: false,
+        botModeEnabled: false,
+      },
+      style,
+    });
+    expect(worker).not.toContain('## 说话习惯');
+    expect(worker).not.toContain('说话习惯');
+    expect(worker).not.toContain('Chris');
+    expect(worker).not.toContain('小助');
+    expect(worker).not.toContain('像实验室记录员一样说话');
+
+    const canonical = buildBotStableTier({
+      ...base,
+      capabilities: {
+        toolsets: [],
+        memoryEnabled: false,
+        partnerActionsEnabled: false,
+        ownSkillsEnabled: false,
+        botModeEnabled: true,
+      },
+      style,
+    });
+    expect(canonical).toContain('## 说话习惯');
+    expect(canonical).toContain('称呼用户为「Chris」');
+    expect(canonical).toContain('自称「小助」');
+  });
 });
 
 /**

@@ -257,7 +257,10 @@ export function buildBotStableTier(input: BotSystemPromptInput): string {
   if (capabilityParts.length > 0) {
     parts.push(['# 你会做什么', ...capabilityParts].join('\n\n'));
   }
-  const styleGuidance = buildBotStyleGuidance(input.style);
+  // Style is a Bot Mode voice. Route/worker/delegation sessions pass
+  // botModeEnabled=false so they keep Cindy's normal Session prompt and
+  // do not impersonate the originating Bot.
+  const styleGuidance = botModeEnabled ? buildBotStyleGuidance(input.style) : '';
   if (styleGuidance) parts.push(styleGuidance);
   return parts.filter(Boolean).join('\n\n');
 }

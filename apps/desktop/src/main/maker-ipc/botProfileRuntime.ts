@@ -847,7 +847,7 @@ export async function hydrateBotProfileRuntime(
       && promptCapabilities.partnerActionsEnabled && deps.listTeammates
       ? await deps.listTeammates({ excludeBotId: row.botId }).catch(() => [])
       : [];
-  const style = normalizeBotStyle(config.style);
+  const style = row.role === 'canonical' ? normalizeBotStyle(config.style) : undefined;
   const promptInput: BotSystemPromptInput = {
     displayName: profile.displayName,
     identity,
