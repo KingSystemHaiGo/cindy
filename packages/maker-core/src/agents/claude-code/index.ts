@@ -1494,7 +1494,6 @@ export class ClaudeCodeAgent extends BaseAgent {
     const makerMemoryEnabled = makerMemoryFlag === true && !!makerMemory;
     // SSH remote 的 workingDir 是远端路径 — store 定位统一经 scope key,
     // 键规则与理由见 buildMemoryScopeKey (memory/storage.ts)。
-    // startSession 保持同步: worktree 归一化收敛到 getStore 边界。
     const memoryScopeKey =
       opts.makerMemoryScopeKey ?? buildMemoryScopeKey(opts.workingDir, opts.remoteHostId);
     // This per-session injection flag must not mutate the shared manager.
