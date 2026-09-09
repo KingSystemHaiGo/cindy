@@ -97,7 +97,7 @@ export interface MergeFileResult {
 /** 单个 legacy 分片的迁移结果。 */
 export interface ShardMigrationResult {
   shard: LegacyShardInfo;
-  action: 'removed-empty' | 'renamed' | 'merged' | 'skipped';
+  action: 'removed-empty' | 'renamed' | 'merged' | 'skipped' | 'rename-incomplete';
   mergedFiles?: MergeFileResult[];
   error?: string;
 }
@@ -107,6 +107,10 @@ export interface RunMigrationOptions {
   backupRoot?: string;
   /** 注入依赖 (测试用)。 */
   deps?: LegacyShardMigrationDeps;
+  /** 测试注入: dropStaleFts 用的单文件 rm (Codex 3971991067)。 */
+  rmFile?: (filePath: string) => Promise<void>;
+  /** 测试注入: 替换 rename (Codex 3971991063)。 */
+  rename?: (from: string, to: string) => Promise<void>;
 }
 
 export interface RunMigrationResult {
@@ -126,14 +130,28 @@ export interface ApplyMigrationSummary {
   }>;
   conflicts: Array<{ dir: string; filename: string }>;
   failed: Array<{ dir: string; reason: string | null }>;
-  /** 无解析失败分片时为 true; CLI 应将 !ok 标为部分失败非 0 退出。 */
+  executionErrors: Array<{ dir: string; action: ShardMigrationResult['action']; error: string }>;
+  /** 无解析失败、无执行期错误、无未解决冲突时为 true (Codex 3971991063)。 */
   ok: boolean;
+}
+
+function isExecutionFailure(r: ShardMigrationResult): boolean {
+  if (r.action === 'skipped' || r.action === 'rename-incomplete') return true;
+  // merged 但带 error = 源目录因冲突/未识别文件保留, 自动化不得当成功。
+  return Boolean(r.error);
 }
 
 export function summarizeApplyMigration(
   plan: LegacyShardMigrationPlan,
   result: RunMigrationResult,
 ): ApplyMigrationSummary {
+  const executionErrors = result.results
+    .filter(isExecutionFailure)
+    .map((r) => ({
+      dir: r.shard.dir,
+      action: r.action,
+      error: r.error ?? r.action,
+    }));
   return {
     shards: result.results.map((r) => ({
       dir: r.shard.dir,
@@ -147,7 +165,11 @@ export function summarizeApplyMigration(
       dir: s.dir,
       reason: s.skipReason ?? null,
     })),
-    ok: plan.failed.length === 0,
+    executionErrors,
+    ok:
+      plan.failed.length === 0 &&
+      executionErrors.length === 0 &&
+      result.conflicts.length === 0,
   };
 }
 
@@ -425,6 +447,8 @@ export async function runLegacyShardMigration(
 ): Promise<RunMigrationResult> {
   const { backupRoot, deps } = opts;
   const now = deps?.now ?? (() => new Date().toISOString());
+  const renameFn = opts.rename ?? ((from: string, to: string) => fs.rename(from, to));
+  const dropFtsFn = (dir: string) => dropStaleFts(dir, opts.rmFile);
   const result: RunMigrationResult = { results: [], conflicts: [] };
 
   // ── 1. 空分片删除 ───────────────────────────────────────────────
@@ -450,7 +474,7 @@ export async function runLegacyShardMigration(
       // 无法进入待删目录 (与备份目录同层, 名字带后缀避免冲突)。
       const trashName = `${path.basename(shard.dir)}.trash-${now().replace(/[:.]/g, '-')}`;
       const trashDir = path.join(path.dirname(shard.dir), trashName);
-      await fs.rename(shard.dir, trashDir);
+      await renameFn(shard.dir, trashDir);
       // 最终复查 (rename 后, 删前): 合法分片 + 未识别 .md 都要查 — 首次复查
       // 之后、rename 之前写入的 notes.md 等未识别文件同样不能被删 (Greptile
       // review on #2519 第三轮)。
@@ -482,7 +506,7 @@ export async function runLegacyShardMigration(
       if (!targetExists) {
         // 快路径: canonical 分片不存在 → rename 整个目录
         if (backupRoot) await backupDir(shard.dir, backupRoot);
-        await fs.rename(shard.dir, targetDir);
+        await renameFn(shard.dir, targetDir);
         // meta.absPath 更新为 canonical scope key (原值 = 旧 worktree 路径)
         await updateMetaAbsPath(targetDir, shard.canonicalScopeKey, now());
         // 重建 MEMORY.md — legacy 分片索引可能缺失/过期 (写入与重建之间崩溃
@@ -492,9 +516,15 @@ export async function runLegacyShardMigration(
         // 丢弃 legacy 的 fts.db 与 sidecar — FTS 曾有更新失败时文件新但行数
         // 碰巧匹配, sanityCheck() 只对比行数 → memory_search 一直返回 stale
         // 行。删除后下次打开由 sanity check 以文件为 source of truth 重建
-        // (Codex review on #2519 第十六轮)。
-        await dropStaleFts(targetDir);
-        r.action = 'renamed';
+        // (Codex review on #2519 第十六轮)。rm 失败不得报 renamed
+        // (Codex #2519 3971991067): 旧 fts.db 残留会让新 store 撞 stale FTS。
+        try {
+          await dropFtsFn(targetDir);
+          r.action = 'renamed';
+        } catch (e) {
+          r.action = 'rename-incomplete';
+          r.error = `stale fts.db remove failed: ${String(e)}`;
+        }
       } else {
         // 慢路径: 逐文件合并
         if (backupRoot) await backupDir(shard.dir, backupRoot);
@@ -552,7 +582,7 @@ export async function runLegacyShardMigration(
         // 第六轮: 复查完成后 fs.rm 前的写入仍会被删)。
         const trashName = `${path.basename(shard.dir)}.trash-${now().replace(/[:.]/g, '-')}`;
         const trashDir = path.join(path.dirname(shard.dir), trashName);
-        await fs.rename(shard.dir, trashDir);
+        await renameFn(shard.dir, trashDir);
         // 最终复查 (rename 后, 删前): 未识别 + 文件名集合 + **内容对比** —
         // 存量会话在 findChangedAfterMerge 之后、rename 之前更新同名记忆时,
         // trash 集合不变但内容新, 只查集合会删掉新版本 (Greptile/Codex
@@ -628,13 +658,23 @@ async function rebuildIndexFile(targetDir: string): Promise<void> {
  * 删除后下次打开由 sanity check 以文件为 source of truth 重建 (Codex
  * review on #2519 第十六轮)。文件不存在时静默。
  */
-async function dropStaleFts(dir: string): Promise<void> {
+async function dropStaleFts(
+  dir: string,
+  rmFile?: (filePath: string) => Promise<void>,
+): Promise<void> {
+  const rm = rmFile ?? ((p: string) => fs.rm(p, { force: true }));
+  const errors: string[] = [];
   for (const name of ['fts.db', 'fts.db-wal', 'fts.db-shm']) {
     try {
-      await fs.rm(path.join(dir, name), { force: true });
-    } catch {
-      // 删除失败不阻塞迁移 (下次 sanity check 会重建/告警)
+      await rm(path.join(dir, name));
+    } catch (e) {
+      // ENOENT 由 force:true 覆盖; 其它错误 (Windows 锁 / ACL) 必须 surface
+      // (Codex #2519 3971991067), 不能假定下次 sanityCheck 会重建。
+      errors.push(`${name}: ${String(e)}`);
     }
+  }
+  if (errors.length > 0) {
+    throw new Error(errors.join('; '));
   }
 }
 

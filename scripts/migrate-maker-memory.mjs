@@ -187,12 +187,15 @@ async function main() {
   const lines = apply.shards;
   const conflicts = apply.conflicts;
   const failed = apply.failed;
+  const executionErrors = apply.executionErrors;
 
   if (!opts.json) {
     const doneLabel = apply.ok ? '迁移完成' : '迁移部分失败';
     process.stdout.write(
       `${doneLabel}: ${lines.length} 个分片处理` +
         (failed.length > 0 ? `; 解析失败 ${failed.length}` : '') +
+        (executionErrors.length > 0 ? `; 执行失败 ${executionErrors.length}` : '') +
+        (conflicts.length > 0 ? `; 冲突 ${conflicts.length}` : '') +
         `\n\n`,
     );
     for (const l of lines) {
@@ -215,6 +218,12 @@ async function main() {
         process.stdout.write(`  - ${s.dir}${s.reason ? ` (${s.reason})` : ''}\n`);
       }
     }
+    if (executionErrors.length > 0) {
+      process.stdout.write(`\n执行失败 (${executionErrors.length}):\n`);
+      for (const s of executionErrors) {
+        process.stdout.write(`  - ${s.dir} [${s.action}] ${s.error}\n`);
+      }
+    }
   }
   // 迁移后复查宿主 (Greptile review on #2519 第十三轮: 进程快照通过后宿主
   // 可能启动 — 迁移期间活动会话向已删除的原目录写入会 ENOENT)。CLI 侧无法
@@ -232,6 +241,7 @@ async function main() {
       shards: lines,
       conflicts,
       failed,
+      executionErrors,
       ok: apply.ok,
     })}\n`,
   );

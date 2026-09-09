@@ -308,6 +308,7 @@ describe('runLegacyShardMigration — 执行', () => {
     const result = await runLegacyShardMigration(plan);
     expect(result.conflicts).toHaveLength(1);
     expect(result.conflicts[0].filename).toBe('feedback_a.md');
+    expect(summarizeApplyMigration(plan, result).ok).toBe(false);
     expect(result.results[0].mergedFiles).toEqual([
       { filename: 'feedback_a.md', outcome: 'conflict-skipped' },
     ]);
@@ -741,6 +742,52 @@ describe('runLegacyShardMigration — 执行', () => {
     expect(apply.ok).toBe(false);
     expect(apply.shards.some((s) => s.dir.endsWith(otherDir))).toBe(true);
     expect(apply.shards.some((s) => s.dir.endsWith(liveDir))).toBe(false);
+  });
+
+  it('执行期 rename 失败 → ok=false 且错误列出 (Codex 3971991063)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const worktree = path.join(tmpRoot, 'repo-wt');
+    const wtDir = sanitizeWorkdir(worktree);
+    await makeShard(wtDir, { absPath: worktree, files: { 'feedback_a.md': 'X' } });
+
+    const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+    const result = await runLegacyShardMigration(plan, {
+      rename: async () => {
+        throw new Error('EACCES rename');
+      },
+    });
+    expect(result.results[0].action).toBe('skipped');
+    expect(result.results[0].error).toMatch(/EACCES rename/);
+    const apply = summarizeApplyMigration(plan, result);
+    expect(apply.ok).toBe(false);
+    expect(apply.executionErrors).toHaveLength(1);
+    expect(apply.executionErrors[0].error).toMatch(/EACCES rename/);
+    expect(apply.failed).toHaveLength(0);
+  });
+
+  it('stale fts.db rm 失败 → rename-incomplete, 不报 renamed (Codex 3971991067)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const worktree = path.join(tmpRoot, 'repo-wt');
+    const wtDir = sanitizeWorkdir(worktree);
+    const mainDir = sanitizeWorkdir(mainRepo);
+    const wtPath = await makeShard(wtDir, { absPath: worktree, files: { 'feedback_a.md': 'X' } });
+    await fs.writeFile(path.join(wtPath, 'fts.db'), Buffer.from('stale-fts'));
+
+    const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+    const result = await runLegacyShardMigration(plan, {
+      rmFile: async (filePath) => {
+        if (String(filePath).includes('fts.db')) throw new Error('EBUSY fts.db');
+      },
+    });
+    expect(result.results[0].action).toBe('rename-incomplete');
+    expect(result.results[0].action).not.toBe('renamed');
+    expect(result.results[0].error).toMatch(/stale fts.db remove failed/);
+    const apply = summarizeApplyMigration(plan, result);
+    expect(apply.ok).toBe(false);
+    expect(apply.executionErrors).toHaveLength(1);
+    // 目录已搬到 canonical, 但不得按成功 renamed 汇报
+    await expect(fs.stat(path.join(memoryRoot, wtDir))).rejects.toThrow();
+    expect(await fs.readFile(path.join(memoryRoot, mainDir, 'feedback_a.md'), 'utf8')).toContain('X');
   });
 
   it('慢路径合并: plan 后写入的合法分片被一并合并, 数据不丢 (Codex 第四轮: 快照后写入)', async () => {

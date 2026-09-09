@@ -32,9 +32,10 @@ export function buildJsonResult(payload: unknown, isError = false): MemoryToolRe
  */
 export async function withStore(
   deps: MemoryMcpDeps,
-  fn: (store: MakerMemoryStore) => Promise<unknown>,
+  fn: (store: MakerMemoryStore, scopeKey: string) => Promise<unknown>,
 ): Promise<MemoryToolResult> {
   let store: MakerMemoryStore;
+  let scopeKey = '';
   let scopeAtEntry: string | null = null;
   try {
     const manager = deps.getManager();
@@ -52,15 +53,37 @@ export async function withStore(
     const workdir = ctx?.workingDir ?? deps.workdir;
     // SSH remote 会话 (ctx 带 remoteHostId) 的 workdir 是远端路径 — 经 scope
     // key 定位, 与 agent 启动注入 (claude-code/codex index.ts) 同一键规则。
-    store = await manager.getStore(
-      ctx?.memoryScopeKey ?? await resolveMemoryScopeKey(workdir, ctx?.remoteHostId),
-    );
+    // scopeKey 透传给 fn (#4124): memory_write 需要 scope 判定 bot-only 类型
+    // (moment 仅伙伴记忆可用), 门禁在 store 层 + MCP 边界双重强制。
+    //
+    // 本地路径的外层 resolveMemoryScopeKey 缓存未命中时最长数秒 (Codex
+    // #2519 3971991054)。该 await 发生在 getStore 的 owner 守卫之前: 期间切
+    // 账号后 getStore 会以新 owner 为入口绑 store, 后置复核只能报错、无法
+    // 撤销已发生的写/删。与 manager.getStore 同款: await 前捕获, await 后
+    // 立刻复核, 不一致 fail-closed, 不调用 getStore。
+    if (ctx?.memoryScopeKey) {
+      scopeKey = ctx.memoryScopeKey;
+    } else {
+      const resolveScope = deps.resolveMemoryScopeKey ?? resolveMemoryScopeKey;
+      scopeKey = await resolveScope(workdir, ctx?.remoteHostId);
+      if (scopeAtEntry !== null && manager.currentOwnerScopeKey?.() !== scopeAtEntry) {
+        return buildJsonResult(
+          {
+            ok: false,
+            code: 'MAKER_MEMORY_NOT_READY',
+            message: 'owner scope changed during scope resolve; refusing to open store',
+          },
+          true,
+        );
+      }
+    }
+    store = await manager.getStore(scopeKey);
   } catch (err) {
     const { code, message } = classifyMemoryError(err);
     return buildJsonResult({ ok: false, code, message }, true);
   }
   try {
-    const data = await fn(store);
+    const data = await fn(store, scopeKey);
     // 操作后复核: owner 在 fn 执行期间切换 → 结果不可信, 不得按成功返回。
     if (scopeAtEntry !== null && deps.getManager().currentOwnerScopeKey?.() !== scopeAtEntry) {
       return buildJsonResult(
