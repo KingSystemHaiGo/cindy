@@ -93,6 +93,8 @@ describe('稳定层:能力必须写进提示词', () => {
     expect(all).toContain('重要的「时刻」也走同一道门槛');
     expect(all).not.toContain('不要等他重复第二次');
     expect(all).toContain('不能拿来改 SOUL');
+    expect(all).toContain('用 memory_write 记成 type moment');
+    expect(all).not.toContain('bot_memory');
     expect(all).toContain('save_bot_skill');
     expect(all).toContain('第一次验证完就');
     expect(all).toContain('开后台任务，也可以给伙伴发消息');
@@ -114,6 +116,23 @@ describe('稳定层:能力必须写进提示词', () => {
     expect(none).not.toContain('save_bot_skill');
     expect(none).not.toContain('create_teammate');
     expect(none).not.toContain('make_pptx');
+  });
+
+  it('Pi facade 形态用 bot_memory 写时刻,MCP 形态维持 memory_write', () => {
+    const memoryCaps = {
+      toolsets: [] as string[],
+      memoryEnabled: true,
+      partnerActionsEnabled: false,
+      ownSkillsEnabled: false,
+    };
+    const mcp = buildBotStableTier(input({ capabilities: memoryCaps }));
+    expect(mcp).toContain('用 memory_write 记成 type moment');
+    expect(mcp).not.toContain('bot_memory');
+    const pi = buildBotStableTier(
+      input({ capabilities: memoryCaps, memoryToolName: 'bot_memory' }),
+    );
+    expect(pi).toContain('用 bot_memory(action:"write")记成 type "moment"');
+    expect(pi).not.toContain('memory_write');
   });
 
   it('交付纪律恒在:要真做出来,被挡住说实话,不许编', () => {

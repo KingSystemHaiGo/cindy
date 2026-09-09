@@ -853,6 +853,7 @@ export async function hydrateBotProfileRuntime(
     identity,
     capabilities: promptCapabilities,
     ...(style ? { style } : {}),
+    ...(opts.agentKind === 'pi' ? { memoryToolName: 'bot_memory' } : {}),
     skillIndex: ownSkills.map((item) => ({
       name: item.name,
       ...(item.description ? { description: item.description } : {}),
