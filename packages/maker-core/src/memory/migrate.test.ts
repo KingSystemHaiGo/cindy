@@ -70,6 +70,11 @@ async function makeShard(
   return dir;
 }
 
+/** 在主仓登记 Cindy 托管 worktree 元数据 (模拟 `.git/worktrees/<name>`)。 */
+async function registerManagedWorktree(mainRepo: string, worktreeName: string): Promise<void> {
+  await fs.mkdir(path.join(mainRepo, '.git', 'worktrees', worktreeName), { recursive: true });
+}
+
 describe('planLegacyShardMigration — 计划生成', () => {
   it('worktree 分片 (目录名 ≠ canonical) 归入 merge/empty, 主仓分片跳过', async () => {
     const mainRepo = path.join(tmpRoot, 'repo');
@@ -121,6 +126,8 @@ describe('planLegacyShardMigration — 计划生成', () => {
     expect(plan.skipped[0].dir.endsWith(sshDir)).toBe(true);
     expect(plan.mergeCandidates).toHaveLength(0);
     expect(plan.emptyToDelete).toHaveLength(0);
+    // skipped 不进 plan.all; CLI totalShards 必须把 skipped 算进去
+    expect(plan.all.length + plan.skipped.length).toBe(1);
   });
 
   it('本地路径 sanitize 后恰好以 ssh- 开头的目录 → 按 meta 判定为本地分片, 不误跳 (Codex 第五轮)', async () => {
@@ -144,6 +151,27 @@ describe('planLegacyShardMigration — 计划生成', () => {
     expect(plan.skipped).toHaveLength(1);
     expect(plan.skipped[0].dir).toBe(orphan);
     expect(plan.mergeCandidates).toHaveLength(0);
+    expect(plan.all.length + plan.skipped.length).toBe(1);
+  });
+
+  it('SSH + 无 meta 同时存在时, 扫描总数 = all + skipped (Codex 第十六轮: totalShards)', async () => {
+    const sshDir = `ssh-host-${'b'.repeat(16)}`;
+    await makeShard(sshDir, {
+      absPath: 'ssh:other-host:/remote/repo',
+      files: { 'feedback_a.md': 'x' },
+    });
+    const orphan = path.join(memoryRoot, 'orphan-dir');
+    await fs.mkdir(orphan, { recursive: true });
+    const mainRepo = path.join(tmpRoot, 'repo');
+    await makeShard(sanitizeWorkdir(mainRepo), {
+      absPath: mainRepo,
+      files: { 'feedback_a.md': 'x' },
+    });
+
+    const plan = await planLegacyShardMigration(memoryRoot);
+    expect(plan.skipped).toHaveLength(2);
+    expect(plan.all).toHaveLength(1);
+    expect(plan.all.length + plan.skipped.length).toBe(3);
   });
 
   it('canonical 目录名 == 当前目录名 → 非 legacy (归一化幂等)', async () => {
@@ -386,6 +414,7 @@ describe('runLegacyShardMigration — 执行', () => {
     const mainRepo = path.join(tmpRoot, 'repo');
     // 已归档/删除的 worktree: resolver live 探测会回落原样 (fake resolver 返回自身)
     const archivedWt = path.join(mainRepo, '.cindy-worktrees', 'feat-x');
+    await registerManagedWorktree(mainRepo, 'feat-x');
     const wtDir = sanitizeWorkdir(archivedWt);
     await makeShard(wtDir, { absPath: archivedWt, files: { 'feedback_a.md': 'X' } });
 
@@ -439,6 +468,7 @@ describe('runLegacyShardMigration — 执行', () => {
   it('.xdt-worktrees 旧形态同样静态推导 (Codex 第二轮: 品牌迁移前布局)', async () => {
     const mainRepo = path.join(tmpRoot, 'repo');
     const archivedWt = path.join(mainRepo, '.xdt-worktrees', 'feat-x', 'apps', 'a');
+    await registerManagedWorktree(mainRepo, 'feat-x');
     const wtDir = sanitizeWorkdir(archivedWt);
     await makeShard(wtDir, { absPath: archivedWt, files: { 'feedback_a.md': 'X' } });
 
@@ -451,15 +481,20 @@ describe('runLegacyShardMigration — 执行', () => {
   });
 
   it('Windows 正斜杠路径的托管 worktree 静态推导 (Codex 第四轮: Desktop 归一化路径)', async () => {
-    // Desktop 存储把 Windows workingDir 归一化为正斜杠 — 静态推导必须能认
-    const archivedWt = 'C:/repo/.cindy-worktrees/wt/apps/a';
-    const wtDir = sanitizeWorkdir(archivedWt);
-    await makeShard(wtDir, { absPath: archivedWt, files: { 'feedback_a.md': 'X' } });
+    // Desktop 存储把 Windows workingDir 归一化为正斜杠 — 静态推导必须能认。
+    // 证据校验走真实 fs, 所以主仓/.git/worktrees/<name> 建在 tmp 里, meta.absPath
+    // 仍写正斜杠形态 (与 Desktop 落盘一致)。
+    const mainRepo = path.join(tmpRoot, 'repo');
+    await registerManagedWorktree(mainRepo, 'wt');
+    const archivedWtFs = path.join(mainRepo, '.cindy-worktrees', 'wt', 'apps', 'a');
+    const archivedWtMeta = archivedWtFs.split(path.sep).join('/');
+    const wtDir = sanitizeWorkdir(archivedWtMeta);
+    await makeShard(wtDir, { absPath: archivedWtMeta, files: { 'feedback_a.md': 'X' } });
 
     const plan = await planLegacyShardMigration(memoryRoot);
     expect(plan.mergeCandidates).toHaveLength(1);
     expect(plan.mergeCandidates[0].canonicalScopeKey).toBe(
-      path.join('C:', 'repo', 'apps', 'a'),
+      path.join(mainRepo, 'apps', 'a'),
     );
     expect(plan.mergeCandidates[0].isLegacy).toBe(true);
   });
@@ -504,6 +539,7 @@ describe('runLegacyShardMigration — 执行', () => {
     const mainRepo = path.join(tmpRoot, 'repo');
     await fs.mkdir(path.join(mainRepo, '.git'), { recursive: true }); // 主仓标记
     const archivedWt = path.join(mainRepo, '.cindy-worktrees', 'feat-x', 'apps', 'a');
+    await registerManagedWorktree(mainRepo, 'feat-x');
     const wtDir = sanitizeWorkdir(archivedWt);
     await makeShard(wtDir, { absPath: archivedWt, files: { 'feedback_a.md': 'X' } });
 
@@ -512,6 +548,23 @@ describe('runLegacyShardMigration — 执行', () => {
     expect(plan.mergeCandidates).toHaveLength(1);
     expect(plan.mergeCandidates[0].canonicalScopeKey).toBe(path.join(mainRepo, 'apps', 'a'));
     expect(plan.mergeCandidates[0].isLegacy).toBe(true);
+  });
+
+  it('普通仓内同名 .cindy-worktrees/<name> 目录 → 不静态推导 (Codex 第十六轮)', async () => {
+    // 普通 checkout 根下碰巧有 .cindy-worktrees/feat-x, 任务 cwd 在其中;
+    // 没有 worktree `.git`、也没有主仓 `.git/worktrees/feat-x` 登记。
+    const mainRepo = path.join(tmpRoot, 'repo');
+    await fs.mkdir(path.join(mainRepo, '.git'), { recursive: true });
+    const coincidental = path.join(mainRepo, '.cindy-worktrees', 'feat-x');
+    const wtDir = sanitizeWorkdir(coincidental);
+    await makeShard(wtDir, { absPath: coincidental, files: { 'feedback_a.md': 'X' } });
+
+    const plan = await planLegacyShardMigration(memoryRoot);
+    expect(plan.mergeCandidates).toHaveLength(0);
+    expect(plan.emptyToDelete).toHaveLength(0);
+    const shard = plan.all.find((s) => s.dir.endsWith(wtDir));
+    expect(shard?.isLegacy).toBe(false);
+    expect(shard?.canonicalScopeKey).toBe(coincidental);
   });
 
   it('慢路径合并: plan 后写入的合法分片被一并合并, 数据不丢 (Codex 第四轮: 快照后写入)', async () => {

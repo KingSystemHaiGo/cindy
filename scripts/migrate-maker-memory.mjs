@@ -109,7 +109,9 @@ async function main() {
 
   const summarize = (p) => ({
     memoryRoot,
-    totalShards: p.all.length,
+    // skipped (SSH / 无 meta) 不进 plan.all, 但仍是扫描到的分片;
+    // 总数不含 skipped 时 dry-run 会显示 0 却列出多项跳过 (Codex #2519)。
+    totalShards: p.all.length + p.skipped.length,
     legacy: p.emptyToDelete.length + p.mergeCandidates.length,
     emptyToDelete: p.emptyToDelete.map((s) => s.dir),
     mergeCandidates: p.mergeCandidates.map((s) => ({

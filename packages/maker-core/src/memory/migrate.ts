@@ -170,14 +170,15 @@ export async function planLegacyShardMigration(
     // 用 `.cindy-worktrees/<name>` 路径形态做静态推导, 否则旧记录永远孤儿
     // (Codex review on #2519)。
     //
-    // 仅当该路径**不是活 git 仓库**时才推导 (Codex review on #2519 第十二
-    // 轮): 普通本地 checkout 恰好位于 `.cindy-worktrees`/`.xdt-worktrees`
-    // 目录下时 (如 /home/me/.cindy-worktrees/proj), resolver 正确返回原样
-    // 但无条件推导会把 canonical 错误改写 — dry-run 报假 legacy、apply 把
-    // 记忆合并到错误 scope。isLiveGitRepo 探测 `.git` 标记: 活仓库跳过推导。
+    // 仅当该路径**不是活 git 仓库**、且能证明是 Cindy 托管 worktree 时才
+    // 推导 (Codex review on #2519 第十二/十六轮): 普通仓内恰好有同名
+    // `.cindy-worktrees/<name>` 目录时, resolver 正确返回原样; 仅凭目录名
+    // 止步会忽略上层 `.git`, 把普通 checkout 误并进主仓 scope。活仓库跳过
+    // 推导; 无托管证据 (worktree `.git` 或 `<main>/.git/worktrees/<name>`)
+    // 也不推导。
     if (canonicalScopeKey === (meta.absPath || entry)) {
       const raw = meta.absPath || entry;
-      if (!(await isLiveGitRepo(raw))) {
+      if (!(await isLiveGitRepo(raw)) && (await hasManagedWorktreeEvidence(raw))) {
         const derived = deriveCanonicalFromCindyWorktreePath(raw);
         if (derived) canonicalScopeKey = derived;
       }
@@ -564,13 +565,16 @@ async function countShardFiles(dir: string): Promise<number> {
  * 但遍历祖先对**已归档的托管 worktree** 误伤: /repo/.cindy-worktrees/<name>/
  * 的 <name> 已删除后 worktree 无 .git, 而主仓 /repo/.git 仍存在 — 遍历命中
  * 主仓标记会判活仓库、跳过静态推导, 记忆永远孤儿 (Codex review on #2519
- * 第十五轮)。因此遍历**止步于托管 worktree 根 (含 worktree 名)**: 该根
- * 及以下有 .git 才算活仓库, 主仓祖先不参与判定。非托管形态 (无
- * .cindy-worktrees/.xdt-worktrees 段) 保持遍历到根的行为。
+ * 第十五轮)。因此仅在**有托管证据**时遍历才止步于托管 worktree 根: 该根
+ * 及以下有 .git 才算活仓库, 主仓祖先不参与判定。普通仓内同名目录没有
+ * worktree `.git`、也没有 `<main>/.git/worktrees/<name>` 登记时, 不把该段
+ * 当托管根, 继续向上找真正的仓库标记 (Codex review on #2519 第十六轮)。
+ * 非托管形态保持遍历到根的行为。
  */
 async function isLiveGitRepo(p: string): Promise<boolean> {
   const abs = path.resolve(p);
-  const stop = managedWorktreeRoot(abs); // null = 非托管形态, 遍历到根
+  const stop =
+    (await hasManagedWorktreeEvidence(abs)) ? managedWorktreeRoot(abs) : null;
   let cur = abs;
   for (;;) {
     try {
@@ -583,6 +587,35 @@ async function isLiveGitRepo(p: string): Promise<boolean> {
     const parent = path.dirname(cur);
     if (parent === cur) return false;
     cur = parent;
+  }
+}
+
+/**
+ * 路径是否有 Cindy 托管 worktree 证据, 而非仅目录名碰巧叫
+ * `.cindy-worktrees/<name>`。证据任一即可:
+ *   1. 托管根 (含 worktree 名) 自身有 `.git` 标记 (活 worktree / 未清 gitdir)
+ *   2. 主仓登记 `<mainRoot>/.git/worktrees/<name>` (归档后磁盘目录已删,
+ *      但 git 仍保留 worktree 元数据, 直至 prune)
+ * 都没有则视为普通仓内的同名目录, 禁止静态推导 (Codex review on #2519
+ * 第十六轮)。
+ */
+async function hasManagedWorktreeEvidence(absPath: string): Promise<boolean> {
+  const root = managedWorktreeRoot(absPath);
+  if (!root) return false;
+  try {
+    const s = await fs.stat(path.join(root, '.git'));
+    if (s.isDirectory() || s.isFile()) return true;
+  } catch {
+    // 归档 worktree 通常已无 .git, 继续看主仓登记
+  }
+  const worktreeName = path.basename(root);
+  const mainRoot = path.dirname(path.dirname(root));
+  if (!worktreeName || !mainRoot) return false;
+  try {
+    const s = await fs.stat(path.join(mainRoot, '.git', 'worktrees', worktreeName));
+    return s.isDirectory() || s.isFile();
+  } catch {
+    return false;
   }
 }
 
