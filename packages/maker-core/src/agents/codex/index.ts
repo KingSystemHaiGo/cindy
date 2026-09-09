@@ -202,6 +202,7 @@ import {
   CONTACTS_RULES_ENABLED,
 } from '../../contacts/system-prompt.js';
 import { MemoryFlushController } from '../../memory/flush-controller.js';
+import { buildMemoryScopeKey } from '../../memory/storage.js';
 import { resolveMemoryScopeKey } from '../../memory/scope-resolver.js';
 import { CODEX_AGENT_COMMANDS } from './commands.js';
 import {
@@ -3210,10 +3211,14 @@ export class CodexAgent extends BaseAgent {
       : opts.makerMemoryEnabled ?? this.deps.runtimeConfig.makerMemoryEnabled ?? false;
     const makerMemory = this.deps.makerMemory;
     const makerMemoryEnabled = makerMemoryFlag === true && !!makerMemory;
-    // SSH remote 的 workingDir 是远端路径 — store 定位统一经 scope key,
-    // 键规则与理由见 buildMemoryScopeKey (memory/storage.ts)。
-    const memoryScopeKey =
-      opts.makerMemoryScopeKey ?? await resolveMemoryScopeKey(opts.workingDir, opts.remoteHostId);
+    // SSH remote 的 workingDir 是远端路径 — store 定位统一经 scope key。
+    // 未开 maker memory 时不 spawn git (保持 startSession 同步路径,
+    // 避免 elicitation/compacting 事件被 git await 挤出断言窗口;
+    // #2519 CodexAgent start 时序)。真正打开 store 时再 await 归一化。
+    const memoryScopeKey = opts.makerMemoryScopeKey
+      ?? (makerMemoryEnabled
+        ? await resolveMemoryScopeKey(opts.workingDir, opts.remoteHostId)
+        : buildMemoryScopeKey(opts.workingDir, opts.remoteHostId));
     // This per-session injection flag must not mutate the shared manager.
     if (makerMemoryEnabled && makerMemory) {
       try {
