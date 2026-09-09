@@ -13,7 +13,12 @@ import { z } from 'zod';
 import { withStore } from './_shared.js';
 import type { MemoryMcpDeps } from '../types.js';
 import type { MemoryToolRegistry } from '../cindy_memoryToolRegistry.js';
-import { isBotOnlyMemoryType, MemoryError, parseBotMemoryScopeKey } from '@cindy/maker-core';
+import {
+  buildFilename,
+  isBotOnlyMemoryType,
+  MemoryError,
+  parseBotMemoryScopeKey,
+} from '@cindy/maker-core';
 
 export function registerMemoryConsolidateTool(registry: MemoryToolRegistry, deps: MemoryMcpDeps): void {
   registry.register({
@@ -53,11 +58,16 @@ export function registerMemoryConsolidateTool(registry: MemoryToolRegistry, deps
         if (isBotOnlyMemoryType(target.type) && parseBotMemoryScopeKey(scopeKey) === null) {
           throw new MemoryError('invalid-type', 'moment 仅伙伴(bot)记忆可用; 当前 scope 不是 bot 记忆');
         }
-        // sourceSession 不暴露给模型: 只从当前 session ctx 注入, 缺 ctx 则不带该字段。
+        // sourceSession 不暴露给模型: 仅新建 target 时从当前 session ctx 注入;
+        // 已存在走 update, 不注入, 让 storage 保留原分片溯源。缺 ctx 则不带该字段。
         const sessionId = deps.getSessionContext?.()?.sessionId?.trim();
+        const targetFilename = buildFilename(target.type, target.name);
+        const targetExists = (await store.list()).some((record) => record.filename === targetFilename);
+        const nextTarget =
+          !targetExists && sessionId ? { ...target, sourceSession: sessionId } : { ...target };
         return store.consolidate({
           sources,
-          target: sessionId ? { ...target, sourceSession: sessionId } : { ...target },
+          target: nextTarget,
         });
       }),
   });

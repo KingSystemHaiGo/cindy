@@ -102,9 +102,13 @@ describe('稳定层:能力必须写进提示词', () => {
     expect(all).toContain('写长期记忆必须先过门槛');
     expect(all).toContain('不要在普通一轮里默认记');
     expect(all).toContain('重要的「时刻」也走同一道门槛');
+    expect(all).toContain('用户明确让你记住的时刻');
+    expect(all).toContain('对话里已经确认过要记的重大事件');
+    expect(all).toContain('发布、里程碑、重大纠偏本身不是独立触发');
+    expect(all).not.toContain('一起完成且以后还用得上的重大节点');
     expect(all).not.toContain('不要等他重复第二次');
     expect(all).toContain('不能拿来改 SOUL');
-    expect(all).toContain('用 memory_write 记成 type moment');
+    expect(all).toContain('才用 memory_write 记成 type moment');
     expect(all).not.toContain('bot_memory');
     expect(all).toContain('save_bot_skill');
     expect(all).toContain('第一次验证完就');
@@ -137,12 +141,12 @@ describe('稳定层:能力必须写进提示词', () => {
       ownSkillsEnabled: false,
     };
     const mcp = buildBotStableTier(input({ capabilities: memoryCaps }));
-    expect(mcp).toContain('用 memory_write 记成 type moment');
+    expect(mcp).toContain('才用 memory_write 记成 type moment');
     expect(mcp).not.toContain('bot_memory');
     const pi = buildBotStableTier(
       input({ capabilities: memoryCaps, memoryToolName: 'bot_memory' }),
     );
-    expect(pi).toContain('用 bot_memory(action:"write")记成 type "moment"');
+    expect(pi).toContain('才用 bot_memory(action:"write")记成 type "moment"');
     expect(pi).not.toContain('memory_write');
   });
 

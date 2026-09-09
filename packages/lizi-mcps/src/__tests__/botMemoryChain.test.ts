@@ -152,6 +152,7 @@ async function modelWritesMemory(
     title: string;
     description: string;
     body: string;
+    mode?: 'create' | 'update' | 'append';
     occurredAt?: string;
     significance?: string;
     sourceSession?: string;
@@ -590,6 +591,71 @@ describe('moment 类型严格限定伙伴作用域 (#4124)', () => {
     expect(moment?.frontmatter.sourceSession).toBeUndefined();
   });
 
+  it('create 缺省与显式 create 都注入当前 session; update 不覆盖原 sourceSession', async () => {
+    const creator = await connectBotSession({
+      agentKind: 'claude-code',
+      sessionId: 'session-moment-create',
+      memoryScopeKey: buildBotMemoryScopeKey(BOT_ID),
+    });
+    try {
+      expect(
+        (
+          await modelWritesMemory(creator.client, {
+            type: 'moment',
+            name: 'keep-origin',
+            title: '首次记下',
+            description: '缺省 create 应注入当前 session',
+            body: '原始时刻。',
+          })
+        ).ok,
+      ).toBe(true);
+      expect(
+        (
+          await modelWritesMemory(creator.client, {
+            type: 'moment',
+            name: 'explicit-create',
+            title: '显式新建',
+            description: 'mode create 也应注入当前 session',
+            body: '另一条原始时刻。',
+            mode: 'create',
+          })
+        ).ok,
+      ).toBe(true);
+    } finally {
+      await creator.cleanup();
+    }
+
+    const editor = await connectBotSession({
+      agentKind: 'claude-code',
+      sessionId: 'session-moment-update',
+      memoryScopeKey: buildBotMemoryScopeKey(BOT_ID),
+    });
+    try {
+      expect(
+        (
+          await modelWritesMemory(editor.client, {
+            type: 'moment',
+            name: 'keep-origin',
+            title: '修订后的时刻',
+            description: 'update 不得改写原始溯源',
+            body: '编辑后的时刻。',
+            mode: 'update',
+          })
+        ).ok,
+      ).toBe(true);
+    } finally {
+      await editor.cleanup();
+    }
+
+    const records = await botMemoryList(BOT_ID);
+    expect(records.find((record) => record.slug === 'keep-origin')?.frontmatter.sourceSession).toBe(
+      'session-moment-create',
+    );
+    expect(records.find((record) => record.slug === 'explicit-create')?.frontmatter.sourceSession).toBe(
+      'session-moment-create',
+    );
+  });
+
   it('伙伴会话可将三条 moment 合并成一条 moment, 旧分片从存储中删除', async () => {
     const session = await connectBotSession({
       agentKind: 'claude-code',
@@ -674,6 +740,77 @@ describe('moment 类型严格限定伙伴作用域 (#4124)', () => {
     expect(target.frontmatter.occurredAt).toBe('2026-09-08');
     expect(target.frontmatter.significance).toBe('high');
     expect(target.frontmatter.sourceSession).toBe('session-moment-consolidate');
+  });
+
+  it('consolidate 更新已存在的 target 时保留原 sourceSession', async () => {
+    const creator = await connectBotSession({
+      agentKind: 'claude-code',
+      sessionId: 'session-moment-target-origin',
+      memoryScopeKey: buildBotMemoryScopeKey(BOT_ID),
+    });
+    try {
+      expect(
+        (
+          await modelWritesMemory(creator.client, {
+            type: 'moment',
+            name: 'moment-chapter',
+            title: '已有章节',
+            description: 'consolidate 将覆盖这条 target',
+            body: '原始章节。',
+            occurredAt: '2026-09-01',
+          })
+        ).ok,
+      ).toBe(true);
+      expect(
+        (
+          await modelWritesMemory(creator.client, {
+            type: 'moment',
+            name: 'moment-extra',
+            title: '待并入的片段',
+            description: '合并进已有章节',
+            body: '额外片段。',
+            occurredAt: '2026-09-02',
+          })
+        ).ok,
+      ).toBe(true);
+    } finally {
+      await creator.cleanup();
+    }
+
+    const editor = await connectBotSession({
+      agentKind: 'claude-code',
+      sessionId: 'session-moment-target-update',
+      memoryScopeKey: buildBotMemoryScopeKey(BOT_ID),
+    });
+    try {
+      const consolidated = parseEnvelope(
+        await editor.client.callTool({
+          name: 'call_tool',
+          arguments: {
+            name: 'memory_consolidate',
+            args: {
+              sources: ['moment_moment-extra.md'],
+              target: {
+                type: 'moment',
+                name: 'moment-chapter',
+                title: '合并后的已有章节',
+                description: '覆盖已存在的 target',
+                body: '原始章节加上额外片段。',
+                occurredAt: '2026-09-08',
+                significance: 'high',
+              },
+            },
+          },
+        }),
+      );
+      expect(consolidated.ok).toBe(true);
+    } finally {
+      await editor.cleanup();
+    }
+
+    const records = await botMemoryList(BOT_ID);
+    expect(records.map((record) => record.filename)).toEqual(['moment_moment-chapter.md']);
+    expect(records[0]?.frontmatter.sourceSession).toBe('session-moment-target-origin');
   });
 
   it('项目会话的 moment consolidate 被 MCP 边界拒绝为 INVALID_PARAMS', async () => {
