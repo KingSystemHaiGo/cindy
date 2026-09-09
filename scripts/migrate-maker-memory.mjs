@@ -25,6 +25,7 @@ import process from 'node:process';
 import {
   planLegacyShardMigration,
   runLegacyShardMigration,
+  summarizeApplyMigration,
 } from '../packages/maker-core/src/memory/migrate.ts';
 
 const HELP = `migrate-maker-memory — 存量 worktree 分片迁移 (P0 第二阶段, #2379)
@@ -180,17 +181,20 @@ async function main() {
     ...(opts.noBackup ? {} : { backupRoot: path.resolve(opts.backupDir) }),
   });
 
-  const lines = result.results.map((r) => ({
-    dir: r.shard.dir,
-    action: r.action,
-    records: r.shard.recordCount,
-    mergedFiles: r.mergedFiles ?? undefined,
-    error: r.error ?? undefined,
-  }));
-  const conflicts = result.conflicts.map((c) => ({ dir: c.dir, filename: c.filename }));
+  // plan.failed 不进 run() 结果; 漏报会让 Git 探测失败仍 0 退出
+  // (Codex review on #2519 3971230679)。
+  const apply = summarizeApplyMigration(plan, result);
+  const lines = apply.shards;
+  const conflicts = apply.conflicts;
+  const failed = apply.failed;
 
   if (!opts.json) {
-    process.stdout.write(`迁移完成: ${lines.length} 个分片处理\n\n`);
+    const doneLabel = apply.ok ? '迁移完成' : '迁移部分失败';
+    process.stdout.write(
+      `${doneLabel}: ${lines.length} 个分片处理` +
+        (failed.length > 0 ? `; 解析失败 ${failed.length}` : '') +
+        `\n\n`,
+    );
     for (const l of lines) {
       process.stdout.write(`[${l.action}] ${l.dir}${l.error ? ` — ${l.error}` : ''}\n`);
       if (l.mergedFiles) {
@@ -205,6 +209,12 @@ async function main() {
         process.stdout.write(`  - ${c.dir}/${c.filename}\n`);
       }
     }
+    if (failed.length > 0) {
+      process.stdout.write(`\n解析失败 (${failed.length}):\n`);
+      for (const s of failed) {
+        process.stdout.write(`  - ${s.dir}${s.reason ? ` (${s.reason})` : ''}\n`);
+      }
+    }
   }
   // 迁移后复查宿主 (Greptile review on #2519 第十三轮: 进程快照通过后宿主
   // 可能启动 — 迁移期间活动会话向已删除的原目录写入会 ENOENT)。CLI 侧无法
@@ -216,8 +226,16 @@ async function main() {
     warn('   迁移以合并遗漏内容。');
   }
   process.stdout.write(
-    `RESULT ${JSON.stringify({ mode: 'apply', backupDir: opts.backupDir ?? null, shards: lines, conflicts })}\n`,
+    `RESULT ${JSON.stringify({
+      mode: 'apply',
+      backupDir: opts.backupDir ?? null,
+      shards: lines,
+      conflicts,
+      failed,
+      ok: apply.ok,
+    })}\n`,
   );
+  if (!apply.ok) process.exitCode = 1;
 }
 
 /**

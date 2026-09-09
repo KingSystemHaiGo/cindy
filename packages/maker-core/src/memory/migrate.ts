@@ -115,6 +115,42 @@ export interface RunMigrationResult {
   conflicts: Array<{ dir: string; filename: string }>;
 }
 
+/** --apply CLI 汇总: 必须含 plan.failed, 否则 Git 探测失败仍 0 退出 (Codex 3971230679)。 */
+export interface ApplyMigrationSummary {
+  shards: Array<{
+    dir: string;
+    action: ShardMigrationResult['action'];
+    records: number;
+    mergedFiles?: MergeFileResult[];
+    error?: string;
+  }>;
+  conflicts: Array<{ dir: string; filename: string }>;
+  failed: Array<{ dir: string; reason: string | null }>;
+  /** 无解析失败分片时为 true; CLI 应将 !ok 标为部分失败非 0 退出。 */
+  ok: boolean;
+}
+
+export function summarizeApplyMigration(
+  plan: LegacyShardMigrationPlan,
+  result: RunMigrationResult,
+): ApplyMigrationSummary {
+  return {
+    shards: result.results.map((r) => ({
+      dir: r.shard.dir,
+      action: r.action,
+      records: r.shard.recordCount,
+      mergedFiles: r.mergedFiles ?? undefined,
+      error: r.error ?? undefined,
+    })),
+    conflicts: result.conflicts.map((c) => ({ dir: c.dir, filename: c.filename })),
+    failed: plan.failed.map((s) => ({
+      dir: s.dir,
+      reason: s.skipReason ?? null,
+    })),
+    ok: plan.failed.length === 0,
+  };
+}
+
 /**
  * 扫描 maker-memory 根目录下所有分片, 生成迁移计划。
  * 纯只读, 不修改任何文件 (dry-run 安全)。
@@ -669,17 +705,20 @@ async function countShardFiles(dir: string): Promise<number> {
  * 非托管形态保持遍历到根的行为。
  */
 async function isLiveGitRepo(p: string): Promise<boolean> {
-  const abs = path.resolve(p);
-  const managed = managedWorktreeRoot(abs);
+  // 托管根从原始 absPath 重建 (保留 POSIX 前导 /), 不要 path.resolve 后再
+  // 比 stop: Windows 会把 `/repo/.cindy-worktrees/wt` 绑到当前盘, 且错误
+  // 重建的相对 stop 永远对不上绝对祖先, 命中主仓 `.git` 误判存活
+  // (Codex review on #2519 3971230671)。
+  const managed = managedWorktreeRoot(p);
   let stop: string | null = null;
   if (managed) {
-    const evidence = await hasManagedWorktreeEvidence(abs);
+    const evidence = await hasManagedWorktreeEvidence(p);
     const rootStillThere = await dirExists(managed);
     // 登记还在, 或 worktree remove 后目录已消失 → 止步托管根, 不把主仓 .git
     // 当活仓库。目录还在且无登记 → 普通仓同名路径, 继续向上。
     if (evidence || !rootStillThere) stop = managed;
   }
-  let cur = abs;
+  let cur = p;
   for (;;) {
     try {
       const s = await fs.stat(path.join(cur, '.git'));
@@ -687,11 +726,24 @@ async function isLiveGitRepo(p: string): Promise<boolean> {
     } catch {
       // 继续向上
     }
-    if (stop !== null && cur === stop) return false; // 托管根未命中 → 非活仓库
+    if (stop !== null && sameLocalPath(cur, stop)) return false; // 托管根未命中 → 非活仓库
     const parent = path.dirname(cur);
     if (parent === cur) return false;
     cur = parent;
   }
+}
+
+function sameLocalPath(a: string, b: string): boolean {
+  const norm = (s: string): string => {
+    const n = s.replace(/\\/g, '/').replace(/\/+$/, '');
+    return n === '' ? '/' : n;
+  };
+  const na = norm(a);
+  const nb = norm(b);
+  if (process.platform === 'win32' || looksLikeWindowsLocalPath(a) || looksLikeWindowsLocalPath(b)) {
+    return na.toLowerCase() === nb.toLowerCase();
+  }
+  return na === nb;
 }
 
 /**
@@ -749,13 +801,22 @@ async function shouldDeriveArchivedManagedWorktree(absPath: string): Promise<boo
  * 或 `.xdt-worktrees/<name>` 段 (两种分隔符), 返回该段整体路径; 无托管段
  * 返回 null。
  */
-function managedWorktreeRoot(absPath: string): string | null {
+export function managedWorktreeRoot(absPath: string): string | null {
   const segments = absPath.split(/[\\/]/);
   for (let i = 0; i < segments.length - 1; i += 1) {
     if (!MANAGED_WORKTREE_DIRS.includes(segments[i])) continue;
     const worktreeName = segments[i + 1];
     if (worktreeName.length === 0) continue;
-    return segments.slice(0, i + 2).join(path.sep);
+    // 保留 path.parse(absPath).root: 不要 segments.join(path.sep) /
+    // path.join('') — POSIX `/repo/.cindy-worktrees/wt` 的空首段会被丢掉,
+    // 变成相对 `repo/...`, dirExists / isLiveGitRepo stop 对不上, 已删
+    // worktree 误判存活 (Codex review on #2519 3971230671)。
+    const reconstructed = prefixSegmentsToMainRoot(segments.slice(0, i + 2), absPath);
+    if (reconstructed === null) continue;
+    if (looksLikeWindowsLocalPath(absPath) || process.platform === 'win32') {
+      return normalizeWindowsLocalScopeKey(reconstructed);
+    }
+    return reconstructed;
   }
   return null;
 }

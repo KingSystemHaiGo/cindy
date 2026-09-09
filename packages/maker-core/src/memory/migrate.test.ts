@@ -17,8 +17,10 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   deriveCanonicalFromCindyWorktreePath,
+  managedWorktreeRoot,
   planLegacyShardMigration,
   runLegacyShardMigration,
+  summarizeApplyMigration,
   type LegacyShardMigrationDeps,
 } from './migrate.js';
 import { normalizeWindowsLocalScopeKey } from './scope-resolver.js';
@@ -599,6 +601,18 @@ describe('runLegacyShardMigration — 执行', () => {
     expect(deriveCanonicalFromCindyWorktreePath('/.cindy-worktrees/name')).toBe('/');
   });
 
+  it('managedWorktreeRoot 保留 POSIX 前导斜杠 (Codex 3971230671)', () => {
+    expect(managedWorktreeRoot('/repo/.cindy-worktrees/wt')).toBe('/repo/.cindy-worktrees/wt');
+    expect(managedWorktreeRoot('/repo/.cindy-worktrees/wt/apps/a')).toBe('/repo/.cindy-worktrees/wt');
+    expect(managedWorktreeRoot('/.cindy-worktrees/name')).toBe('/.cindy-worktrees/name');
+    expect(managedWorktreeRoot('C:/repo/.cindy-worktrees/wt')).toBe('C:/repo/.cindy-worktrees/wt');
+    expect(managedWorktreeRoot('C:/.cindy-worktrees/name')).toBe('C:/.cindy-worktrees/name');
+    expect(managedWorktreeRoot('C:\\repo\\.cindy-worktrees\\wt')).toBe('C:/repo/.cindy-worktrees/wt');
+    expect(managedWorktreeRoot('//server/share/repo/.cindy-worktrees/feat-x')).toBe(
+      '//server/share/repo/.cindy-worktrees/feat-x',
+    );
+  });
+
   it('meta.json 为 JSON null → 该分片 skipped, 其余继续 (Codex 第十七轮)', async () => {
     const mainRepo = path.join(tmpRoot, 'repo');
     const worktree = path.join(tmpRoot, 'repo-wt');
@@ -678,6 +692,55 @@ describe('runLegacyShardMigration — 执行', () => {
     expect(plan.failed[0].skipReason).toBe('worktree-resolve-failure');
     expect(plan.mergeCandidates).toHaveLength(1);
     expect(plan.mergeCandidates[0].dir.endsWith(otherDir)).toBe(true);
+  });
+
+  it('POSIX 绝对路径已删 worktree → 判死并静态推导 (Codex 3971230671)', async () => {
+    // 故意用 POSIX 前导 / 形态 (即使跑在 Windows CI): join(path.sep) 会丢掉
+    // 前导斜杠, stop 对不上, 若本机碰巧有 /repo/.git 会把已删 worktree 判活。
+    const posixMain = '/cindy-migrate-posix-dead-wt/repo';
+    const posixWt = `${posixMain}/.cindy-worktrees/feat-x`;
+    expect(managedWorktreeRoot(posixWt)).toBe(posixWt);
+    expect(managedWorktreeRoot(`${posixWt}/apps/a`)).toBe(posixWt);
+    const wtDir = sanitizeWorkdir(posixWt);
+    await makeShard(wtDir, { absPath: posixWt, files: { 'feedback_a.md': 'X' } });
+    // 不创建 worktree 目录、不登记 — 模拟 git worktree remove 之后
+    // identity resolver: live 探测失败回落原路径, 走 isLiveGitRepo + 静态推导
+
+    const plan = await planLegacyShardMigration(memoryRoot, {
+      resolveScopeKey: async (wd) => wd,
+    });
+    expect(plan.mergeCandidates).toHaveLength(1);
+    expect(plan.mergeCandidates[0].canonicalScopeKey).toBe(posixMain);
+    expect(plan.mergeCandidates[0].isLegacy).toBe(true);
+    expect(plan.failed).toHaveLength(0);
+  });
+
+  it('--apply 汇总含 plan.failed 且 ok=false (Codex 3971230679)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const liveWt = path.join(mainRepo, '.cindy-worktrees', 'feat-x');
+    await fs.mkdir(path.join(liveWt, '.git'), { recursive: true });
+    await registerManagedWorktree(mainRepo, 'feat-x');
+    const liveDir = sanitizeWorkdir(liveWt);
+    await makeShard(liveDir, { absPath: liveWt, files: { 'feedback_a.md': 'X' } });
+
+    const otherWt = path.join(tmpRoot, 'other-wt');
+    const otherDir = sanitizeWorkdir(otherWt);
+    await makeShard(otherDir, { absPath: otherWt, files: { 'feedback_b.md': 'Y' } });
+
+    const plan = await planLegacyShardMigration(memoryRoot, {
+      resolveScopeKey: async (wd: string) => {
+        if (fwd(wd) === fwd(liveWt)) return wd;
+        if (fwd(wd) === fwd(otherWt)) return fwd(mainRepo);
+        return wd;
+      },
+    });
+    const result = await runLegacyShardMigration(plan);
+    const apply = summarizeApplyMigration(plan, result);
+    expect(apply.failed).toHaveLength(1);
+    expect(apply.failed[0].reason).toBe('worktree-resolve-failure');
+    expect(apply.ok).toBe(false);
+    expect(apply.shards.some((s) => s.dir.endsWith(otherDir))).toBe(true);
+    expect(apply.shards.some((s) => s.dir.endsWith(liveDir))).toBe(false);
   });
 
   it('慢路径合并: plan 后写入的合法分片被一并合并, 数据不丢 (Codex 第四轮: 快照后写入)', async () => {
