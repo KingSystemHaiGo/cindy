@@ -273,11 +273,11 @@ export async function planLegacyShardMigration(
     // (Codex review on #2519)。
     //
     // 仅当该路径**不是活 git 仓库**、且能证明是 Cindy 托管 worktree 时才
-    // 推导 (Codex review on #2519 第十二/十六/十七轮): 普通仓内恰好有同名
-    // `.cindy-worktrees/<name>` 目录时, resolver 正确返回原样, 不推导。
-    // `git worktree remove` 会删掉 worktree 目录与 `.git/worktrees/<name>` 登记,
-    // 但 meta.absPath 仍是托管形态 — 记 unregistered-legacy, 仍静态推导,
-    // 否则归档分片永远孤儿。
+    // 推导 (Codex review on #2519 第十二/十六/七/二十一轮): 普通仓内恰好有
+    // 同名 `.cindy-worktrees/<name>` 目录时, resolver 正确返回原样, 不推导。
+    // 路径形态像托管但既无 `.git`/主仓登记、目录也已删 — 不能从
+    // 路径形态猜测 (Codex 3972854282): 普通 checkout 曾位于同名路径后
+    // 卸载时会被误并入祖先 scope。记 failed `ambiguous-managed-worktree`, 不自动迁移。
     //
     // 活托管 worktree 上 resolver 超时/失败也回落原路径, 且 isLiveGitRepo
     // 为真会压掉静态推导 → 静默 non-legacy、记忆孤儿。记 failed 并 surface
@@ -293,9 +293,19 @@ export async function planLegacyShardMigration(
         );
         continue;
       }
-      if (!live && (await shouldDeriveArchivedManagedWorktree(rawAbs))) {
-        const derived = deriveCanonicalFromCindyWorktreePath(rawAbs);
-        if (derived) canonicalScopeKey = derived;
+      if (!live) {
+        if (await shouldDeriveArchivedManagedWorktree(rawAbs)) {
+          const derived = deriveCanonicalFromCindyWorktreePath(rawAbs);
+          if (derived) canonicalScopeKey = derived;
+        } else {
+          const managed = managedWorktreeRoot(rawAbs);
+          if (managed && !(await dirExists(managed))) {
+            plan.failed.push(
+              await buildSkippedInfo(dir, entry, 'ambiguous-managed-worktree', rawAbs),
+            );
+            continue;
+          }
+        }
       }
     }
     const canonicalDirName = memoryScopeDirName(canonicalScopeKey);
@@ -343,17 +353,19 @@ export async function planLegacyShardMigration(
 }
 
 function canonicalizeMetaAbsPath(absPath: string): string {
-  const trimmed = absPath.trim();
-  if (process.platform === 'win32' || looksLikeWindowsLocalPath(trimmed)) {
-    return normalizeWindowsLocalScopeKey(trimmed);
+  // 不 trim: POSIX / Windows 都允许目录名尾空格; trim 会把 `/home/project `
+  // 改成 `/home/project`, 两者 sanitize 目录不同, 非 legacy 分片被误迁
+  // (Codex 3972854308)。全空串已在读 meta 时按 invalid-meta 拒绝, 不在这里改写身份。
+  if (process.platform === 'win32' || looksLikeWindowsLocalPath(absPath)) {
+    return normalizeWindowsLocalScopeKey(absPath);
   }
-  if (trimmed.length > 1) return trimmed.replace(/\/+$/, '');
-  return trimmed;
+  if (absPath.length > 1) return absPath.replace(/\/+$/, '');
+  return absPath;
 }
 
 function isAbsoluteLocalPath(p: string): boolean {
   if (path.isAbsolute(p)) return true;
-  // 跨平台规划: Linux CI 上 Windows 盘符/UNC 仍视为绝对, 相对盘符 C:foo 不算。
+  // 跨平台规划: Linux CI 上 Windows 盘符/UNC 仍视为绝对; 相对盘符 C:foo 与裸 C: 不算 (Codex 3972854297)。
   if (/^[A-Za-z]:\//.test(p)) return true;
   if (p.startsWith('//') && p.length > 2) return true;
   return false;
@@ -813,8 +825,9 @@ function sameLocalPath(a: string, b: string): boolean {
  *   1. 托管根 (含 worktree 名) 自身有 `.git` 标记 (活 worktree / 未清 gitdir)
  *   2. 主仓登记 `<mainRoot>/.git/worktrees/<name>` (归档后磁盘目录已删,
  *      但 git 仍保留 worktree 元数据, 直至 prune)
- * 都没有则视为普通仓内的同名目录, 禁止静态推导 (Codex review on #2519
- * 第十六轮)。
+ * 都没有则禁止静态推导: 目录还在 = 普通仓同名路径 (第十六轮);
+ * 目录已删 = 歧义, 由调用方标 `ambiguous-managed-worktree` 而非自动并入
+ * (Codex 3972854282)。
  */
 async function hasManagedWorktreeEvidence(absPath: string): Promise<boolean> {
   const root = managedWorktreeRoot(absPath);
@@ -846,15 +859,13 @@ async function hasGitWorktreeRegistration(absPath: string): Promise<boolean> {
 /**
  * 是否应对已归档托管路径做静态推导。
  * - 仍有 worktree `.git` 或 `.git/worktrees/<name>` 登记 → 是托管, 推导
- * - `git worktree remove` 后目录与登记都没了, 但 meta.absPath 仍是托管形态 →
- *   unregistered-legacy, 仍推导 (否则归档分片孤儿; Codex #2519 第十七轮)
+ * - 无证据且目录已删 → 不推导 (调用方标歧义; Codex 3972854282)
  * - 普通仓内同名目录还在磁盘上、且无登记 → 不推导 (第十六轮护栏)
  */
 async function shouldDeriveArchivedManagedWorktree(absPath: string): Promise<boolean> {
   const root = managedWorktreeRoot(absPath);
   if (!root) return false;
-  if (await hasManagedWorktreeEvidence(absPath)) return true;
-  return !(await dirExists(root));
+  return hasManagedWorktreeEvidence(absPath);
 }
 
 /**

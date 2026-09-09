@@ -224,7 +224,8 @@ function finalizeLocalScopeKey(key: string): string {
  *  - 折叠重复斜杠; 去掉尾随斜杠; 根盘保持 `C:/` (保留盘符大小写)
  *  - **不**把路径段改成小写: sanitizeWorkdir 区分 `C--Users` 与 `c--users`,
  *    全量小写会把已有分片拆开, 需独立迁移; cache/samePath 已大小写不敏感
- *  - 相对盘符 `C:foo` 不抬成 `C:/foo` (cwd 相关, 不稳定)
+ *  - 相对盘符 `C:foo` / 裸 `C:` 不抬成 `C:/foo` / `C:/` (cwd 相关, 不稳定;
+ *    Codex 3972854297: `C:` 是 drive-relative, 不等于 `C:/`)
  *  - ssh: / bot: 复合键不碰
  */
 export function normalizeWindowsLocalScopeKey(input: string): string {
@@ -258,7 +259,7 @@ export function normalizeWindowsLocalScopeKey(input: string): string {
     const letter = drive[1];
     const rest = drive[2];
     if (!rest.startsWith('/')) {
-      if (rest === '') return `${letter}/`;
+      // 裸 `C:` 与 `C:foo` 都是 drive-relative, 不抬成根盘 (Codex 3972854297)
       return `${letter}${rest}`;
     }
     const trimmed = rest.replace(/\/+$/, '');

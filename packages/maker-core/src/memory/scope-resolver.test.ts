@@ -287,7 +287,7 @@ describe('normalizeWindowsLocalScopeKey — 路径边界 (Codex #2519 第十九�
     expect(normalizeWindowsLocalScopeKey('C:/repo\\apps//a/')).toBe('C:/repo/apps/a');
     expect(normalizeWindowsLocalScopeKey('C:/')).toBe('C:/');
     expect(normalizeWindowsLocalScopeKey('C:\\')).toBe('C:/');
-    expect(normalizeWindowsLocalScopeKey('C:')).toBe('C:/');
+    expect(normalizeWindowsLocalScopeKey('C:')).toBe('C:'); // 裸盘符 drive-relative, 不抬成 C:/
     expect(normalizeWindowsLocalScopeKey('C:foo')).toBe('C:foo'); // 不抬成绝对
     expect(normalizeWindowsLocalScopeKey('C:/repo with space/项目')).toBe('C:/repo with space/项目');
   });

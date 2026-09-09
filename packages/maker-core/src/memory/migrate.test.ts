@@ -614,20 +614,25 @@ describe('runLegacyShardMigration — 执行', () => {
     expect(shard?.canonicalScopeKey).toBe(fwd(coincidental));
   });
 
-  it('git worktree remove 后无登记 → 归档分片仍静态推导 (Codex 第十七轮)', async () => {
-    // Session 清理走 git worktree remove: 托管目录与 .git/worktrees/<name> 都没了,
-    // 只剩 maker-memory 分片 + meta.absPath 的托管形态。
+  it('无托管证据且目录已删 → failed 歧义, 不自动推导 (Codex 3972854282)', async () => {
+    // 普通 checkout 曾位于 `.cindy-worktrees/<name>` 下后被卸载: 无 .git、
+    // 无 `.git/worktrees/<name>` 登记、磁盘目录也不在。路径形态不够当托管证据,
+    // 不得把记忆并入祖先 scope。
     const mainRepo = path.join(tmpRoot, 'repo');
     await fs.mkdir(path.join(mainRepo, '.git'), { recursive: true });
     const archivedWt = path.join(mainRepo, '.cindy-worktrees', 'feat-x');
     const wtDir = sanitizeWorkdir(archivedWt);
     await makeShard(wtDir, { absPath: archivedWt, files: { 'feedback_a.md': 'X' } });
-    // 不创建 worktree 目录、不登记 — 模拟 remove 之后
+    // 不创建 worktree 目录、不登记
 
     const plan = await planLegacyShardMigration(memoryRoot);
-    expect(plan.mergeCandidates).toHaveLength(1);
-    expect(plan.mergeCandidates[0].canonicalScopeKey).toBe(fwd(mainRepo));
-    expect(plan.mergeCandidates[0].isLegacy).toBe(true);
+    expect(plan.mergeCandidates).toHaveLength(0);
+    expect(plan.emptyToDelete).toHaveLength(0);
+    expect(plan.failed).toHaveLength(1);
+    expect(plan.failed[0].dir.endsWith(wtDir)).toBe(true);
+    expect(plan.failed[0].skipReason).toBe('ambiguous-managed-worktree');
+    const apply = summarizeApplyMigration(plan, { results: [], conflicts: [] });
+    expect(apply.ok).toBe(false);
   });
 
   it('根盘托管路径推导保留 C:/ 而不是 C: (Codex 第十七轮)', () => {
@@ -674,19 +679,41 @@ describe('runLegacyShardMigration — 执行', () => {
       deriveCanonicalFromCindyWorktreePath('\\\\server\\share\\repo\\.cindy-worktrees\\feat-x\\apps\\a'),
     ).toBe('//server/share/repo/apps/a');
     expect(normalizeWindowsLocalScopeKey('C:foo')).toBe('C:foo');
+    expect(normalizeWindowsLocalScopeKey('C:')).toBe('C:');
   });
 
-  it('相对盘符 C:foo 规划阶段 skipped (Codex 第十九轮)', async () => {
+  it('相对盘符 C:foo / 裸 C: 规划阶段 skipped (Codex 第十九轮 / 3972854297)', async () => {
     const mainRepo = path.join(tmpRoot, 'repo');
     const worktree = path.join(tmpRoot, 'repo-wt');
     const wtDir = sanitizeWorkdir(worktree);
     await makeShard(wtDir, { absPath: worktree, files: { 'feedback_a.md': 'X' } });
     await makeShard('rel-drive', { absPath: 'C:foo', files: { 'feedback_a.md': 'x' } });
+    await makeShard('bare-drive', { absPath: 'C:', files: { 'feedback_a.md': 'y' } });
 
     const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
-    const skipped = plan.skipped.find((s) => s.dir.endsWith('rel-drive'));
-    expect(skipped?.skipReason).toBe('relative-absPath');
+    expect(plan.skipped.find((s) => s.dir.endsWith('rel-drive'))?.skipReason).toBe('relative-absPath');
+    expect(plan.skipped.find((s) => s.dir.endsWith('bare-drive'))?.skipReason).toBe('relative-absPath');
     expect(plan.mergeCandidates).toHaveLength(1);
+    expect(plan.mergeCandidates[0].dir.endsWith(wtDir)).toBe(true);
+  });
+
+  it('absPath 尾空格不 trim, 不误判 legacy (Codex 3972854308)', async () => {
+    // 用 POSIX 形态, 避免 Windows 创建尾空格目录名失败; 身份仍是尾空格路径。
+    const repo = '/home/project ';
+    const dirName = sanitizeWorkdir(repo);
+    await makeShard(dirName, { absPath: repo, files: { 'feedback_a.md': 'x' } });
+
+    const plan = await planLegacyShardMigration(memoryRoot, {
+      resolveScopeKey: async (wd) => wd,
+    });
+    expect(plan.skipped).toHaveLength(0);
+    expect(plan.failed).toHaveLength(0);
+    expect(plan.mergeCandidates).toHaveLength(0);
+    expect(plan.emptyToDelete).toHaveLength(0);
+    expect(plan.all).toHaveLength(1);
+    expect(plan.all[0].isLegacy).toBe(false);
+    expect(plan.all[0].canonicalScopeKey).toBe(fwd(repo));
+    expect(plan.all[0].canonicalDirName).toBe(dirName);
   });
 
   it('相对路径 absPath 规划阶段 skipped, 其余分片继续 (Codex 第十八轮)', async () => {
@@ -746,10 +773,11 @@ describe('runLegacyShardMigration — 执行', () => {
     const plan = await planLegacyShardMigration(memoryRoot, {
       resolveScopeKey: async (wd) => wd,
     });
-    expect(plan.mergeCandidates).toHaveLength(1);
-    expect(plan.mergeCandidates[0].canonicalScopeKey).toBe(posixMain);
-    expect(plan.mergeCandidates[0].isLegacy).toBe(true);
-    expect(plan.failed).toHaveLength(0);
+    // 无登记、目录不存在 → 歧义, 不从路径形态并入 posixMain (Codex 3972854282)
+    expect(plan.mergeCandidates).toHaveLength(0);
+    expect(plan.failed).toHaveLength(1);
+    expect(plan.failed[0].skipReason).toBe('ambiguous-managed-worktree');
+    expect(plan.failed[0].dir.endsWith(wtDir)).toBe(true);
   });
 
   it('--apply 汇总含 plan.failed 且 ok=false (Codex 3971230679)', async () => {
