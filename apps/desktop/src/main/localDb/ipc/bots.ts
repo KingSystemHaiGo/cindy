@@ -531,7 +531,7 @@ async function readProfile(
     lastReadAt,
   );
   const config = parseJson(version?.capabilitiesJson ?? '{}');
-  const modelChain = readEffectiveBotModelChain(config);
+  const modelChain = await readEffectiveBotModelChain(config);
   const primaryModelRoute = modelChain[0];
   const invitation = botInvitationProgress(config.invitation);
   if (invitation && isManagedBotAvatarUrl(profile.avatar)) invitation.avatarSkipped = false;
@@ -808,19 +808,18 @@ async function fileExists(candidate: string): Promise<boolean> {
   }
 }
 
-function defaultNewBotCapabilities(): Record<string, unknown> {
-  let modelChain = readEffectiveBotModelChain({
+async function defaultNewBotCapabilities(): Promise<Record<string, unknown>> {
+  const modelChain = await readEffectiveBotModelChain({
     modelChainOverride: null,
     modelOverride: null,
   });
   const primary = modelChain[0] ?? {
     harness: 'pi' as const,
-    model: NEW_BOT_DEFAULT_PI_MODEL,
-    providerId: NEW_BOT_DEFAULT_PI_PROVIDER,
-    effort: NEW_BOT_DEFAULT_PI_EFFORT,
+    model: '',
+    providerId: null,
+    effort: '',
     fastMode: false,
   };
-  if (modelChain.length === 0) modelChain = [primary];
   return {
     ...primary,
     modelOverride: null,
@@ -989,7 +988,7 @@ export async function createBotProfile(raw: unknown) {
   }
   const persistedCapabilities = normalizeBotModelCapabilitiesOrThrow({
     permissions: 'auto',
-    ...(hasRequestedCapabilities ? {} : defaultNewBotCapabilities()),
+    ...(hasRequestedCapabilities ? {} : await defaultNewBotCapabilities()),
     ...requestedCapabilities,
     skills,
     userContextSource,
@@ -1093,7 +1092,7 @@ export function registerBotIpc(): void {
   setRemoteBotSessionLookup(readRemoteBotSessionAccess);
   ipcMain.handle('local-db:bots:model-chain-settings-get', async (event) => {
     assertTrustedAppRendererEvent(event);
-    const state = readBotModelChainSettingsState();
+    const state = await readBotModelChainSettingsState();
     return { modelChain: state.value.modelChain, isCustomized: state.isCustomized };
   });
 
@@ -1512,7 +1511,8 @@ export function registerBotIpc(): void {
     const invitation = botInvitationProgress(config.invitation);
     if (invitation && invitation.stage !== 'ready' && invitation.stage !== 'welcome')
       throwIpcError('PRECONDITION_FAILED', '伙伴正在准备见面');
-    const primaryRoute = readEffectiveBotModelChain(config)[0] ?? null;
+    const primaryRoute = (await readEffectiveBotModelChain(config))[0] ?? null;
+    if (!primaryRoute) throwIpcError('PRECONDITION_FAILED', '请先连接模型供应商或选择伙伴模型');
     const workspaceKind = 'dialogue' as const;
     const workingDir = await ensureBotWorkspaceDir(
       owner.userDataDir,
