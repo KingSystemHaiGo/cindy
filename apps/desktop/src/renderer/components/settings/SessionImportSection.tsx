@@ -457,8 +457,10 @@ function ScanSummary({ scan }: { scan: ScanResult }) {
   const { t } = useTranslation();
   const projectCount = scan.candidates.filter((item) => item.sidebarBucket === 'project').length;
   const dialogueCount = scan.candidates.length - projectCount;
+  const existingCount = scan.rejected.existing;
+  const managedDialogueCount = scan.rejected.managedDialogue ?? 0;
   return (
-    <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
+    <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-6">
       <SummaryCell
         label={t('settings.sessionImport.summary.total')}
         value={scan.candidates.length}
@@ -476,13 +478,18 @@ function ScanSummary({ scan }: { scan: ScanResult }) {
       />
       <SummaryCell
         label={t('settings.sessionImport.summary.filtered')}
-        value={
-          scan.rejected.codex
-          + scan.rejected.claude
-          + scan.rejected.existing
-          + (scan.rejected.managedDialogue ?? 0)
-        }
+        value={scan.rejected.codex + scan.rejected.claude}
         hint={buildFilteredHint(scan.rejected, t)}
+      />
+      <SummaryCell
+        label={t('settings.sessionImport.summary.existing')}
+        value={existingCount}
+        hint={t('settings.sessionImport.summary.existingHint')}
+      />
+      <SummaryCell
+        label={t('settings.sessionImport.summary.managedDialogue')}
+        value={managedDialogueCount}
+        hint={t('settings.sessionImport.summary.managedDialogueHint')}
       />
     </div>
   );
