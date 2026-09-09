@@ -21,7 +21,13 @@ import {
   runLegacyShardMigration,
   type LegacyShardMigrationDeps,
 } from './migrate.js';
+import { normalizeWindowsLocalScopeKey } from './scope-resolver.js';
 import { memoryScopeDirName, sanitizeWorkdir } from './storage.js';
+
+/** Windows 本地 key 一律正斜杠; POSIX 恒等。 */
+function fwd(p: string): string {
+  return p.replace(/\\/g, '/');
+}
 
 /** 临时 memory 根; 每个用例前重建。 */
 let tmpRoot: string;
@@ -41,7 +47,7 @@ afterEach(async () => {
 function fakeResolver(mainRepo: string, worktree: string): LegacyShardMigrationDeps {
   return {
     resolveScopeKey: async (wd: string) => {
-      if (wd === worktree) return mainRepo;
+      if (fwd(wd) === fwd(worktree)) return fwd(mainRepo);
       return wd;
     },
   };
@@ -423,7 +429,7 @@ describe('runLegacyShardMigration — 执行', () => {
     const plan = await planLegacyShardMigration(memoryRoot);
     expect(plan.mergeCandidates).toHaveLength(1);
     expect(plan.mergeCandidates[0].canonicalDirName).toBe(sanitizeWorkdir(mainRepo));
-    expect(plan.mergeCandidates[0].canonicalScopeKey).toBe(mainRepo);
+    expect(plan.mergeCandidates[0].canonicalScopeKey).toBe(fwd(mainRepo));
   });
 
   it('只有未识别 .md 的 legacy 分片不按空删 (Greptile 第二轮: 空分片误删未识别内容)', async () => {
@@ -478,7 +484,7 @@ describe('runLegacyShardMigration — 执行', () => {
     expect(plan.mergeCandidates[0].canonicalDirName).toBe(
       sanitizeWorkdir(path.join(mainRepo, 'apps', 'a')),
     );
-    expect(plan.mergeCandidates[0].canonicalScopeKey).toBe(path.join(mainRepo, 'apps', 'a'));
+    expect(plan.mergeCandidates[0].canonicalScopeKey).toBe(fwd(path.join(mainRepo, 'apps', 'a')));
   });
 
   it('Windows 正斜杠路径的托管 worktree 静态推导 (Codex 第四轮: Desktop 归一化路径)', async () => {
@@ -495,7 +501,7 @@ describe('runLegacyShardMigration — 执行', () => {
     const plan = await planLegacyShardMigration(memoryRoot);
     expect(plan.mergeCandidates).toHaveLength(1);
     expect(plan.mergeCandidates[0].canonicalScopeKey).toBe(
-      path.join(mainRepo, 'apps', 'a'),
+      fwd(path.join(mainRepo, 'apps', 'a')),
     );
     expect(plan.mergeCandidates[0].isLegacy).toBe(true);
   });
@@ -514,7 +520,7 @@ describe('runLegacyShardMigration — 执行', () => {
     expect(plan.emptyToDelete).toHaveLength(0);
     const shard = plan.all.find((s) => s.dir.endsWith(wtDir));
     expect(shard?.isLegacy).toBe(false);
-    expect(shard?.canonicalScopeKey).toBe(liveRepo);
+    expect(shard?.canonicalScopeKey).toBe(fwd(liveRepo));
   });
 
   it('活仓库子目录 (absPath 为 .cindy-worktrees 下子路径) → 祖先 .git 标记命中, 不推导 (Codex 第十四轮)', async () => {
@@ -531,7 +537,7 @@ describe('runLegacyShardMigration — 执行', () => {
     expect(plan.emptyToDelete).toHaveLength(0);
     const shard = plan.all.find((s) => s.dir.endsWith(wtDir));
     expect(shard?.isLegacy).toBe(false);
-    expect(shard?.canonicalScopeKey).toBe(workdir);
+    expect(shard?.canonicalScopeKey).toBe(fwd(workdir));
   });
 
   it('已归档托管 worktree (worktree 无 .git 但主仓有) → 仍静态推导 (Codex 第十五轮)', async () => {
@@ -547,7 +553,7 @@ describe('runLegacyShardMigration — 执行', () => {
     const plan = await planLegacyShardMigration(memoryRoot);
     // worktree 根及以下无 .git → 判非活仓库 → 静态推导映射到主仓
     expect(plan.mergeCandidates).toHaveLength(1);
-    expect(plan.mergeCandidates[0].canonicalScopeKey).toBe(path.join(mainRepo, 'apps', 'a'));
+    expect(plan.mergeCandidates[0].canonicalScopeKey).toBe(fwd(path.join(mainRepo, 'apps', 'a')));
     expect(plan.mergeCandidates[0].isLegacy).toBe(true);
   });
 
@@ -566,7 +572,7 @@ describe('runLegacyShardMigration — 执行', () => {
     expect(plan.emptyToDelete).toHaveLength(0);
     const shard = plan.all.find((s) => s.dir.endsWith(wtDir));
     expect(shard?.isLegacy).toBe(false);
-    expect(shard?.canonicalScopeKey).toBe(coincidental);
+    expect(shard?.canonicalScopeKey).toBe(fwd(coincidental));
   });
 
   it('git worktree remove 后无登记 → 归档分片仍静态推导 (Codex 第十七轮)', async () => {
@@ -581,7 +587,7 @@ describe('runLegacyShardMigration — 执行', () => {
 
     const plan = await planLegacyShardMigration(memoryRoot);
     expect(plan.mergeCandidates).toHaveLength(1);
-    expect(plan.mergeCandidates[0].canonicalScopeKey).toBe(mainRepo);
+    expect(plan.mergeCandidates[0].canonicalScopeKey).toBe(fwd(mainRepo));
     expect(plan.mergeCandidates[0].isLegacy).toBe(true);
   });
 
@@ -589,12 +595,8 @@ describe('runLegacyShardMigration — 执行', () => {
     const derived = deriveCanonicalFromCindyWorktreePath('C:/.cindy-worktrees/name');
     expect(derived).toBe('C:/');
     expect(memoryScopeDirName(derived!)).toBe('C--');
-    expect(deriveCanonicalFromCindyWorktreePath('C:/.cindy-worktrees/name/apps/a')).toBe(
-      path.join('C:/', 'apps', 'a'),
-    );
-    expect(deriveCanonicalFromCindyWorktreePath('/.cindy-worktrees/name')).toBe(
-      path.parse('/.cindy-worktrees/name').root || '/',
-    );
+    expect(deriveCanonicalFromCindyWorktreePath('C:/.cindy-worktrees/name/apps/a')).toBe('C:/apps/a');
+    expect(deriveCanonicalFromCindyWorktreePath('/.cindy-worktrees/name')).toBe('/');
   });
 
   it('meta.json 为 JSON null → 该分片 skipped, 其余继续 (Codex 第十七轮)', async () => {
@@ -611,6 +613,29 @@ describe('runLegacyShardMigration — 执行', () => {
     expect(plan.skipped.some((s) => s.dir === bad)).toBe(true);
     expect(plan.mergeCandidates).toHaveLength(1);
     expect(plan.mergeCandidates[0].dir.endsWith(wtDir)).toBe(true);
+  });
+
+  it('UNC 托管路径静态推导保留 //server/share 前缀 (Codex 第十九轮)', () => {
+    expect(
+      deriveCanonicalFromCindyWorktreePath('//server/share/repo/.cindy-worktrees/feat-x'),
+    ).toBe('//server/share/repo');
+    expect(
+      deriveCanonicalFromCindyWorktreePath('\\\\server\\share\\repo\\.cindy-worktrees\\feat-x\\apps\\a'),
+    ).toBe('//server/share/repo/apps/a');
+    expect(normalizeWindowsLocalScopeKey('C:foo')).toBe('C:foo');
+  });
+
+  it('相对盘符 C:foo 规划阶段 skipped (Codex 第十九轮)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const worktree = path.join(tmpRoot, 'repo-wt');
+    const wtDir = sanitizeWorkdir(worktree);
+    await makeShard(wtDir, { absPath: worktree, files: { 'feedback_a.md': 'X' } });
+    await makeShard('rel-drive', { absPath: 'C:foo', files: { 'feedback_a.md': 'x' } });
+
+    const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+    const skipped = plan.skipped.find((s) => s.dir.endsWith('rel-drive'));
+    expect(skipped?.skipReason).toBe('relative-absPath');
+    expect(plan.mergeCandidates).toHaveLength(1);
   });
 
   it('相对路径 absPath 规划阶段 skipped, 其余分片继续 (Codex 第十八轮)', async () => {
@@ -643,8 +668,8 @@ describe('runLegacyShardMigration — 执行', () => {
 
     const plan = await planLegacyShardMigration(memoryRoot, {
       resolveScopeKey: async (wd: string) => {
-        if (wd === liveWt) return liveWt; // 模拟 git 超时/失败回落原路径
-        if (wd === otherWt) return mainRepo;
+        if (fwd(wd) === fwd(liveWt)) return wd; // 模拟 git 超时/失败回落原路径
+        if (fwd(wd) === fwd(otherWt)) return fwd(mainRepo);
         return wd;
       },
     });

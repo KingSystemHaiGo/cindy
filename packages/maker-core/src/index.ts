@@ -74,6 +74,8 @@ export {
 } from './memory/storage.js';
 export {
   resolveMemoryScopeKey,
+  normalizeWindowsLocalScopeKey,
+  looksLikeWindowsLocalPath,
   __clearMemoryScopeKeyCacheForTests,
   type GitProbe,
   type ResolveMemoryScopeKeyDeps,

@@ -35,7 +35,11 @@ import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
 import { MemoryStorage, SSH_SCOPE_KEY_PREFIX, memoryScopeDirName, parseFilename } from './storage.js';
-import { resolveMemoryScopeKey } from './scope-resolver.js';
+import {
+  looksLikeWindowsLocalPath,
+  normalizeWindowsLocalScopeKey,
+  resolveMemoryScopeKey,
+} from './scope-resolver.js';
 
 /** meta.json 内容 (storage.ts MemoryStorageMeta 同形)。 */
 interface ShardMeta {
@@ -174,7 +178,7 @@ export async function planLegacyShardMigration(
     // 前缀: sanitizeWorkdir 允许本地路径 (如 /ssh/proj) 恰好产出 ssh- 开头的
     // 目录名, 按前缀误判会把本地 legacy 分片跳过成孤儿 (Codex review on
     // #2519 第五轮)。
-    const rawAbs = meta.absPath;
+    const rawAbs = canonicalizeMetaAbsPath(meta.absPath);
     const isRemote = rawAbs.startsWith(SSH_SCOPE_KEY_PREFIX);
     if (isRemote) {
       plan.skipped.push(await buildSkippedInfo(dir, entry, 'ssh', rawAbs));
@@ -183,7 +187,7 @@ export async function planLegacyShardMigration(
     // MemoryStorageMeta.absPath 约定绝对路径; 相对路径 (如 "..") 规划阶段
     // 拒绝, 否则 apply 会把目标解析到 memoryRoot 的父目录并删源
     // (Codex review on #2519 第十八轮)。
-    if (!path.isAbsolute(rawAbs)) {
+    if (!isAbsoluteLocalPath(rawAbs)) {
       plan.skipped.push(await buildSkippedInfo(dir, entry, 'relative-absPath', rawAbs));
       continue;
     }
@@ -268,6 +272,23 @@ export async function planLegacyShardMigration(
   return plan;
 }
 
+function canonicalizeMetaAbsPath(absPath: string): string {
+  const trimmed = absPath.trim();
+  if (process.platform === 'win32' || looksLikeWindowsLocalPath(trimmed)) {
+    return normalizeWindowsLocalScopeKey(trimmed);
+  }
+  if (trimmed.length > 1) return trimmed.replace(/\/+$/, '');
+  return trimmed;
+}
+
+function isAbsoluteLocalPath(p: string): boolean {
+  if (path.isAbsolute(p)) return true;
+  // 跨平台规划: Linux CI 上 Windows 盘符/UNC 仍视为绝对, 相对盘符 C:foo 不算。
+  if (/^[A-Za-z]:\//.test(p)) return true;
+  if (p.startsWith('//') && p.length > 2) return true;
+  return false;
+}
+
 async function buildSkippedInfo(
   dir: string,
   entry: string,
@@ -316,17 +337,20 @@ const WINDOWS_DRIVE_RE = /^[A-Za-z]:$/;
 function prefixSegmentsToMainRoot(prefixSegs: string[], original: string): string | null {
   const meaningful = prefixSegs.filter((s) => s.length > 0);
   if (meaningful.length === 0) {
-    return path.parse(original).root || '/';
+    if (original.startsWith('//') || original.startsWith('\\')) return '//';
+    return '/';
   }
   if (meaningful.length === 1 && WINDOWS_DRIVE_RE.test(meaningful[0])) {
-    const root = path.parse(original).root;
-    if (root && WINDOWS_DRIVE_RE.test(root.replace(/[\\/]+$/, ''))) {
-      return root.endsWith('/') || root.endsWith('\\') ? root.replace(/\\/g, '/') : `${root}/`;
-    }
     return `${meaningful[0]}/`;
   }
-  const joined = prefixSegs.join(path.sep);
-  return joined.length > 0 ? joined : null;
+  // UNC: ['', '', 'server', 'share'] 或 ['', 'server', 'share'] 经 split 后
+  const uncHost = prefixSegs[0] === '' && prefixSegs[1] === '' ? prefixSegs.slice(2) : null;
+  if (uncHost && uncHost.length >= 1) {
+    return '//' + uncHost.filter((s) => s.length > 0).join('/');
+  }
+  const joined = prefixSegs.filter((s) => s.length > 0).join('/');
+  if (joined.length === 0) return null;
+  return original.startsWith('/') ? `/${joined}` : joined;
 }
 
 export function deriveCanonicalFromCindyWorktreePath(absPath: string): string | null {
@@ -341,8 +365,12 @@ export function deriveCanonicalFromCindyWorktreePath(absPath: string): string | 
     if (worktreeName.length === 0) continue;
     const mainRoot = prefixSegmentsToMainRoot(segments.slice(0, i), absPath);
     if (mainRoot === null) continue;
-    const subPath = segments.slice(i + 2).filter((s) => s.length > 0).join(path.sep);
-    return subPath ? path.join(mainRoot, subPath) : mainRoot;
+    const subPath = segments.slice(i + 2).filter((s) => s.length > 0).join('/');
+    const joined = subPath ? `${mainRoot.replace(/\/+$/, '')}/${subPath}` : mainRoot;
+    if (looksLikeWindowsLocalPath(absPath) || process.platform === 'win32') {
+      return normalizeWindowsLocalScopeKey(joined);
+    }
+    return joined;
   }
   return null;
 }

@@ -19,6 +19,8 @@ import { beforeEach, describe, expect, it } from 'vitest';
 
 import {
   __clearMemoryScopeKeyCacheForTests,
+  looksLikeWindowsLocalPath,
+  normalizeWindowsLocalScopeKey,
   resolveMemoryScopeKey,
   type GitProbe,
 } from './scope-resolver.js';
@@ -130,8 +132,9 @@ describe('resolveMemoryScopeKey — fake probe 回落与缓存', () => {
       '/storage/.git',
       '/real/checkout',
     );
+    const mapped = path.join(path.resolve('/real/checkout'), 'apps', 'a');
     expect(await resolveMemoryScopeKey('/fake/wt/apps/a', null, { execGit: probe })).toBe(
-      path.join(path.resolve('/real/checkout'), 'apps', 'a'),
+      process.platform === 'win32' ? mapped.replace(/\\/g, '/') : mapped,
     );
   });
 
@@ -204,7 +207,23 @@ describe('resolveMemoryScopeKey — fake probe 回落与缓存', () => {
   });
 
   it.skipIf(process.platform !== 'win32')(
-    'Windows 风格路径: git 正斜杠输出 + 反斜杠 cwd 混合归一化',
+    'Windows 正反斜杠 cwd 命中同一缓存 (分隔符规范化后 cache key 稳定)',
+    async () => {
+      let calls = 0;
+      const probe: GitProbe = async () => {
+        calls += 1;
+        throw Object.assign(new Error('not a git repository'), { code: 128 });
+      };
+      await resolveMemoryScopeKey('C:\\cache-mix\\repo', null, { execGit: probe });
+      await resolveMemoryScopeKey('C:/cache-mix/repo', null, { execGit: probe });
+      await resolveMemoryScopeKey('\\\\server\\share\\r', null, { execGit: probe });
+      await resolveMemoryScopeKey('//server/share/r', null, { execGit: probe });
+      expect(calls).toBe(2);
+    },
+  );
+
+  it.skipIf(process.platform !== 'win32')(
+    'Windows 反斜杠 cwd 与正斜杠主仓收成同一正斜杠 key (Codex #2519 第十九轮 UNC/分隔符)',
     async () => {
       const probe = probeFor(
         'C:/repo/.cindy-worktrees/feat',
@@ -215,7 +234,7 @@ describe('resolveMemoryScopeKey — fake probe 回落与缓存', () => {
       const key = await resolveMemoryScopeKey('C:\\repo\\.cindy-worktrees\\feat\\apps\\a', null, {
         execGit: probe,
       });
-      expect(key).toBe('C:\\repo\\apps\\a');
+      expect(key).toBe('C:/repo/apps/a');
     },
   );
 
@@ -240,6 +259,46 @@ describe('resolveMemoryScopeKey — fake probe 回落与缓存', () => {
 
 // 默认 unit tier 唯一一条真实 Git smoke (§3.1): 端到端打通「真实 git 探测 +
 // 映射」主路径。组合矩阵见 scope-resolver.git-integration.test.ts。
+describe('normalizeWindowsLocalScopeKey — 路径边界 (Codex #2519 第十九轮)', () => {
+  // 路径边界审计 (分隔符 / 盘符 / UNC / \\?\\ / 空与相对盘符 / 特殊字符)
+  // 已由下列用例覆盖。symlink / junction / 大小写:
+  //  - 不额外 realpath, scope 跟 git toplevel (与 inode/junction 目标解耦)
+  //  - 不把路径段改成小写 (sanitizeWorkdir 区分 C--Users 与 c--users)
+  //  - cache/samePath 已大小写不敏感
+
+  it('UNC 正斜杠与反斜杠收成同一 //server/share 形态', () => {
+    expect(normalizeWindowsLocalScopeKey('\\\\server\\share\\repo')).toBe(
+      '//server/share/repo',
+    );
+    expect(normalizeWindowsLocalScopeKey('//server/share/repo')).toBe('//server/share/repo');
+    expect(normalizeWindowsLocalScopeKey('//server/share/repo/')).toBe('//server/share/repo');
+    expect(normalizeWindowsLocalScopeKey('//server//share///repo')).toBe('//server/share/repo');
+    expect(looksLikeWindowsLocalPath('//server/share/repo')).toBe(true);
+  });
+
+  it('长路径 \\\\?\\ 与 \\\\?\\UNC\\ 前缀剥掉后再规范化', () => {
+    expect(normalizeWindowsLocalScopeKey('\\\\?\\C:\\repo\\apps')).toBe('C:/repo/apps');
+    expect(normalizeWindowsLocalScopeKey('\\\\?\\UNC\\server\\share\\repo')).toBe(
+      '//server/share/repo',
+    );
+  });
+
+  it('盘符: 尾随斜杠/重复斜杠/根盘/相对盘符/混合分隔符', () => {
+    expect(normalizeWindowsLocalScopeKey('C:/repo\\apps//a/')).toBe('C:/repo/apps/a');
+    expect(normalizeWindowsLocalScopeKey('C:/')).toBe('C:/');
+    expect(normalizeWindowsLocalScopeKey('C:\\')).toBe('C:/');
+    expect(normalizeWindowsLocalScopeKey('C:')).toBe('C:/');
+    expect(normalizeWindowsLocalScopeKey('C:foo')).toBe('C:foo'); // 不抬成绝对
+    expect(normalizeWindowsLocalScopeKey('C:/repo with space/项目')).toBe('C:/repo with space/项目');
+  });
+
+  it('空串 / ssh / bot 不改写', () => {
+    expect(normalizeWindowsLocalScopeKey('')).toBe('');
+    expect(normalizeWindowsLocalScopeKey('ssh:host:/repo')).toBe('ssh:host:/repo');
+    expect(normalizeWindowsLocalScopeKey('bot:alice')).toBe('bot:alice');
+  });
+});
+
 describe.skipIf(!gitAvailable())('resolveMemoryScopeKey — 真实 Git smoke', () => {
   it('linked worktree 子目录 cwd → 主仓根 + 相对子路径', async () => {
     const tmpRoot = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'scope-resolver-')));
@@ -256,7 +315,10 @@ describe.skipIf(!gitAvailable())('resolveMemoryScopeKey — 真实 Git smoke', (
       git(['worktree', 'add', '-b', 'wt-branch', wt], repoRoot);
       const sub = path.join(wt, 'apps', 'a');
       await fs.mkdir(sub, { recursive: true });
-      expect(await resolveMemoryScopeKey(sub)).toBe(path.join(repoRoot, 'apps', 'a'));
+      const mapped = path.join(repoRoot, 'apps', 'a');
+      expect(await resolveMemoryScopeKey(sub)).toBe(
+        process.platform === 'win32' ? mapped.replace(/\\/g, '/') : mapped,
+      );
     } finally {
       try {
         await fs.rm(tmpRoot, { recursive: true, force: true, maxRetries: 3 });

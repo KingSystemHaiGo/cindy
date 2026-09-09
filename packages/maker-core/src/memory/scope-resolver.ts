@@ -120,8 +120,11 @@ export async function resolveMemoryScopeKey(
 
   const execGit = deps?.execGit;
   const now = deps?.now ?? (() => Date.now());
-  // Windows 路径大小写不敏感, 缓存 key 统一小写 (返回值保留原始大小写)。
-  const cacheKey = process.platform === 'win32' ? workingDir.toLowerCase() : workingDir;
+  // Windows: 大小写不敏感 + 正反斜杠/UNC 形态先收成稳定 key, 避免同一目录打两轮 git。
+  const cacheKey =
+    process.platform === 'win32'
+      ? normalizeWindowsLocalScopeKey(workingDir).toLowerCase()
+      : workingDir;
   const hit = scopeKeyCache.get(cacheKey);
   if (hit && hit.expiresAt > now()) return hit.value;
 
@@ -130,10 +133,14 @@ export async function resolveMemoryScopeKey(
     // 直接回落, 省掉一次进程 spawn (也避开 Windows 临时目录的 EPERM 竞争)。
     // 注入了 execGit 的调用方显式接管探测, 跳过预检。
     if (!execGit && !(await hasGitMarkerUpward(path.normalize(workingDir)).catch(() => true))) {
-      return workingDir;
+      return finalizeLocalScopeKey(workingDir);
     }
     // 任何失败都回落 cwd 原样 — 归一化是纯增强, 绝不让 git 探测故障阻断 memory。
-    return canonicalizeLocalWorkdir(workingDir, execGit ?? defaultExecGit).catch(() => workingDir);
+    const resolved = await canonicalizeLocalWorkdir(
+      workingDir,
+      execGit ?? defaultExecGit,
+    ).catch(() => workingDir);
+    return finalizeLocalScopeKey(resolved);
   })();
   scopeKeyCache.set(cacheKey, { value, expiresAt: now() + CACHE_TTL_MS });
   return value;
@@ -192,27 +199,82 @@ async function canonicalizeLocalWorkdir(workingDir: string, execGit: GitProbe): 
   // linked worktree: 子路径映射回主仓根下 (该路径在主仓可以不存在 —
   // scope key 只是身份字符串, 落盘目录名经 memoryScopeDirName 派生)。
   const rel = path.relative(toplevel, cwd);
-  if (rel === '') return matchSeparatorStyle(workingDir, mainRoot);
+  if (rel === '') return mainRoot;
   // cwd 不在 toplevel 下 (symlink/大小写风格不一致等) — 不猜, 回落。
+  // 不额外 realpath: scope 跟 git toplevel, 与 inode/junction 目标解耦。
   if (rel.startsWith('..') || path.isAbsolute(rel)) return workingDir;
-  const mapped = path.join(mainRoot, rel);
-  // Windows: Desktop 存正斜杠路径 (C:/repo), 但 path.normalize/join 在
-  // Windows 上产反斜杠 (C:\repo)。两者 sanitize 到同一磁盘目录, 而
-  // MakerMemoryManager 按 raw scope key 缓存 Store — 主 checkout 会话
-  // (正斜杠 key) 与 worktree 会话 (反斜杠 key) 会开两个实例指向同一
-  // SQLite/索引, 一侧写入后另一侧 MEMORY.md 缓存过期 (Codex review on
-  // #2519 第八轮)。返回与输入同拼写风格的结果, 保证同一目录只一个 key。
-  return matchSeparatorStyle(workingDir, mapped);
+  return path.join(mainRoot, rel);
 }
 
-/** 让 result 的分隔符风格与参考路径 (workingDir) 一致。Windows 专用。 */
-function matchSeparatorStyle(reference: string, result: string): string {
-  if (process.platform !== 'win32') return result;
-  // 仅当参考路径是 Windows 盘符正斜杠形态 (C:/repo — Desktop 存储的归一化
-  // 拼写) 时把结果转正斜杠, 与主 checkout 会话的 scope key 拼写一致;
-  // POSIX 风格路径 (/fake/...) 与反斜杠输入保持 path.join 默认行为。
-  if (/^[A-Za-z]:\//.test(reference)) return result.replace(/\\/g, '/');
-  return result;
+function finalizeLocalScopeKey(key: string): string {
+  if (process.platform === 'win32') return normalizeWindowsLocalScopeKey(key);
+  return key;
+}
+
+/**
+ * Windows 本地 scope key 的稳定形态 (Codex review on #2519 第八/十九轮)。
+ *
+ * MakerMemoryManager 用 raw 字符串当 Map key, memoryScopeDirName 却把
+ * `\` 与 `/` 收成同一磁盘目录。主 checkout (Desktop 正斜杠 / 正斜杠 UNC)
+ * 与 worktree (`path.join` 反斜杠 / `\\server\share`) 必须收成同一 key。
+ *
+ * 规则:
+ *  - 分隔符一律 `/`; UNC 保留 `//server/share` 双斜杠前缀, 不塌成单斜杠
+ *  - `\\?\` / `\\?\UNC\` 长路径前缀剥掉后再规范化 (否则 sanitize 目录不同)
+ *  - 折叠重复斜杠; 去掉尾随斜杠; 根盘保持 `C:/` (保留盘符大小写)
+ *  - **不**把路径段改成小写: sanitizeWorkdir 区分 `C--Users` 与 `c--users`,
+ *    全量小写会把已有分片拆开, 需独立迁移; cache/samePath 已大小写不敏感
+ *  - 相对盘符 `C:foo` 不抬成 `C:/foo` (cwd 相关, 不稳定)
+ *  - ssh: / bot: 复合键不碰
+ */
+export function normalizeWindowsLocalScopeKey(input: string): string {
+  if (!input) return input;
+  if (input.startsWith('ssh:') || input.startsWith('bot:')) return input;
+
+  let s = input.replace(/\//g, '\\');
+
+  // `\\?\UNC\server\share` / `\\?\C:\...` — 用 slice 避开正则反斜杠计数。
+  const longUnc = '\\\\?\\UNC\\';
+  const longDos = '\\\\?\\';
+  if (s.length >= longUnc.length && s.slice(0, longUnc.length).toLowerCase() === longUnc.toLowerCase()) {
+    s = '\\\\' + s.slice(longUnc.length);
+  } else if (s.startsWith(longDos)) {
+    s = s.slice(longDos.length);
+  }
+
+  const isUnc = s.startsWith('\\\\');
+  s = s.replace(/\\/g, '/');
+
+  if (isUnc) {
+    s = '//' + s.slice(2).replace(/\/+/g, '/');
+    s = s.replace(/\/+$/, '');
+    if (s === '' || s === '/') return '//';
+    return s;
+  }
+
+  s = s.replace(/\/+/g, '/');
+  const drive = s.match(/^([A-Za-z]:)(.*)$/);
+  if (drive) {
+    const letter = drive[1];
+    const rest = drive[2];
+    if (!rest.startsWith('/')) {
+      if (rest === '') return `${letter}/`;
+      return `${letter}${rest}`;
+    }
+    const trimmed = rest.replace(/\/+$/, '');
+    if (trimmed === '') return `${letter}/`;
+    return `${letter}${trimmed}`;
+  }
+
+  if (s.length > 1) s = s.replace(/\/+$/, '');
+  return s;
+}
+
+/** Desktop / Windows 形态路径 (盘符、UNC、`\\?\` 长路径), 供 migrate 跨平台复用。 */
+export function looksLikeWindowsLocalPath(p: string): boolean {
+  if (/^[A-Za-z]:/.test(p)) return true;
+  const slashes = p.replace(/\//g, '\\');
+  return slashes.startsWith('\\\\');
 }
 
 /** git rev-parse 输出 → 绝对路径。空输出返 null (调用方回落)。 */
