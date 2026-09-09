@@ -10,8 +10,8 @@
 import type { PluginMarketItem } from '../../../../shared/pluginMarket';
 
 /**
- * 批量更新只维护执行进度。每个真实包的权限确认由统一安装事务完成，
- * 本模型不再保存目录 manifest、批准基线或另一套待确认状态。
+ * 批量更新只维护执行进度。真实包由统一安装事务校验并落位，
+ * 本模型不再保存目录 manifest、能力基线或另一套更新状态。
  */
 export type UpdateAllRowStatus =
   | 'pending'
@@ -57,9 +57,14 @@ export function updateRow(
   return rows.map((row) => (row.pluginId === pluginId ? { ...row, ...patch } : row));
 }
 
+/** 批次是否已收敛:没有任何行还会自行推进(pending/installing)。 */
+export function isBatchSettled(rows: readonly UpdateAllRow[]): boolean {
+  return rows.every((row) => row.status !== 'pending' && row.status !== 'installing');
+}
+
 /** 批次是否完全结束。 */
 export function isBatchFinished(rows: readonly UpdateAllRow[]): boolean {
-  return rows.every((row) => row.status !== 'pending' && row.status !== 'installing');
+  return isBatchSettled(rows);
 }
 
 /** 完成摘要:成功 / 跳过 / 失败计数,供收尾 toast 使用。 */

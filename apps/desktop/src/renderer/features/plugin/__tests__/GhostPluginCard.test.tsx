@@ -1,7 +1,8 @@
 /**
  * Regression coverage for installed Plugin card actions (redesigned card:
- * whole-card primary action, kind-specific primary button, manage entry),
- * market card actions, and the legacy recovery notice.
+ * whole-card opens detail, kind-specific primary button, manage entry),
+ * market card actions, the legacy recovery notice, and market success navigation
+ * (first install opens detail; update stays put).
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  * @vitest-environment jsdom
  */
@@ -31,6 +32,9 @@ import {
   GhostPluginCard,
   LegacyGhostRecoveryNotice,
   MarketPluginCard,
+  MyPublishesSectionVisibilityGate,
+  SHOW_MY_PUBLISHES_SECTION,
+  shouldOpenInstalledDetailAfterMarketSuccess,
 } from '../GhostPluginPage';
 import {
   __ingestGhostBadgeForTest,
@@ -47,6 +51,116 @@ const {
   visibleInstalledPluginItems,
 } = __installedPluginLayoutForTests;
 
+describe('MyPublishesSectionVisibilityGate', () => {
+  const labels = {
+    overviewLabel: 'Overview',
+    publishesLabel: 'My publishes',
+    tabsAriaLabel: 'Plugin page sections',
+  };
+
+  it('shows both secondary tabs and switches their selected panel when enabled', () => {
+    render(
+      <MyPublishesSectionVisibilityGate
+        visible
+        {...labels}
+        publishes={<div data-testid="publishes-content" />}
+      >
+        <div data-testid="overview-content" />
+      </MyPublishesSectionVisibilityGate>,
+    );
+
+    const overviewTab = screen.getByRole('tab', { name: 'Overview' });
+    const publishesTab = screen.getByRole('tab', { name: 'My publishes' });
+    const overviewPanel = document.getElementById(overviewTab.getAttribute('aria-controls') ?? '');
+    const publishesPanel = document.getElementById(
+      publishesTab.getAttribute('aria-controls') ?? '',
+    );
+
+    expect(screen.getAllByRole('tab')).toHaveLength(2);
+    expect(overviewTab.getAttribute('aria-selected')).toBe('true');
+    expect(publishesTab.getAttribute('aria-selected')).toBe('false');
+    expect(overviewPanel?.hidden).toBe(false);
+    expect(publishesPanel?.hidden).toBe(true);
+
+    fireEvent.click(publishesTab);
+
+    // This excludes a decorative tab row that never switches the visible content.
+    expect(overviewTab.getAttribute('aria-selected')).toBe('false');
+    expect(publishesTab.getAttribute('aria-selected')).toBe('true');
+    expect(overviewPanel?.hidden).toBe(true);
+    expect(publishesPanel?.hidden).toBe(false);
+  });
+
+  it('removes the whole secondary tab row and publishing effects when disabled', () => {
+    const publishesRender = vi.fn();
+    function PublishesProbe() {
+      publishesRender();
+      return <div data-testid="publishes-content-disabled" />;
+    }
+
+    const { container } = render(
+      <MyPublishesSectionVisibilityGate
+        visible={SHOW_MY_PUBLISHES_SECTION}
+        {...labels}
+        publishes={<PublishesProbe />}
+      >
+        <section className="mt-6" data-testid="installed-content-disabled" />
+        <section className="mt-10" data-testid="recommended-content-disabled" />
+      </MyPublishesSectionVisibilityGate>,
+    );
+
+    // This excludes hiding only the publishing panel while leaving a one-tab row or wrapper noise.
+    expect(SHOW_MY_PUBLISHES_SECTION).toBe(false);
+    expect(screen.queryByRole('tablist')).toBeNull();
+    expect(screen.queryByRole('tab')).toBeNull();
+    const installed = screen.getByTestId('installed-content-disabled');
+    const recommended = screen.getByTestId('recommended-content-disabled');
+    expect(Array.from(container.children)).toEqual([installed, recommended]);
+    expect(installed.className).toBe('mt-6');
+    expect(recommended.className).toBe('mt-10');
+    expect(publishesRender).not.toHaveBeenCalled();
+  });
+
+  it('keeps overview content mounted and in place while viewing publishes', () => {
+    render(
+      <MyPublishesSectionVisibilityGate
+        visible
+        {...labels}
+        publishes={<div data-testid="publishes-content-persistent" />}
+      >
+        <div data-testid="overview-content-persistent" />
+      </MyPublishesSectionVisibilityGate>,
+    );
+
+    const overviewNode = screen.getByTestId('overview-content-persistent');
+    const publishesNode = screen.getByTestId('publishes-content-persistent');
+    const overviewPanel = overviewNode.parentElement;
+    const publishesPanel = publishesNode.parentElement;
+
+    expect(overviewPanel?.nextElementSibling).toBe(publishesPanel);
+    fireEvent.click(screen.getByRole('tab', { name: 'My publishes' }));
+
+    // The same DOM node and panel order exclude conditional unmounting or reordering the catalog.
+    expect(screen.getByTestId('overview-content-persistent')).toBe(overviewNode);
+    expect(overviewPanel?.nextElementSibling).toBe(publishesPanel);
+    expect(overviewPanel?.hidden).toBe(true);
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Overview' }));
+    expect(screen.getByTestId('overview-content-persistent')).toBe(overviewNode);
+    expect(overviewPanel?.hidden).toBe(false);
+  });
+});
+
+describe('shouldOpenInstalledDetailAfterMarketSuccess', () => {
+  it('opens the installed detail after a first-time market install', () => {
+    expect(shouldOpenInstalledDetailAfterMarketSuccess(false)).toBe(true);
+  });
+
+  it('stays on the current page after an update or replacement', () => {
+    expect(shouldOpenInstalledDetailAfterMarketSuccess(true)).toBe(false);
+  });
+});
+
 const commandPlugin: GhostPluginListItem = {
   id: 'filo-google',
   name: 'Filo Google',
@@ -54,8 +168,13 @@ const commandPlugin: GhostPluginListItem = {
   version: '1.0.0',
   enabled: true,
   canUse: true,
+  approvalState: 'approved',
+  builtin: false,
   tabPanel: false,
+  hasMainView: false,
+  mainViewTitle: null,
   hostCapability: null,
+  oauthAuthorizationExpired: false,
 };
 
 const panelPlugin: GhostPluginListItem = {
@@ -77,6 +196,14 @@ const simulatorPlugin: GhostPluginListItem = {
   id: 'ios-simulator',
   name: 'iOS Simulator',
   hostCapability: 'ios-simulator',
+};
+
+const mainViewPlugin: GhostPluginListItem = {
+  ...panelPlugin,
+  id: 'workspace',
+  name: 'Workspace',
+  hasMainView: true,
+  mainViewTitle: 'Workspace',
 };
 
 const marketPlugin: PluginMarketItem = {
@@ -102,33 +229,110 @@ describe('GhostPluginCard', () => {
   // 未读是模块级 store,用例间必须互不串味。
   afterEach(() => __resetGhostUnreadForTest());
 
-  it('fires the primary action from the whole card for a command plugin', () => {
+  it('opens plugin details from the whole card for a command plugin', () => {
     const onPrimary = vi.fn();
     const onManage = vi.fn();
     render(<GhostPluginCard item={commandPlugin} onPrimary={onPrimary} onManage={onManage} />);
 
     fireEvent.click(screen.getByRole('button', { name: 'Filo Google' }));
-    expect(onPrimary).toHaveBeenCalledTimes(1);
-    expect(onManage).not.toHaveBeenCalled();
-    // 指令型主按钮 = 「对话」。
+    expect(onManage).toHaveBeenCalledTimes(1);
+    expect(onPrimary).not.toHaveBeenCalled();
+    // 指令型主按钮仍是「对话」,不随整卡改成详情。
     expect(screen.getByRole('button', { name: 'settings.ghosts.page.chatAria' })).toBeTruthy();
   });
 
+  it('keeps the conversation pill as the command plugin primary action', () => {
+    const onPrimary = vi.fn();
+    const onManage = vi.fn();
+    render(<GhostPluginCard item={commandPlugin} onPrimary={onPrimary} onManage={onManage} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'settings.ghosts.page.chatAria' }));
+    expect(onPrimary).toHaveBeenCalledTimes(1);
+    expect(onManage).not.toHaveBeenCalled();
+  });
+
+  it.each(['Enter', ' '] as const)(
+    'opens plugin details when the card itself is activated with %s',
+    (key) => {
+      const onPrimary = vi.fn();
+      const onManage = vi.fn();
+      render(<GhostPluginCard item={commandPlugin} onPrimary={onPrimary} onManage={onManage} />);
+
+      fireEvent.keyDown(screen.getByRole('button', { name: 'Filo Google' }), { key });
+      expect(onManage).toHaveBeenCalledTimes(1);
+      expect(onPrimary).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['Enter', ' '] as const)(
+    'does not treat a nested pill %s as a card activation',
+    (key) => {
+      const onPrimary = vi.fn();
+      const onManage = vi.fn();
+      render(<GhostPluginCard item={commandPlugin} onPrimary={onPrimary} onManage={onManage} />);
+
+      fireEvent.keyDown(screen.getByRole('button', { name: 'settings.ghosts.page.chatAria' }), {
+        key,
+      });
+      expect(onManage).not.toHaveBeenCalled();
+    },
+  );
+
   it('labels the primary button 使用 for a tab-panel plugin', () => {
     const onPrimary = vi.fn();
-    render(<GhostPluginCard item={panelPlugin} onPrimary={onPrimary} onManage={vi.fn()} />);
+    const onManage = vi.fn();
+    render(<GhostPluginCard item={panelPlugin} onPrimary={onPrimary} onManage={onManage} />);
 
     fireEvent.click(screen.getByRole('button', { name: 'settings.ghosts.page.useAria' }));
     expect(onPrimary).toHaveBeenCalledTimes(1);
+    expect(onManage).not.toHaveBeenCalled();
+  });
+
+  it('opens plugin details from the whole card for a tab-panel plugin', () => {
+    const onPrimary = vi.fn();
+    const onManage = vi.fn();
+    render(<GhostPluginCard item={panelPlugin} onPrimary={onPrimary} onManage={onManage} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Signoff Board' }));
+    expect(onManage).toHaveBeenCalledTimes(1);
+    expect(onPrimary).not.toHaveBeenCalled();
   });
 
   it('offers a conversation entry for a Host capability plugin', () => {
     const onPrimary = vi.fn();
-    render(<GhostPluginCard item={simulatorPlugin} onPrimary={onPrimary} onManage={vi.fn()} />);
+    const onManage = vi.fn();
+    render(<GhostPluginCard item={simulatorPlugin} onPrimary={onPrimary} onManage={onManage} />);
 
     fireEvent.click(screen.getByRole('button', { name: 'settings.ghosts.page.chatAria' }));
     expect(onPrimary).toHaveBeenCalledTimes(1);
+    expect(onManage).not.toHaveBeenCalled();
     expect(screen.queryByText('settings.ghosts.page.agentInvoked')).toBeNull();
+  });
+
+  it('keeps the tab-panel action when the plugin also declares main-view', () => {
+    const onPrimary = vi.fn();
+    render(<GhostPluginCard item={mainViewPlugin} onPrimary={onPrimary} onManage={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'settings.ghosts.page.useAria' }));
+    expect(onPrimary).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('button', { name: 'settings.ghosts.page.openAria' })).toBeNull();
+  });
+
+  it('does not add a primary action for a main-view-only tool plugin', () => {
+    render(
+      <GhostPluginCard
+        item={{
+          ...toolPlugin,
+          hasMainView: true,
+          mainViewTitle: 'Workspace',
+        }}
+        onPrimary={vi.fn()}
+        onManage={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('settings.ghosts.page.agentInvoked')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'settings.ghosts.page.openAria' })).toBeNull();
   });
 
   it('routes the manage icon to detail without firing the primary action', () => {
@@ -143,13 +347,14 @@ describe('GhostPluginCard', () => {
 
   it('shows the update pill and keeps it from triggering the card action', () => {
     const onPrimary = vi.fn();
+    const onManage = vi.fn();
     const onUpdate = vi.fn();
     render(
       <GhostPluginCard
         item={commandPlugin}
         updateVersion="1.1.0"
         onPrimary={onPrimary}
-        onManage={vi.fn()}
+        onManage={onManage}
         onUpdate={onUpdate}
       />,
     );
@@ -157,7 +362,21 @@ describe('GhostPluginCard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'settings.ghosts.page.updateAria' }));
     expect(onUpdate).toHaveBeenCalledTimes(1);
     expect(onPrimary).not.toHaveBeenCalled();
+    expect(onManage).not.toHaveBeenCalled();
     // 有更新时不显示「已是最新」。
+    expect(screen.queryByText(/upToDate/)).toBeNull();
+  });
+
+  it('shows an expired OAuth status instead of the up-to-date status', () => {
+    render(
+      <GhostPluginCard
+        item={{ ...commandPlugin, oauthAuthorizationExpired: true }}
+        onPrimary={vi.fn()}
+        onManage={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('settings.ghosts.page.oauthAuthorizationExpired')).toBeTruthy();
     expect(screen.queryByText(/upToDate/)).toBeNull();
   });
 
@@ -182,6 +401,27 @@ describe('GhostPluginCard', () => {
     ).toBe(true);
   });
 
+  it('replaces the update pill with a spinner while this card is pending', () => {
+    render(
+      <GhostPluginCard
+        item={commandPlugin}
+        updateVersion="1.1.0"
+        updateBusy
+        updatePending
+        onPrimary={vi.fn()}
+        onManage={vi.fn()}
+        onUpdate={vi.fn()}
+      />,
+    );
+
+    const update = screen.getByRole('button', {
+      name: 'settings.ghosts.page.updateAria',
+    });
+    expect(update.getAttribute('aria-busy')).toBe('true');
+    expect(update.querySelector('.animate-spinner')).toBeTruthy();
+    expect(update.textContent).toBe('');
+  });
+
   it('sends a tool-only plugin to manage and renders no primary button', () => {
     const onPrimary = vi.fn();
     const onManage = vi.fn();
@@ -189,6 +429,27 @@ describe('GhostPluginCard', () => {
 
     expect(screen.getByText('settings.ghosts.page.agentInvoked')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Pure Tool' }));
+    expect(onManage).toHaveBeenCalledTimes(1);
+    expect(onPrimary).not.toHaveBeenCalled();
+  });
+
+  it('opens details from the non-interactive agent-invoked hint', () => {
+    const onPrimary = vi.fn();
+    const onManage = vi.fn();
+    render(<GhostPluginCard item={toolPlugin} onPrimary={onPrimary} onManage={onManage} />);
+
+    fireEvent.click(screen.getByText('settings.ghosts.page.agentInvoked'));
+    expect(onManage).toHaveBeenCalledTimes(1);
+    expect(onPrimary).not.toHaveBeenCalled();
+  });
+
+  it('opens details from empty space in the right action rail', () => {
+    const onPrimary = vi.fn();
+    const onManage = vi.fn();
+    render(<GhostPluginCard item={commandPlugin} onPrimary={onPrimary} onManage={onManage} />);
+
+    const manage = screen.getByRole('button', { name: 'settings.ghosts.page.manageAria' });
+    fireEvent.click(manage.parentElement as HTMLElement);
     expect(onManage).toHaveBeenCalledTimes(1);
     expect(onPrimary).not.toHaveBeenCalled();
   });
@@ -458,6 +719,26 @@ describe('MarketPluginCard', () => {
     expect((busyCardBody as HTMLButtonElement).disabled).toBe(true);
     expect(busyCardBody.className).toContain('cursor-wait');
     expect(busyCardBody.className).not.toContain('cursor-not-allowed');
+  });
+
+  it('replaces the install label with a spinner while this card is pending', () => {
+    render(
+      <MarketPluginCard
+        item={marketPlugin}
+        busy
+        pending
+        onSelect={vi.fn()}
+        onInstall={vi.fn()}
+        onIconLoadError={vi.fn()}
+      />,
+    );
+
+    const install = screen.getByRole('button', {
+      name: 'settings.ghosts.page.installAria',
+    });
+    expect(install.getAttribute('aria-busy')).toBe('true');
+    expect(install.querySelector('.animate-spinner')).toBeTruthy();
+    expect(install.textContent).toBe('');
   });
 });
 

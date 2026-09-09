@@ -3,7 +3,7 @@
  *
  * 链路:手机拿 APNs device token → PUT device-link server /push-token 注册;
  * 桌面端任务终态发 notify 帧 → server 查账号 token → APNs 下发。
- * 契约见 cindy-server docs/device-link-server.md 与协议仓 device-link-protocol.md。
+ * 契约见本仓 packages/device-link-protocol 与 cindy-server docs/device-link-server.md。
  */
 
 export type PushAppVariant = 'cn' | 'global';
@@ -68,6 +68,18 @@ function parseNotificationPayloadDeepLink(data: unknown): string | null {
   // APNs relay implementations may wrap custom fields under `body` or `data`.
   // Keep the fallback explicit rather than recursively walking untrusted payloads.
   return parseNotificationDeepLink(record.body) ?? parseNotificationDeepLink(record.data);
+}
+
+/** Local navigation hint only; neither the push payload nor the device-link protocol changes. */
+export function notificationRecoveryRoute(deepLink: string, responseKey: string): string {
+  const hashIndex = deepLink.indexOf('#');
+  const path = hashIndex < 0 ? deepLink : deepLink.slice(0, hashIndex);
+  const fragment = hashIndex < 0 ? '' : deepLink.slice(hashIndex);
+  const queryIndex = path.indexOf('?');
+  const pathname = queryIndex < 0 ? path : path.slice(0, queryIndex);
+  const query = new URLSearchParams(queryIndex < 0 ? '' : path.slice(queryIndex + 1));
+  query.set('notificationResponse', responseKey);
+  return `${pathname}?${query.toString()}${fragment}`;
 }
 
 /**

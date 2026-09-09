@@ -35,6 +35,7 @@ export async function withStore(
   fn: (store: MakerMemoryStore) => Promise<unknown>,
 ): Promise<MemoryToolResult> {
   let store: MakerMemoryStore;
+  let scopeAtEntry: string | null = null;
   try {
     const manager = deps.getManager();
     if (!manager.isEnabled()) {
@@ -43,18 +44,34 @@ export async function withStore(
         true,
       );
     }
+    // 操作锚点 (review #2388 Codex 4th P1): getStore 返回的裸 store 在 manager
+    // 守卫之外被调用方 await — 在拿 store 前捕获 scope, fn 完成后复核, 期间
+    // 登出/切账号则操作结果不可信, fail-closed。
+    scopeAtEntry = manager.currentOwnerScopeKey?.() ?? null;
     const ctx = deps.getSessionContext?.();
     const workdir = ctx?.workingDir ?? deps.workdir;
     // SSH remote 会话 (ctx 带 remoteHostId) 的 workdir 是远端路径 — 经 scope
-    // key 定位, 与 agent 启动注入 (claude-code/codex index.ts) 同一键规则;
-    // 本地会话在此额外做 git worktree 归一化 (#2379)。
-    store = await manager.getStore(await resolveMemoryScopeKey(workdir, ctx?.remoteHostId));
+    // key 定位, 与 agent 启动注入 (claude-code/codex index.ts) 同一键规则。
+    store = await manager.getStore(
+      ctx?.memoryScopeKey ?? await resolveMemoryScopeKey(workdir, ctx?.remoteHostId),
+    );
   } catch (err) {
     const { code, message } = classifyMemoryError(err);
     return buildJsonResult({ ok: false, code, message }, true);
   }
   try {
     const data = await fn(store);
+    // 操作后复核: owner 在 fn 执行期间切换 → 结果不可信, 不得按成功返回。
+    if (scopeAtEntry !== null && deps.getManager().currentOwnerScopeKey?.() !== scopeAtEntry) {
+      return buildJsonResult(
+        {
+          ok: false,
+          code: 'MAKER_MEMORY_NOT_READY',
+          message: 'owner scope changed during memory operation; result not trusted',
+        },
+        true,
+      );
+    }
     return buildJsonResult({ ok: true, data });
   } catch (err) {
     const { code, message } = classifyMemoryError(err);

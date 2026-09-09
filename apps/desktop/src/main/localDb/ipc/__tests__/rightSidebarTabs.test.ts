@@ -57,6 +57,8 @@ function createDb(): Database.Database {
     CREATE INDEX right_sidebar_tabs_session_idx ON right_sidebar_tabs (session_id, position);
     CREATE UNIQUE INDEX right_sidebar_tabs_subagents_singleton_idx
       ON right_sidebar_tabs (session_id) WHERE kind = 'subagents';
+    CREATE UNIQUE INDEX right_sidebar_tabs_bot_artifacts_singleton_idx
+      ON right_sidebar_tabs (session_id) WHERE kind = 'bot-artifacts';
   `);
   sqlite.prepare(`INSERT INTO sessions (id) VALUES (?)`).run('s1');
   sqlite.prepare(`INSERT INTO sessions (id) VALUES (?)`).run('s2');
@@ -245,6 +247,26 @@ describe('rightSidebarTabs IPC', () => {
       ).rejects.toThrow(/RIGHT_SIDEBAR_STATE_TOO_LARGE/);
     });
 
+    it.each([
+      ['cyclic state', () => {
+        const state: Record<string, unknown> = {};
+        state.self = state;
+        return state;
+      }],
+      ['BigInt state', () => ({ value: BigInt(1) })],
+      ['top-level function state', () => () => undefined],
+    ])('rejects non-JSON-serializable %s with INVALID_PARAMS', async (_name, makeState) => {
+      await expect(
+        invoke('local-db:right-sidebar-tabs:upsert', {
+          id: 't1',
+          sessionId: 's1',
+          kind: 'web-browser',
+          position: 0,
+          state: makeState(),
+        }),
+      ).rejects.toThrow(/\[INVALID_PARAMS\] tab state must be JSON-serializable/);
+    });
+
     it('rejects invalid params (missing sessionId)', async () => {
       await expect(
         invoke('local-db:right-sidebar-tabs:upsert', {
@@ -308,6 +330,12 @@ describe('rightSidebarTabs IPC', () => {
         invoke('local-db:right-sidebar-tabs:ensure-singleton', {
           sessionId: 's1',
           kind: 'web-browser',
+        }),
+      ).rejects.toThrow(/INVALID_PARAMS/);
+      await expect(
+        invoke('local-db:right-sidebar-tabs:ensure-singleton', {
+          sessionId: 's1',
+          kind: 'bot-artifacts',
         }),
       ).rejects.toThrow(/INVALID_PARAMS/);
     });

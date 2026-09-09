@@ -11,6 +11,7 @@ function ghost(
   return {
     dir: `/plugins/${id}`,
     enabled: options.enabled ?? true,
+    approval: { state: 'approved', revision: '00000000-0000-4000-8000-000000000001' },
     manifest: {
       schemaVersion: 2,
       id,
@@ -18,7 +19,6 @@ function ghost(
       version: '1',
       kind: 'chip',
       entry: 'main.js',
-      slots: ['tool'],
       tools: (options.tools ?? ['run']).map((name) => ({
         name,
         description: name,

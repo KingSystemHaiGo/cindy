@@ -142,6 +142,8 @@ export interface SerializedAttachedFile {
   size: number;
   category: FileCategory;
   mimeType: string;
+  /** Image source was selected or pasted on the Desktop host. */
+  pathOrigin?: 'desktop-host';
   url?: string;
   originalName?: string;
   /**
@@ -169,6 +171,13 @@ export interface MentionedResource {
   type: 'file' | 'dir' | 'agent';
   name: string;
   path: string;
+}
+
+/** Bot candidates supplied by the Bot task route to the shared Composer. */
+export interface ComposerBotMention {
+  id: string;
+  name: string;
+  description?: string;
 }
 
 export interface FileValidationResult {

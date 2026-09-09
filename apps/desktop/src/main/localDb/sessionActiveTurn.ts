@@ -52,6 +52,10 @@
 import { and, desc, eq, gt, inArray, isNull, lt, sql } from 'drizzle-orm';
 
 import { getDbClient } from './client/current';
+import {
+  getSessionInterruptionBootAt,
+  setSessionInterruptionBootAtForTests,
+} from './sessionInterruptionBoot';
 import { messages, sessions } from './schema';
 import { createLogger } from '../logger';
 import { DESKTOP_VISIBLE_SESSION_SOURCES } from '../../shared/sessionSource.js';
@@ -70,6 +74,36 @@ let _quitFrozen = false;
 /** app 退出编排 sync 阶段调用(bootstrap-electron onQuit),此后时间戳只读。 */
 export function freezeSessionActiveTurnMarkers(): void {
   _quitFrozen = true;
+}
+
+/**
+ * 数据 owner 边界(切账号 / 登出)的**有作用域** ended 写抑制 —— 与 _quitFrozen
+ * 同一语义:边界 teardown 的 maker.shutdown 会批量 close 所有本地会话,close
+ * teardown 触发的 ended 写会把"边界时还在飞的 turn"伪装成正常收尾,被切换打断
+ * 的任务既无中断横幅也无红点,呈现为"卡住且无报错"(2026-08-11 实报:凭证跨区
+ * 误判触发账号切换,busy Codex 会话被静默孤儿化)。与 quit freeze 的差别只有一个:
+ * 边界后进程继续服务新 owner,必须可释放。计数器支持重入;返回的释放函数幂等。
+ *
+ * 残余竞态说明:close 触发的 ended 写来自 session status listener 的 async handler,
+ * 不被 maker.shutdown 的 await 覆盖,理论上可能晚于释放时刻。调用方靠「持有到
+ * teardown 尾部(DB dispose 之后)」把窗口压到极小;真漏网的迟到写会撞上已
+ * dispose 的 DbClient,由写链吞错落日志,不会污染时间戳。
+ */
+let _endedWriteSuppressions = 0;
+
+export function beginSessionTurnEndedSuppression(): () => void {
+  _endedWriteSuppressions += 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    _endedWriteSuppressions -= 1;
+  };
+}
+
+/** ended 写抑制判定:quit freeze 或任一在持有的 owner 边界抑制。 */
+function isEndedWriteSuppressed(): boolean {
+  return _quitFrozen || _endedWriteSuppressions > 0;
 }
 
 /**
@@ -159,7 +193,7 @@ export function markSessionTurnStarted(sessionId: string): void {
  * 在重启后误判为中断。只允许时间戳前进。
  */
 export function markSessionTurnEnded(sessionId: string, endedAtOverride?: number): void {
-  if (_quitFrozen) return;
+  if (isEndedWriteSuppressed()) return;
   const notifyContext = captureTurnEndedPersistedContext();
   enqueueEndedWrite(
     sessionId,
@@ -178,7 +212,7 @@ export function markSessionTurnEnded(sessionId: string, endedAtOverride?: number
  * 入队时刻判定」的语义一致(barrier 版的"入队时刻"= 本函数调用时刻)。
  */
 export function markSessionTurnEndedAfterBarrier(sessionId: string, barrier: Promise<unknown>): void {
-  if (_quitFrozen) return;
+  if (isEndedWriteSuppressed()) return;
   const endedAt = Date.now();
   const notifyContext = captureTurnEndedPersistedContext();
   void barrier.then(
@@ -299,11 +333,9 @@ function enqueueEndedWrite(sessionId: string, endedAt: number, notifyContext: un
  * 检测不到(PR #879 review P1,两个 reviewer 独立指出)。现在把边界下沉进查询本身,
  * 调用时机不再影响正确性。
  */
-let _bootAtMs = Date.now();
-
 /** 测试专用:定格「本进程启动时刻」,让中断判定不依赖真实时钟。 */
 export function _setBootAtMsForTests(ms: number): void {
-  _bootAtMs = ms;
+  setSessionInterruptionBootAtForTests(ms);
 }
 
 /**
@@ -330,11 +362,13 @@ export async function listInterruptedPendingRows(): Promise<
         gt(sessions.activeTurnStartedAt, sql`COALESCE(${sessions.lastTurnEndedAt}, 0)`),
         gt(sessions.activeTurnStartedAt, sql`COALESCE(${sessions.clearedAt}, 0)`),
         // 只认「开始于本进程启动之前」的 turn —— 排除正在跑的(见 _bootAtMs 注释)。
-        lt(sessions.activeTurnStartedAt, _bootAtMs),
+        lt(sessions.activeTurnStartedAt, getSessionInterruptionBootAt()),
       ),
     );
   // startedAt 必非 null(上面的 gt/lt 比较已排除),类型收窄用于批量处置的 CAS。
-  return rows.flatMap((r) => (r.startedAt == null ? [] : [{ sessionId: r.id, startedAt: r.startedAt }]));
+  return rows.flatMap((r) =>
+    r.startedAt == null ? [] : [{ sessionId: r.id, startedAt: r.startedAt }],
+  );
 }
 
 /** 同上,只要会话 id —— 红点首拉用。 */
@@ -577,5 +611,10 @@ function summarizeRecoveryContent(raw: string): string {
 export function _resetSessionActiveTurnStateForTests(): void {
   _writeChains.clear();
   _quitFrozen = false;
+  _endedWriteSuppressions = 0;
   _onTurnEndedPersisted = null;
+  // bootAt 一并重置:它在模块 import 时定格,而用例常以「相对 now 的 startedAt」
+  // 造数据 —— 文件内前置用例的累计耗时一旦超过该相对差,后续用例的中断判定就会
+  // 因 startedAt >= bootAt 静默翻转(时钟脆弱)。每个用例重新定基消除顺序耦合。
+  setSessionInterruptionBootAtForTests(Date.now());
 }

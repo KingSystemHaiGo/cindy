@@ -1,14 +1,14 @@
 /**
- * Batch plugin update dialog: rows stream through the shared real-package
- * install transaction and report progress here.
+ * Batch plugin update dialog: rows stream through the unified Main install
+ * transaction and only expose progress here.
  *
- * Inputs: live batch rows owned by the Plugin page runner.
+ * Inputs: live batch rows owned by the Plugin page runner plus row actions.
  * Outputs: progress presentation only; no IPC and no batch policy here.
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
 import * as Dialog from '@radix-ui/react-dialog';
-import { Check } from 'lucide-react';
+import { Check, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import { WINDOW_NO_DRAG_STYLE } from '@/components/layout/windowDrag';
@@ -84,37 +84,47 @@ export function UpdateAllDialog({
           className="fixed left-1/2 top-1/2 z-[10000] flex max-h-[70vh] w-[calc(100vw-48px)] max-w-[520px] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-[var(--border-default)] bg-[var(--surface-elevated)] text-[var(--text-primary)] shadow-[var(--shadow-menu)] focus:outline-none"
           style={WINDOW_NO_DRAG_STYLE}
         >
-          <div className="border-b-[0.5px] border-[var(--border-default)] px-6 py-5">
-            <Dialog.Title className="text-18 font-medium">
-              {t('settings.ghosts.updateAll.title', { count: rows.length })}
-            </Dialog.Title>
-            <Dialog.Description className="mt-1 text-13 leading-5 text-[var(--text-tertiary)]">
-              {t('settings.ghosts.updateAll.description')}
-            </Dialog.Description>
+          <div className="flex items-start gap-4 border-b-[0.5px] border-[var(--border-default)] px-6 py-5">
+            <div className="min-w-0 flex-1">
+              <Dialog.Title className="text-18 font-medium">
+                {t('settings.ghosts.updateAll.title', { count: rows.length })}
+              </Dialog.Title>
+              <Dialog.Description className="mt-1 text-13 leading-5 text-[var(--text-tertiary)]">
+                {t('settings.ghosts.updateAll.description')}
+              </Dialog.Description>
+            </div>
+            <Dialog.Close
+              aria-label={t('settings.ghosts.detail.closeDialog')}
+              className="grid size-9 shrink-0 place-items-center rounded-full text-[var(--text-secondary)] hover:bg-[var(--surface-hover-soft)] hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
+            >
+              <X size={17} aria-hidden="true" />
+            </Dialog.Close>
           </div>
           <div className="overflow-y-auto px-6 py-2">
             {rows.map((row) => (
               <div
                 key={row.pluginId}
-                className="flex items-center gap-3 border-b-[0.5px] border-[var(--border-default)] py-3.5 last:border-b-0"
+                className="border-b-[0.5px] border-[var(--border-default)] py-3.5 last:border-b-0"
               >
-                <GhostPluginIcon
-                  iconDataUrl={iconByGhostId.get(row.ghostId)}
-                  iconId={row.ghostId}
-                  iconName={row.name}
-                  size="menu"
-                />
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-13 font-medium leading-5">{row.name}</p>
-                  <p className="text-11 text-[var(--text-tertiary)]">
-                    {t('settings.ghosts.updateAll.versionRange', {
-                      from: row.fromVersion,
-                      to: row.toVersion,
-                    })}
-                  </p>
-                </div>
-                <div className="flex shrink-0 items-center gap-2">
-                  <RowStatus row={row} />
+                <div className="flex items-center gap-3">
+                  <GhostPluginIcon
+                    iconDataUrl={iconByGhostId.get(row.ghostId)}
+                    iconId={row.ghostId}
+                    iconName={row.name}
+                    size="menu"
+                  />
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-13 font-medium leading-5">{row.name}</p>
+                    <p className="text-11 text-[var(--text-tertiary)]">
+                      {t('settings.ghosts.updateAll.versionRange', {
+                        from: row.fromVersion,
+                        to: row.toVersion,
+                      })}
+                    </p>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <RowStatus row={row} />
+                  </div>
                 </div>
               </div>
             ))}

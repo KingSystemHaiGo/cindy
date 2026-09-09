@@ -18,6 +18,7 @@ import {
 } from './tools.js';
 import { logToolResultErrorCode } from '../tool-error-telemetry.js';
 import { WindowSnapshotTracker } from './snapshot-tracker.js';
+import { computerResultOutcome } from './result.js';
 
 export interface ComputerMcpServerOptions {
   sessionId?: string;
@@ -26,7 +27,6 @@ export interface ComputerMcpServerOptions {
 
 const DESCRIPTION_LIST =
   'Discover local desktop computer-use tools. These tools operate on the user desktop through the installed driver. ' +
-  "For iOS work, cindy_ios_simulator is the default embedded-simulator route; use this server for macOS Simulator.app only after the user explicitly requests an external window. " +
   'Use read-only status/get_accessibility_tree/list_apps/list_windows/get_window_state before click/type_text/press_key/hotkey.';
 
 const DESCRIPTION_CALL =
@@ -47,6 +47,7 @@ function textResult(value: unknown, isError?: boolean) {
 const SESSION_AWARE_TOOLS = new Set<ComputerMcpToolName>([
   'list_windows',
   'get_window_state',
+  'verify_state',
   'click',
   'double_click',
   'right_click',
@@ -89,19 +90,6 @@ const ELEMENT_INDEX_ACTION_TOOLS = new Set<ComputerMcpToolName>([
   'scroll',
 ]);
 
-/** Actions that can change a target app after resolving its model-supplied PID. */
-const TARGETED_MUTATING_TOOLS = new Set<ComputerMcpToolName>([
-  'click',
-  'double_click',
-  'right_click',
-  'drag',
-  'type_text',
-  'set_value',
-  'press_key',
-  'hotkey',
-  'scroll',
-]);
-
 const MAX_REPLAY_TURNS = 1_000;
 const MAX_REPLAY_DIRECTORY_ENTRIES = 10_000;
 const MAX_REPLAY_ACTION_BYTES = 256 * 1024;
@@ -123,7 +111,6 @@ interface ReplayTrajectoryAction {
 }
 
 interface ComputerDispatchOptions {
-  forceFreshProcessIdentity?: boolean;
   pathWorkingDirOverride?: string;
 }
 
@@ -305,7 +292,7 @@ export function createComputerMcpServer(
         inputSchema: z.toJSONSchema(z.object(tool.inputShape).strict()),
       })),
       workflow:
-        'Start with status and check_permissions. For iOS work, use cindy_ios_simulator first; this server may inspect the external Xcode/Simulator desktop UI read-only, but mutating external iOS workflows are not available until Cindy has a host-issued authorization flow. Otherwise use get_accessibility_tree/list_windows, optionally narrow list_windows with query/workspace_root/process_name (for example, {"process_name":"Simulator"}), inspect a target with get_window_state, perform one action, and call get_window_state again to verify. Targeted actions such as click/type_text require pid; include window_id whenever the target window is known, and always for coordinates. Use get_window_state with {"capture_mode":"vision"} for screenshots and normally omit screenshot_out_file. Element indices are only valid for the latest snapshot of the same pid/window_id: pass the snapshot_id from get_window_state along with element_index, and re-observe when an action is rejected with STALE_SNAPSHOT. Use start_recording/stop_recording/replay_trajectory only when the user explicitly asks for recording or replay.',
+        'Start with status and check_permissions. Use get_accessibility_tree/list_windows, optionally narrow list_windows with query/workspace_root/process_name (for example, {"process_name":"Simulator"}), inspect a target with get_window_state, perform one action, and call get_window_state again to verify. Targeted actions such as click/type_text require pid; include window_id whenever the target window is known, and always for coordinates. Use get_window_state with include_screenshot:false for bounded text observations; request an image for visual grounding and normally omit screenshot_out_file. Prefer the exact element_token returned by the latest observation, or pass snapshot_id with element_index. Re-observe on STALE_SNAPSHOT. After an action, verify its intended postcondition with verify_state or a fresh observation; a delivered or unverifiable action does not prove completion. Never replay a mutation automatically after cancellation or a connection failure. Use start_recording/stop_recording/replay_trajectory only when the user explicitly asks for recording or replay.',
     }),
   );
 
@@ -370,20 +357,23 @@ export function createComputerMcpServer(
       return replayTrajectoryWithGuards(parsedData, signal);
     }
 
-    const externalIosGuard = await guardExternalIosDesktopWorkflow(
-      name as ComputerMcpToolName,
-      parsedData,
-      dispatchOptions?.forceFreshProcessIdentity === true,
-    );
-    if (externalIosGuard) return externalIosGuard;
-
     // 快照代际护栏:element_index 指向"某次 get_window_state 的第几项",观察和
     // 动作之间 UI 树变化时会静默作用到错误元素。带 snapshot_id 的动作在此校验
     // 它是否仍是目标窗口最新观察;不带的放行(过渡兼容)但打遥测日志。
     const staleResult = checkSnapshotFreshness(name as ComputerMcpToolName, parsedData, sessionId);
     if (staleResult) return staleResult;
-    // snapshot_id 是 MCP 层的护栏参数,driver 不认识,派发前剥掉。
-    delete parsedData.snapshot_id;
+    if (typeof parsedData.snapshot_id === 'string') {
+      const driverId = snapshotTracker.driverSnapshotId(sessionId, parsedData.snapshot_id);
+      if (driverId) parsedData.snapshot_id = driverId;
+      else delete parsedData.snapshot_id; // Legacy drivers have no native snapshot ids.
+    }
+    if (name === 'set_value' && parsedData.element_index === undefined && parsedData.element_token === undefined) {
+      return textResult({ ok: false, errorCode: 'INVALID_ARGS', data: { message: 'set_value requires element_token or element_index.' } }, true);
+    }
+    if (name === 'verify_state' || name === 'get_window_state') {
+      snapshotTracker.invalidate(sessionId, parsedData.pid as number, parsedData.window_id as number);
+    }
+    if (signal?.aborted) return replayCancelledResult();
 
     const parsedArgs = withSessionArg(
       name as ComputerMcpToolName,
@@ -396,94 +386,65 @@ export function createComputerMcpServer(
         deps,
         name as ComputerMcpToolName,
         parsedArgs,
-        callContext,
+        { ...callContext, signal },
       );
+      if (
+        name === 'get_window_state' &&
+        isUnavailableWindowObservation(data, parsedData)
+      ) {
+        invalidateWindowSnapshot(name, parsedData, sessionId);
+        return textResult(
+          {
+            ok: false,
+            tool: name,
+            errorCode: 'CUA_UNAVAILABLE',
+            hint: 'The requested window observation failed. Do not reuse earlier snapshot IDs, element indices or coordinates. Check status/check_permissions and refresh list_windows for the target; after the window or capture state recovers, call get_window_state again. Repeated capture failure requires recovery before further actions.',
+            data,
+          },
+          true,
+        );
+      }
+      const outcome = computerResultOutcome(name, data);
       const snapshotId = recordWindowSnapshot(name as ComputerMcpToolName, parsedData, data, sessionId);
       return textResult({
-        ok: true,
+        ...outcome,
         tool: name,
         ...(snapshotId ? { snapshot_id: snapshotId } : {}),
         data,
-      });
+      }, !outcome.ok);
     } catch (err) {
+      invalidateWindowSnapshot(name, parsedData, sessionId);
+      if ((signal?.aborted || (err as { outcomeUnknown?: boolean })?.outcomeUnknown)
+        && typeof parsedData.pid === 'number' && typeof parsedData.window_id === 'number') {
+        snapshotTracker.invalidate(sessionId, parsedData.pid, parsedData.window_id);
+      }
       return textResult(
         {
           ok: false,
-          errorCode: 'COMPUTER_DRIVER_ERROR',
-          data: { message: err instanceof Error ? err.message : String(err) },
+          errorCode: signal?.aborted ? 'REQUEST_CANCELLED' :
+            typeof (err as { code?: unknown })?.code === 'string' ? (err as { code: string }).code : 'COMPUTER_DRIVER_ERROR',
+          data: {
+            message: err instanceof Error ? err.message : String(err),
+            ...((err as { outcomeUnknown?: boolean })?.outcomeUnknown ? { outcome_unknown: true, next_step: 'fresh_state' } : {}),
+          },
         },
         true,
       );
     }
   }
 
-  /**
-   * Cindy's embedded simulator is the default iOS route. This guard uses
-   * host-resolved PID provenance so the model cannot relabel Xcode/Simulator
-   * and then drive Run/click/hotkey through generic desktop automation.
-   */
-  async function guardExternalIosDesktopWorkflow(
-    name: ComputerMcpToolName,
-    parsedData: Record<string, unknown>,
-    forceFreshProcessIdentity = false,
-  ) {
-    if (name === 'launch_app') {
-      const target = classifyExternalIosTarget({
-        name: parsedData.name,
-        bundleId: parsedData.bundle_id,
-        executable: parsedData.name,
-      });
-      if (target === 'simulator') {
-        return embeddedIosSimulatorPreferredResult('Simulator.app');
-      }
-      if (target === 'xcode') {
-        return embeddedIosSimulatorPreferredResult('Xcode');
-      }
-      return null;
-    }
-
+  function invalidateWindowSnapshot(
+    name: string,
+    args: Record<string, unknown>,
+    sessionId: string | undefined,
+  ): void {
     if (
-      !TARGETED_MUTATING_TOOLS.has(name) ||
-      typeof parsedData.pid !== 'number'
+      name === 'get_window_state' &&
+      typeof args.pid === 'number' &&
+      typeof args.window_id === 'number'
     ) {
-      return null;
+      snapshotTracker.invalidate(sessionId, args.pid, args.window_id);
     }
-    return guardMutatingProcessTarget(parsedData.pid, name, forceFreshProcessIdentity);
-  }
-
-  async function guardMutatingProcessTarget(
-    pid: number,
-    tool: ComputerMcpToolName,
-    forceFreshProcessIdentity = false,
-  ) {
-    if (!deps.resolveProcessIdentity) return targetProvenanceUnavailableResult();
-
-    let identity;
-    try {
-      identity = forceFreshProcessIdentity
-        ? await deps.resolveProcessIdentity(pid, { forceFresh: true })
-        : await deps.resolveProcessIdentity(pid);
-    } catch (err) {
-      deps.logger?.warn('failed to resolve Computer Use target process for iOS routing guard', {
-        pid,
-        tool,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return targetProvenanceUnavailableResult();
-    }
-    if (
-      !identity ||
-      identity.pid !== pid ||
-      ![identity.name, identity.command, identity.executable, identity.bundleId].some(
-        (value) => typeof value === 'string' && value.trim().length > 0,
-      )
-    ) {
-      return targetProvenanceUnavailableResult();
-    }
-    const target = classifyExternalIosTarget(identity);
-    if (!target) return null;
-
-    return embeddedIosSimulatorPreferredResult(target === 'xcode' ? 'Xcode' : 'Simulator.app');
   }
 
   function trajectoryValidationFailedResult(message: string, turn?: string) {
@@ -756,8 +717,6 @@ export function createComputerMcpServer(
         const args = parsed.data as Record<string, unknown>;
         const nestedPathError = await guardPathArgs(toolName, args, workingRoot);
         if (nestedPathError) return { error: nestedPathError };
-        const externalIosGuard = await guardExternalIosDesktopWorkflow(toolName, args);
-        if (externalIosGuard) return { error: externalIosGuard };
         actions.push({ turn, tool: toolName, args });
       } catch (error) {
         if (signal?.aborted) return { error: replayCancelledResult() };
@@ -871,14 +830,15 @@ export function createComputerMcpServer(
       // This closes both PID-reuse and mutable-action-file races that a single
       // preflight followed by the driver's nested replay would leave open.
       const result = await handleCallTool(action.tool, action.args, signal, {
-        forceFreshProcessIdentity: true,
         // Preflight normalized nested path arguments against this canonical
         // root. Reuse it so a symlink spelling of the session workingDir does
         // not make those immutable absolute paths look lexically out of scope.
         pathWorkingDirOverride: prepared.workingRoot,
       });
       if (signal?.aborted) return replayCancelledResult();
-      const isError = result.isError === true;
+      const payload = JSON.parse(result.content[0].text) as { outcome?: { status?: string }; data?: { outcome_unknown?: boolean } };
+      const outcomeUnknown = payload.outcome?.status === 'unknown' || payload.data?.outcome_unknown === true;
+      const isError = result.isError === true || outcomeUnknown;
       const summaryBudget = Math.max(
         0,
         Math.min(
@@ -901,7 +861,7 @@ export function createComputerMcpServer(
           tool: action.tool,
           error: summary,
         };
-        if (prepared.stopOnError) break;
+        if (prepared.stopOnError || outcomeUnknown) break;
       } else {
         succeeded += 1;
       }
@@ -924,65 +884,6 @@ export function createComputerMcpServer(
         ...(firstFailure ? { first_failure: firstFailure } : {}),
       },
     });
-  }
-
-  function classifyExternalIosTarget(input: {
-    name?: unknown;
-    bundleId?: unknown;
-    command?: unknown;
-    executable?: unknown;
-  }): 'xcode' | 'simulator' | null {
-    const name = typeof input.name === 'string' ? input.name.trim().toLowerCase() : '';
-    const bundleId = typeof input.bundleId === 'string' ? input.bundleId.trim().toLowerCase() : '';
-    const command = typeof input.command === 'string' ? input.command.trim().toLowerCase() : '';
-    const executable = typeof input.executable === 'string' ? input.executable.trim().toLowerCase() : '';
-    const provenance = [name, command, executable].filter(Boolean).join(' ');
-    const nameBasename = name.replace(/\\/g, '/').split('/').at(-1) ?? '';
-
-    if (
-      bundleId === 'com.apple.iphonesimulator' ||
-      /(^|[\s/])simulator(?:\.app)?(?:[\s/]|$)/.test(provenance)
-    ) {
-      return 'simulator';
-    }
-    if (
-      bundleId === 'com.apple.dt.xcode' ||
-      /^xcode(?:[-_.][a-z0-9][a-z0-9._-]*)?(?:\.app)?$/i.test(nameBasename) ||
-      /(^|[\s/])xcode(?:\.app)?(?:[\s/]|$)/.test(provenance)
-    ) {
-      return 'xcode';
-    }
-    return null;
-  }
-
-  function embeddedIosSimulatorPreferredResult(target: 'Xcode' | 'Simulator.app') {
-    return textResult(
-      {
-        ok: false,
-        errorCode: 'EMBEDDED_IOS_SIMULATOR_PREFERRED',
-        data: {
-          message:
-            `Use cindy_ios_simulator for Cindy's embedded viewer. External ${target} automation is unavailable until Cindy can issue an explicit host authorization.`,
-          next_tool: 'cindy_ios_simulator',
-          blocked_target: target,
-        },
-      },
-      true,
-    );
-  }
-
-  function targetProvenanceUnavailableResult() {
-    return textResult(
-      {
-        ok: false,
-        errorCode: 'TARGET_PROVENANCE_UNAVAILABLE',
-        data: {
-          message:
-            'Cindy could not verify the target process identity, so this mutating desktop action was blocked. Refresh the target window and try again.',
-        },
-      },
-      true,
-    );
   }
 
   /**
@@ -1053,11 +954,20 @@ export function createComputerMcpServer(
     sessionId: string | undefined,
   ) {
     if (!ELEMENT_INDEX_ACTION_TOOLS.has(name)) return null;
-    if (typeof parsedData.element_index !== 'number') return null;
+    if (typeof parsedData.element_index !== 'number' && typeof parsedData.element_token !== 'string') return null;
     const pid = parsedData.pid as number;
     const windowId = typeof parsedData.window_id === 'number' ? parsedData.window_id : undefined;
 
-    const snapshotId = typeof parsedData.snapshot_id === 'string' ? parsedData.snapshot_id : undefined;
+    let snapshotId = typeof parsedData.snapshot_id === 'string' ? parsedData.snapshot_id : undefined;
+    if (typeof parsedData.element_token === 'string') {
+      const ref = snapshotTracker.elementReference(sessionId, parsedData.element_token, snapshotId);
+      if (!ref || (typeof parsedData.element_index === 'number' && ref.index !== parsedData.element_index)
+        || (snapshotId && !snapshotTracker.sameSnapshot(sessionId, snapshotId, ref.snapshotId))) {
+        return textResult({ ok: false, errorCode: 'STALE_SNAPSHOT', data: { message: 'Unknown or conflicting element token. Call get_window_state again.' } }, true);
+      }
+      snapshotId = ref.snapshotId;
+      if (windowId === undefined) parsedData.window_id = ref.windowId;
+    }
     if (!snapshotId) {
       // 过渡兼容:老调用方 / 未升级的 agent 不带 snapshot_id,放行但留痕,
       // 后续可据此评估何时收紧为强制。
@@ -1070,7 +980,10 @@ export function createComputerMcpServer(
     }
 
     const verdict = snapshotTracker.validate(sessionId, snapshotId, pid, windowId);
-    if (verdict.ok) return null;
+    if (verdict.ok) {
+      parsedData.window_id ??= snapshotTracker.windowId(sessionId, snapshotId);
+      return null;
+    }
     return textResult(
       {
         ok: false,
@@ -1080,7 +993,7 @@ export function createComputerMcpServer(
           snapshot_id: snapshotId,
           reason: verdict.reason,
           hint:
-            'The element_index comes from a window snapshot that is no longer the latest observation of this window, so the target element may have moved or changed. Call get_window_state again for this pid/window_id, then retry with the fresh snapshot_id and element_index.',
+            'The element reference does not identify the latest observation of this window. Call get_window_state again, then use its top-level snapshot_id with element_index or element_token. Supplying that snapshot_id is required when the driver reuses tokens between observations.',
         },
       },
       true,
@@ -1097,8 +1010,7 @@ export function createComputerMcpServer(
     if (name !== 'get_window_state') return null;
     if (typeof parsedData.pid !== 'number' || typeof parsedData.window_id !== 'number') return null;
     // driver 层失败(data.ok === false)不算一次有效观察,不发新代。
-    if (data && typeof data === 'object' && !Array.isArray(data)
-      && (data as { ok?: unknown }).ok === false) {
+    if (!data || typeof data !== 'object' || Array.isArray(data) || !computerResultOutcome(name, data).ok) {
       return null;
     }
     const snapshotId = snapshotTracker.record(sessionId, parsedData.pid, parsedData.window_id);
@@ -1106,10 +1018,39 @@ export function createComputerMcpServer(
     if (driverSnapshotId) {
       snapshotTracker.registerAlias(snapshotId, driverSnapshotId);
     }
+    snapshotTracker.recordElements(snapshotId, (data as { elements?: unknown })?.elements);
     return snapshotId;
   }
 
   return server;
+}
+
+/** Only explicit driver failure signals override legacy/partial observation success. */
+function isUnavailableWindowObservation(
+  data: unknown,
+  args: Record<string, unknown>,
+): boolean {
+  const captureMode = typeof args.screenshot_out_file === 'string' || args.include_screenshot === true
+    ? 'vision'
+    : args.include_screenshot === false ? 'ax' : args.capture_mode;
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return false;
+  const state = data as Record<string, unknown>;
+  if (state.ok === false || state.isError === true) return true;
+  const screenshotFailed =
+    state.screenshot_frame_valid === false ||
+    (state.screenshot_error !== undefined && state.screenshot_error !== null);
+  const hasElements =
+    Array.isArray(state.elements) && state.elements.length > 0;
+  const hasTree =
+    typeof state.tree_markdown === 'string' &&
+    state.tree_markdown.trim().length > 0;
+  const axUnavailable = state.degraded === true && !hasElements && !hasTree;
+  // A screenshot explicitly requested by vision/SOM cannot be replaced by an AX tree.
+  // Conversely, a valid vision-only result may have no AX surface or input route.
+  if (captureMode === 'vision' || captureMode === 'som')
+    return screenshotFailed;
+  if (captureMode === 'ax') return axUnavailable;
+  return screenshotFailed && axUnavailable;
 }
 
 function readDriverSnapshotId(data: unknown): string | null {

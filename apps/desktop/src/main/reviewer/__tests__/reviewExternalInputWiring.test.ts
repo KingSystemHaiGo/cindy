@@ -26,6 +26,27 @@ describe('Review external input wiring', () => {
     }
   });
 
+  it('allows only local Stop through the Review input guard', () => {
+    expect(registerSource).toMatch(
+      /if \(intent !== 'stop' \|\| remote\) await assertReviewExternalInputAllowed\(sid\);/,
+    );
+    const stopHandlerStart = registerSource.indexOf(
+      'ipcMain.handle(MAKER_INVOKE.INPUT_STOP',
+    );
+    const stopHandlerEnd = registerSource.indexOf(
+      'ipcMain.handle(MAKER_INVOKE.INPUT_RESUME',
+      stopHandlerStart,
+    );
+    const stopHandler = registerSource.slice(stopHandlerStart, stopHandlerEnd);
+    expect(stopHandler).toContain('const remote = isDeviceLinkInvoke();');
+    expect(stopHandler).toContain(
+      "await assertRemoteInputControlBoundary(sid, remote, opts, 'stop');",
+    );
+    expect(stopHandler).toContain(
+      'if (!remote) reviewRunControl.noteReviewerStopRequested(sid);',
+    );
+  });
+
   it('also rejects local cross-task and Orca delivery into Review tasks', () => {
     expect(registerSource).toMatch(
       /async function sendToSessionInternal[\s\S]*?await assertReviewExternalInputAllowed\(targetSessionId\);/,
@@ -47,9 +68,41 @@ describe('Review external input wiring', () => {
     expect(reviewStartSource).not.toContain('MAKER_INVOKE.INPUT_ENQUEUE');
   });
 
-  it('binds Git reviews to readable workspace content outside the Git snapshot', () => {
-    expect(registerSource).toContain(
+  it('fingerprints reviewed evidence instead of scanning the whole workspace', () => {
+    // A full-workspace content hash cannot stay inside its byte budget on a
+    // real checkout, and unrelated edits must not invalidate a finished review.
+    expect(registerSource).not.toContain(
       'const artifactPaths = [...reviewReadPaths, sourceWorkingDir];',
+    );
+    // When the change set IS the evidence, its files are bound: Git evidence
+    // hashes identity, status and patches, so an ignored deliverable built by
+    // the reviewed turn is covered by neither fingerprint otherwise.
+    expect(registerSource).toContain(
+      'const artifactPaths = [...new Set([...reviewReadPaths, ...changeSetContent.paths])];',
+    );
+    // A change set that cannot account for its own files is not a usable
+    // baseline; publishing against it would skip the truncated remainder.
+    // A Git fingerprint is not an exemption — it cannot see ignored files,
+    // so a dropped entry that is an ignored deliverable is covered by neither.
+    // The change set contributes nothing at all unless it is the selected
+    // evidence: an unrelated turn must not refuse the review through the gate,
+    // nor bind its own paths into the fingerprint and invalidate the result.
+    expect(registerSource).toContain('const changeSetIsReviewed = !evidence.workspace?.dirty');
+    // Matched with a regex rather than a literal: the repository checks out
+    // with CRLF on Windows, so an embedded \n would never match there.
+    expect(registerSource).toMatch(
+      /\?\s*reviewChangeSetContentPaths\(evidence\.changeSet, sourceWorkingDir\)\s*:\s*\{ paths: \[\], truncated: false \};/,
+    );
+    expect(registerSource).toContain('if (changeSetContent.truncated) {');
+    // The workspace fingerprint pins HEAD, not the base being compared against,
+    // so both gates must recheck the branch baseline as well.
+    expect(
+      registerSource.match(
+        /if \(!\(await reviewBranchBaselineIsCurrent\(source\.id, evidence\.branch\)\)\)/g,
+      ),
+    ).toHaveLength(2);
+    expect(registerSource).not.toContain(
+      'if (changeSetContent.truncated && !evidence.workspaceFingerprint) {',
     );
     expect(registerSource).toContain(
       'const artifactFingerprintOptions = { linkConfinementRoot: sourceWorkingDir };',
@@ -62,8 +115,15 @@ describe('Review external input wiring', () => {
     expect(
       registerSource.indexOf('if (!(await completeArtifactFingerprintIsCurrent()))'),
     ).toBeLessThan(registerSource.indexOf('verifyBeforePublish: async'));
-    expect(registerSource).not.toContain(
-      '...(evidence.workspaceFingerprint ? [] : [sourceWorkingDir])',
+  });
+
+  it('reports a failed branch load instead of claiming there is nothing to review', () => {
+    // A context-free worktree exits before the prompt is built, so the
+    // prompt-level warning never runs; without this the user is told there is
+    // no work when in fact the branch could not be loaded.
+    // Regex, not a literal: the repository checks out with CRLF on Windows.
+    expect(registerSource).toMatch(
+      /evidence\.branchUnavailableReason\s*\?\s*`Review could not load this branch's changes/,
     );
   });
 
@@ -88,18 +148,47 @@ describe('Review external input wiring', () => {
     );
   });
 
-  it('retries failed startup reconciliation before admitting another Review', () => {
-    expect(registerSource.match(/createRetryableReviewStartup\(/g)).toHaveLength(2);
-    expect(registerSource).toContain('void ensureReviewStartupReady().catch(() => {});');
-    expect(registerSource).toMatch(
-      /waitUntilReady: async \(\) => \{\s+await ensureReviewStartupReady\(\);\s+[\s\S]*?await reconcileInterruptedReviews\(\);/,
+  it('prepares Review on demand and reconciles only the requested source task', () => {
+    expect(registerSource.match(/createRetryableReviewInitialization\(/g)).toHaveLength(2);
+    expect(registerSource).not.toContain('void ensureReviewRuntimeReady().catch(() => {});');
+    expect(registerSource).not.toContain('reconcileStaleLeases');
+    expect(registerSource).not.toContain(`LIKE '%"reviewRun"%'`);
+    expect(registerSource).toContain(
+      'await sessionTurnLeaseTracker.refreshActiveLeaseOwners();',
     );
-    const reconcileStart = registerSource.indexOf('const reconcileInterruptedReviews');
+    expect(registerSource).toContain(
+      'void cleanupOrphanedTempAttachments({ currentOwner: reviewRunOwner }).catch',
+    );
+    const wireSessionStart = registerSource.indexOf('export function wireSessionToIpc');
+    const wireSessionEnd = registerSource.indexOf(
+      'export const wireSessionToIpcExternal',
+      wireSessionStart,
+    );
+    expect(registerSource.slice(wireSessionStart, wireSessionEnd)).not.toContain(
+      'ensureReviewOwnerLivenessReady()',
+    );
+    expect(reviewStartSource.indexOf('const request = readStartReviewRequest(raw);')).toBeLessThan(
+      reviewStartSource.indexOf('await deps.waitUntilReady(request.sourceSessionId);'),
+    );
+    expect(registerSource).toMatch(
+      /waitUntilReady: async \(sourceSessionId\) => \{\s+await ensureReviewRuntimeReady\(\);\s+[\s\S]*?await reconcileReviewForSource\(sourceSessionId\);/,
+    );
+    const sourceReadStart = registerSource.indexOf('const readSourceReviewCards');
+    const sourceReadEnd = registerSource.indexOf('const reconcileReviewForSource', sourceReadStart);
+    const sourceRead = registerSource.slice(sourceReadStart, sourceReadEnd);
+    expect(sourceRead).toContain('eq(messages.sessionId, sourceSessionId)');
+    expect(sourceRead).toContain("gte(messages.clientId, 'review:')");
+    expect(sourceRead).toContain("lt(messages.clientId, 'review;')");
+
+    const reconcileStart = registerSource.indexOf('const reconcileReviewForSource');
     const reconcileEnd = registerSource.indexOf(
       'const sourceHasPersistedRunningReview',
       reconcileStart,
     );
     const reconcileSource = registerSource.slice(reconcileStart, reconcileEnd);
+    expect(reconcileSource).toContain(
+      'readPersistedReviewSourceLease(dbClient, sourceSessionId)',
+    );
     expect(reconcileSource.indexOf('patchMessageAgentMeta')).toBeLessThan(
       reconcileSource.indexOf('releaseReviewSourceLease'),
     );
