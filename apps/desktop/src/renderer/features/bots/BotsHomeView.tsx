@@ -80,7 +80,7 @@ export function BotSettings({
   const [portraitRetryFailed, setPortraitRetryFailed] = useState(false);
   const [identitySource, setIdentitySource] = useState(bot.identitySource ?? '');
   const [userContextSource, setUserContextSource] = useState(bot.userContextSource ?? '');
-  const [style, setStyle] = useState<BotCommunicationStyle | undefined>(bot.style);
+  const [style, setStyle] = useState<BotCommunicationStyle | null | undefined>(bot.style);
   const [avatar, setAvatar] = useState(bot.avatar);
   const [avatarColor, setAvatarColor] = useState(bot.avatarColor);
   const [selectedSkills, setSelectedSkills] = useState<string[]>(bot.skills);
@@ -313,7 +313,7 @@ export function BotSettings({
         </details>
 
         <BotCommunicationStyleFields
-          value={style}
+          value={style ?? undefined}
           onChange={(next, kind) => {
             setStyle(next);
             autosave.onEdit(kind);

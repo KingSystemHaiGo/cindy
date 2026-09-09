@@ -46,7 +46,8 @@ export interface BotSettingsDraft {
   description: string;
   identitySource: string;
   userContextSource: string;
-  style?: BotCommunicationStyle;
+  /** 与 payload 对齐:未设置 undefined,显式清空 null。 */
+  style?: BotCommunicationStyle | null;
   avatar: string;
   avatarColor: string;
   capabilities: BotCapabilities;

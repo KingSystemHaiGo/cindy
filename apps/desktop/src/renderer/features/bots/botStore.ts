@@ -161,8 +161,8 @@ export interface BotProfile {
    * 老 profile 与用户自建伙伴没有这个字段,归一为 neutral,文案改用伙伴名字。
    */
   gender?: BotGender;
-  /** 结构化沟通风格。老档案没有 → undefined → 提示词不注入风格块。 */
-  style?: BotCommunicationStyle;
+  /** 结构化沟通风格。老档案没有 → undefined;显式清空 → null。未设置时提示词不注入风格块。 */
+  style?: BotCommunicationStyle | null;
   identitySource?: string;
   userContextSource?: string;
   avatar: string;
@@ -974,11 +974,13 @@ export function updateBotProfile(id: string, patch: BotProfileUpdatePatch): Prom
   const before = profiles.find((bot) => bot.id === id);
   if (!before) return Promise.reject(new Error('Bot not found'));
   const { avatarUploadToken, capabilityBaseline, ...profilePatch } = patch;
-  const { style: patchStyle, ...restPatch } = profilePatch;
+  const { style: patchStyle, capabilities: patchCapabilities, ...restPatch } = profilePatch;
+  // restPatch 不含 style / Partial capabilities, 才能直接当 Partial<BotProfile>。
   const optimisticPatch: Partial<BotProfile> = { ...restPatch };
   if (Object.prototype.hasOwnProperty.call(profilePatch, 'style')) {
     const nextStyle = normalizeBotStyle(patchStyle);
     if (nextStyle) optimisticPatch.style = nextStyle;
+    else optimisticPatch.style = null;
   }
   // 这一行的写入代际。回填与回滚都要求「我仍然是这一行最新的那次写」——
   // 落后的响应一律丢弃,不许覆盖更新的状态(见下面两处 isLatestWrite)。
@@ -991,7 +993,7 @@ export function updateBotProfile(id: string, patch: BotProfileUpdatePatch): Prom
     const next = {
       ...bot,
       ...optimisticPatch,
-      capabilities: { ...bot.capabilities, ...optimisticPatch.capabilities },
+      capabilities: { ...bot.capabilities, ...patchCapabilities },
     };
     if (Object.prototype.hasOwnProperty.call(profilePatch, 'style') && !optimisticPatch.style) {
       delete next.style;
