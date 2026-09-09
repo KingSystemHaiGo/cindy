@@ -77,4 +77,23 @@ describe('sent message atoms', () => {
       'quoted A\n/help before\nquoted B\nPasted text (2 lines) after',
     );
   });
+
+  it('projects pasted payloads to the same visible chip labels used by the message stream', () => {
+    const text = 'before private payload after';
+    const start = text.indexOf('private payload');
+
+    expect(sentInlineTokensDisplayText(buildVisibleSentInlineTokens(
+      text,
+      [{ kind: 'text', text }],
+      [{ start, end: start + 'private payload'.length, display: 'Pasted text (1 line)' }],
+    ))).toBe('before Pasted text (1 line) after');
+  });
+
+  it('projects Pi runtime /skill: chips to the human slash label', () => {
+    expect(sentInlineTokensDisplayText(buildSentInlineTokens(
+      '/skill:git follow-up',
+      [],
+      [{ start: 0, end: 10 }],
+    ))).toBe('/git follow-up');
+  });
 });

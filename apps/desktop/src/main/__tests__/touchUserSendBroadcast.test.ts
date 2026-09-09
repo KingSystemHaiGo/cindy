@@ -23,6 +23,7 @@ const h = vi.hoisted(() => {
   // 填进来（userSendAt/updatedAt = 本次 ts），模拟正常路径。
   // 需要非默认结果（no-op/MAX updatedAt）的测试先 push 目标行再调函数。
   const selectResults: Array<Array<Record<string, unknown>>> = [];
+  const updateErrors: unknown[] = [];
 
   const makeUpdateChain = () => {
     const chain: Record<string, unknown> = {};
@@ -35,7 +36,10 @@ const h = vi.hoisted(() => {
       }
       return chain;
     };
-    chain.where = () => Promise.resolve(undefined);
+    chain.where = () => {
+      const error = updateErrors.shift();
+      return error === undefined ? Promise.resolve(undefined) : Promise.reject(error);
+    };
     return chain;
   };
 
@@ -51,12 +55,14 @@ const h = vi.hoisted(() => {
   return {
     tapWindowBroadcast: vi.fn(),
     webContentsSend: vi.fn(),
+    broadcastSubagentRunsInvalidated: vi.fn(),
     agentIslandService: {
       handleSessionClosed: vi.fn(),
       handleSessionMetadataPatch: vi.fn(),
     },
     updateSetCalls,
     selectResults,
+    updateErrors,
     fakeDb: {
       update: vi.fn(() => makeUpdateChain()),
       select: vi.fn(() => makeSelectChain()),
@@ -75,7 +81,9 @@ vi.mock('../logger', () => ({
 }));
 // 被 sessions.ts 顶层 import 但与本测试无关的副作用模块,全部 stub 掉避免触碰 electron app 路径。
 vi.mock('../localDb/dialogueWorkspace', () => ({ ensureDialogueWorkspaceDir: vi.fn() }));
-vi.mock('../git-context/prRefsStore', () => ({ recomputePrRefsForSession: vi.fn(() => Promise.resolve()) }));
+vi.mock('../git-context/prRefsStore', () => ({
+  recomputePrRefsForSession: vi.fn(() => Promise.resolve()),
+}));
 vi.mock('../localDb/ipc/recentWorkdirs', () => ({ upsertRecentWorkdir: vi.fn() }));
 vi.mock('../device-link/broadcast-tap', () => ({
   captureDataOwnerBroadcastScope: vi.fn(() => null),
@@ -87,14 +95,26 @@ vi.mock('../localDb/client/current', () => ({ getDbClient: () => ({ drizzle: h.f
 vi.mock('../agent-island/service.js', () => ({
   getAgentIslandService: () => h.agentIslandService,
 }));
+vi.mock('../localDb/ipc/subagentRuns.js', () => ({
+  broadcastSubagentRunsInvalidated: h.broadcastSubagentRunsInvalidated,
+}));
 
 import { notifyAgentIslandSessionPatch } from '../localDb/agentIslandSessionPatch.js';
-import { clearSessionContextInDb, touchUserSendInDb, persistSessionFields } from '../localDb/ipc/sessions.js';
+import {
+  clearSessionContextInDb,
+  touchUserSendInDb,
+  persistSessionFields,
+} from '../localDb/ipc/sessions.js';
+import {
+  backgroundTurnPredatesSessionClear,
+  noteSessionClearBoundary,
+} from '../messagePersistBroadcaster.js';
 
 beforeEach(() => {
   vi.clearAllMocks();
   h.updateSetCalls.length = 0;
   h.selectResults.length = 0;
+  h.updateErrors.length = 0;
 });
 
 describe('touchUserSendInDb 广播 sessions:patched(device-link 项目归属收敛)', () => {
@@ -135,7 +155,7 @@ describe('touchUserSendInDb 广播 sessions:patched(device-link 项目归属收�
     const payload = tapArg?.[1] as { sessionId: string; patch: Record<string, unknown> };
     expect(payload.sessionId).toBe('sess-2');
     expect(typeof payload.patch.userSendAt).toBe('string'); // ISO
-    expect(typeof payload.patch.updatedAt).toBe('string');  // ISO
+    expect(typeof payload.patch.updatedAt).toBe('string'); // ISO
   });
 
   it('atomic guard: UPDATE no-op 时（验证 SELECT 返回空）跳过广播，不向 renderer 发送过时值', async () => {
@@ -182,12 +202,44 @@ describe('clearSessionContextInDb 广播 sessions:patched(device-link /clear 收
     const iso = new Date(atMs).toISOString();
     expect(h.webContentsSend).toHaveBeenCalledWith('local-db:sessions:patched', {
       sessionId: 'sess-clear',
-      patch: { sdkSessionId: null, clearedAt: iso, updatedAt: iso },
+      patch: { sdkSessionId: null, clearedAt: iso, updatedAt: iso, preview: null },
     });
     expect(h.tapWindowBroadcast).toHaveBeenCalledWith('local-db:sessions:patched', {
       sessionId: 'sess-clear',
-      patch: { sdkSessionId: null, clearedAt: iso, updatedAt: iso },
+      patch: { sdkSessionId: null, clearedAt: iso, updatedAt: iso, preview: null },
     });
+    expect(h.broadcastSubagentRunsInvalidated).toHaveBeenCalledWith('sess-clear', null);
+  });
+
+  it('把 DB 读回的有效 clear 边界登记给晚到 background 过滤器', async () => {
+    const sessionId = 'sess-clear-background-boundary';
+    const requestedAt = 1_700_000_123_000;
+    const effectiveAt = requestedAt + 5_000;
+    noteSessionClearBoundary(sessionId, null);
+    expect(backgroundTurnPredatesSessionClear(sessionId, effectiveAt - 1)).toBe(false);
+
+    // 并发的较新 clear 可能已经把 DB 边界推进到 requestedAt 之后；内存过滤器
+    // 必须采用 SELECT 读回的有效值，不能只记本次请求参数。
+    h.selectResults.push([{ clearedAt: effectiveAt, updatedAt: effectiveAt }]);
+    await clearSessionContextInDb(sessionId, requestedAt);
+
+    expect(backgroundTurnPredatesSessionClear(sessionId, effectiveAt - 1)).toBe(true);
+    expect(backgroundTurnPredatesSessionClear(sessionId, effectiveAt + 1)).toBe(false);
+    noteSessionClearBoundary(sessionId, null);
+  });
+
+  it('DB 落库失败时仍先登记 host-owned clear 边界', async () => {
+    const sessionId = 'sess-clear-background-boundary-db-failure';
+    const requestedAt = 1_700_000_456_000;
+    noteSessionClearBoundary(sessionId, null);
+    h.updateErrors.push(new Error('db unavailable'));
+
+    await expect(clearSessionContextInDb(sessionId, requestedAt)).rejects.toThrow('db unavailable');
+
+    expect(h.broadcastSubagentRunsInvalidated).not.toHaveBeenCalled();
+    expect(backgroundTurnPredatesSessionClear(sessionId, requestedAt - 1)).toBe(true);
+    expect(backgroundTurnPredatesSessionClear(sessionId, requestedAt + 1)).toBe(false);
+    noteSessionClearBoundary(sessionId, null);
   });
 });
 
@@ -224,7 +276,10 @@ describe('persistSessionFields(远程 set-* 回流:字段白名单 + 广播)', (
     } as Record<string, unknown>);
 
     expect(h.updateSetCalls).toHaveLength(1);
-    expect(h.updateSetCalls[0]).toMatchObject({ model: 'claude-opus-4-8', providerId: 'anthropic' });
+    expect(h.updateSetCalls[0]).toMatchObject({
+      model: 'claude-opus-4-8',
+      providerId: 'anthropic',
+    });
     expect(lastTapPatch()!.patch).toEqual({ model: 'claude-opus-4-8', providerId: 'anthropic' });
   });
 
@@ -242,11 +297,18 @@ describe('persistSessionFields(远程 set-* 回流:字段白名单 + 广播)', (
       extraDirs: ['/a', '/b'],
       permissionMode: 'plan',
     } as Record<string, unknown>);
-    expect(lastTapPatch()!.patch).toEqual({ fastMode: true, extraDirs: ['/a', '/b'], permissionMode: 'plan' });
+    expect(lastTapPatch()!.patch).toEqual({
+      fastMode: true,
+      extraDirs: ['/a', '/b'],
+      permissionMode: 'plan',
+    });
   });
 
   it('patch 不含任何白名单字段 → 早退:不写库、不广播', async () => {
-    await persistSessionFields('sess-2', { title: 'x', status: 'archived' } as Record<string, unknown>);
+    await persistSessionFields('sess-2', { title: 'x', status: 'archived' } as Record<
+      string,
+      unknown
+    >);
     expect(h.updateSetCalls).toHaveLength(0);
     expect(h.tapWindowBroadcast).not.toHaveBeenCalled();
   });

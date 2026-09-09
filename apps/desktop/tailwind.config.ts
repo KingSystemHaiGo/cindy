@@ -57,6 +57,8 @@ const config: Config = {
       fontFamily: {
         mono: ['var(--app-font-code, var(--app-font-code-default))'],
       },
+      // DESIGN.md §3 numeric 字号白名单的 Tailwind 权威来源之一。规范正本
+      // 与三处权威来源代码由守卫互验；lib/utils.ts 是单独校验的消费端去重列表。
       fontSize: {
         xs: ['var(--text-xs)', { lineHeight: 'var(--text-xs-line-height)' }],
         sm: ['var(--text-sm)', { lineHeight: 'var(--text-sm-line-height)' }],
@@ -67,7 +69,6 @@ const config: Config = {
         '3xl': ['var(--text-3xl)', { lineHeight: 'var(--text-3xl-line-height)' }],
         '4xl': ['var(--text-4xl)', { lineHeight: 'var(--text-4xl-line-height)' }],
         '5xl': ['var(--text-5xl)', { lineHeight: 'var(--text-5xl-line-height)' }],
-        9: 'var(--text-9)',
         10: 'var(--text-10)',
         11: 'var(--text-11)',
         12: 'var(--text-12)',
@@ -75,17 +76,9 @@ const config: Config = {
         14: 'var(--text-14)',
         15: 'var(--text-15)',
         16: 'var(--text-16)',
-        17: 'var(--text-17)',
         18: 'var(--text-18)',
-        19: 'var(--text-19)',
         20: 'var(--text-20)',
-        21: 'var(--text-21)',
-        22: 'var(--text-22)',
-        23: 'var(--text-23)',
         24: 'var(--text-24)',
-        25: 'var(--text-25)',
-        26: 'var(--text-26)',
-        27: 'var(--text-27)',
         28: 'var(--text-28)',
       },
       borderRadius: {
@@ -120,6 +113,11 @@ const config: Config = {
           from: { opacity: '1' },
           to: { opacity: '0' },
         },
+        // 共享 confirm-content-in/out:存量弹窗仍是 left-1/2 top-1/2 +
+        // -translate-x/y-1/2 的 transform 居中,动画期间 keyframes 的 transform
+        // 会整体覆盖 Tailwind 的 translate —— 不把 translate(-50%, -50%) 烘进
+        // 每一帧,弹窗入退场时会跳到视口左上角(位移一半宽高)。故共享动画
+        // 保持 translate + scale,不得删除。
         'confirm-content-in': {
           from: { opacity: '0', transform: 'translate(-50%, -50%) scale(0.95)' },
           to: { opacity: '1', transform: 'translate(-50%, -50%) scale(1)' },
@@ -127,6 +125,18 @@ const config: Config = {
         'confirm-content-out': {
           from: { opacity: '1', transform: 'translate(-50%, -50%) scale(1)' },
           to: { opacity: '0', transform: 'translate(-50%, -50%) scale(0.95)' },
+        },
+        // 布局居中弹窗专用(ConfirmDialog 的 inset-0 + m-auto 方案,confirm-dialog.tsx):
+        // keyframes 里不得再带回 translate —— app-region 命中区不跟随 transform,
+        // 入场/退场期间 translate 会把弹窗甩出 no-drag 挖洞。fade + scale 仍按
+        // DESIGN.md §14.4 的 heavy-overlay 规格(250ms in / 150ms out)。
+        'confirm-content-layout-in': {
+          from: { opacity: '0', transform: 'scale(0.95)' },
+          to: { opacity: '1', transform: 'scale(1)' },
+        },
+        'confirm-content-layout-out': {
+          from: { opacity: '1', transform: 'scale(1)' },
+          to: { opacity: '0', transform: 'scale(0.95)' },
         },
       },
       animation: {
@@ -151,6 +161,10 @@ const config: Config = {
           'confirm-content-in var(--motion-enter, 250ms) cubic-bezier(0, 0, 0.2, 1)',
         'confirm-content-out':
           'confirm-content-out var(--motion-exit, 150ms) cubic-bezier(0.4, 0, 1, 1)',
+        'confirm-content-layout-in':
+          'confirm-content-layout-in var(--motion-enter, 250ms) cubic-bezier(0, 0, 0.2, 1)',
+        'confirm-content-layout-out':
+          'confirm-content-layout-out var(--motion-exit, 150ms) cubic-bezier(0.4, 0, 1, 1)',
       },
     },
   },

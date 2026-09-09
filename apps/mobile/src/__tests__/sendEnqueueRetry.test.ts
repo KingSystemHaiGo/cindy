@@ -9,22 +9,20 @@ import { describe, expect, it } from 'vitest';
  * - BACKPRESSURE 要么在本地发送前拒绝,要么由被控端 admission 明确拒绝执行;
  * - projection 也无法证明未入队——空闲 agent 下 enqueue-immediate 会把消息瞬间
  *   slice 进 activeTurn,pendingQueue 里查不到;
- * 因此自动重发只允许发生在「保证未发出」的失败上(inFlight 未置位),in-flight
- * 歧义失败一律交回滚路径;被控端 enqueue 另有 clientId 幂等去重兜底。
  */
 describe('send enqueue weak-network retry ordering', () => {
   const source = readFileSync(resolve(process.cwd(), 'app/sessions/[sessionId].tsx'), 'utf8');
 
   /**
    * 提取全部 enqueue 弱网重试循环体(send 原路径 + outbox 派发路径各一个),
-   * 每个循环以其后最近的「setInputProjection(…, projection);」为界。
+   * 每个循环以其后最近的 projection store 写入为界。
    * 两条路径共用同一套写序边界,守卫必须逐个覆盖,不能只查第一个。
    */
   const LOOP_MARKER = 'for (let attempt = 0; ; attempt++) {';
   const extractRetryLoops = (): string[] => {
     const loops: string[] = [];
     for (let from = source.indexOf(LOOP_MARKER); from > -1; from = source.indexOf(LOOP_MARKER, from + 1)) {
-      const endMatch = /remoteSessionStore\.setInputProjection\([^)]*, projection\);/.exec(source.slice(from));
+      const endMatch = /remoteSessionStore\.setInputProjectionIfCurrent\(\s*[^,]+,\s*projection,\s*projectionEpochAtRequestStart,\s*projectionRemoteEpochAtRequestStart,\s*queued\.clientId,\s*\);/.exec(source.slice(from));
       expect(endMatch).not.toBeNull();
       loops.push(source.slice(from, from + (endMatch?.index ?? 0)));
     }

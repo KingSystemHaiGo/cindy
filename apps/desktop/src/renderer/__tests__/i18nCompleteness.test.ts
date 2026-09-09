@@ -28,17 +28,18 @@ const PLURAL_SUFFIXES = ['_zero', '_one', '_two', '_few', '_many', '_other'] as 
  * 记录在案以免阻断 device-link 工作;后续按文件 owner 逐条补齐后从这里删除。
  */
 const KNOWN_MISSING: ReadonlySet<string> = new Set([
-  'ccAgent.workdirBrowse.fileBody.drawioLoading',
-  'ccAgent.workdirBrowse.fileBody.pdfLoading',
-  'chat.media.clickToZoom',
 ]);
 
 function loadLocales(): Record<string, unknown>[] {
   const dirs = readdirSync(LOCALES_DIR, { withFileTypes: true })
     .filter((d) => d.isDirectory())
     .map((d) => d.name);
-  return dirs.map((d) =>
-    JSON.parse(readFileSync(resolve(LOCALES_DIR, d, 'common.json'), 'utf8')) as Record<string, unknown>,
+  return dirs.map(
+    (d) =>
+      JSON.parse(readFileSync(resolve(LOCALES_DIR, d, 'common.json'), 'utf8')) as Record<
+        string,
+        unknown
+      >,
   );
 }
 
@@ -107,10 +108,10 @@ async function scanSource(): Promise<Scan> {
 }
 
 describe('i18n completeness (static keys present in all locales)', () => {
-  it('every static t() key (no inline default) exists in all 4 locales', async () => {
+  it('every static t() key (no inline default) exists in all supported locales', async () => {
     const locales = localeNames();
     const trees = loadLocales();
-    expect(locales.length).toBeGreaterThanOrEqual(4); // zh-CN / en / ja / ko
+    expect(locales.length).toBeGreaterThanOrEqual(5); // zh-CN / zh-TW / en / ja / ko
 
     const { used, withDefault, templateCount } = await scanSource();
 

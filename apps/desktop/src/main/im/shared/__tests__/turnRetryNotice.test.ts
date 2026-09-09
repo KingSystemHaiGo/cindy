@@ -198,23 +198,60 @@ describe('terminalErrorText', () => {
     expect(terminalErrorText({})).toBe('[object Object]');
   });
 
+  it('工具循环终态只输出渠道安全文案, 不泄漏内部分类', () => {
+    const text = terminalErrorText({
+      message: 'tool_use_loop_detected: missing_required_field',
+      reason: 'tool_use_loop_detected',
+      toolLoop: { kind: 'contract', count: 3 },
+    });
+
+    expect(text).toContain('无效的工具调用');
+    expect(text).toContain('3 次失败');
+    expect(text).not.toContain('tool_use_loop_detected');
+    expect(text).not.toContain('missing_required_field');
+  });
+
+  it('缺失或越界的 toolLoop 详情仍回落到通用安全文案', () => {
+    const text = terminalErrorText({
+      message: 'tool_use_loop_detected: secret_internal_hint',
+      reason: 'tool_use_loop_detected',
+      toolLoop: { kind: 'secret_internal_kind', count: 999999999 },
+    });
+
+    expect(text).toContain('重复调用工具次数过多');
+    expect(text).not.toContain('secret_internal_hint');
+    expect(text).not.toContain('secret_internal_kind');
+  });
+
   /**
    * Auto 档审阅器故障同样走非终止 error。渠道侧原来对这类一律静默 —— Slack /
    * Telegram 上的用户只看到工具接连被拒、没有原因(codex P1 of #1574)。
    */
   it('Auto 档审阅器不可用 → 渠道侧说明 + 可执行动作', () => {
     const notice = turnRetryNotice({
-      message: '[AUTO_REVIEW_UNAVAILABLE] Auto-review is temporarily unavailable, so actions '
-        + 'that need review are being denied. Switch this task to Default permissions if you '
-        + 'want to approve them yourself.',
+      message: '[AUTO_REVIEW_UNAVAILABLE] Auto-review could not reach a decision (network or '
+        + 'service hiccup), so actions that need review are being handed to you to confirm.',
       isTerminal: false,
     });
-    expect(notice).toContain('自动审批暂时不可用');
+    expect(notice).toContain('自动审批暂时无法给出判断');
+    // 必须说清操作的去向 —— 现在是转交用户确认,不再是静默拒绝。
+    expect(notice).toContain('转由你来确认');
     // 必须给出用户能做的事,否则等于只说"又失败了"。
     expect(notice).toContain('默认权限');
     // 不得把 [CODE] 前缀或英文原文推给渠道用户。
     expect(notice).not.toContain('AUTO_REVIEW_UNAVAILABLE');
-    expect(notice).not.toContain('Auto-review is temporarily');
+    expect(notice).not.toContain('Auto-review could not');
+  });
+
+  it('确认卡没送到 → 渠道侧说明这次不是用户拒绝', () => {
+    const notice = turnRetryNotice({
+      message: '[AUTO_REVIEW_CONFIRM_UNDELIVERED] Automatic review was unavailable, and the '
+        + 'confirmation request was not completed. This is not a user rejection.',
+      isTerminal: false,
+    });
+    expect(notice).toContain('这次拒绝不是你点的');
+    expect(notice).not.toContain('AUTO_REVIEW_CONFIRM_UNDELIVERED');
+    expect(notice).not.toContain('not a user rejection');
   });
 
   it('其它带 bracket code 的非终止 error 仍保持静默', () => {

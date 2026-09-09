@@ -1,12 +1,15 @@
 import { beforeAll, describe, expect, it } from 'vitest';
+import { DeviceLinkError } from '@cindy/device-link';
 import { i18n } from '@/i18n';
 import {
   buildOutboxItem,
   createOutboxClientId,
+  isSafelyUnsentOutboxEnqueueError,
   outboxDisplayItem,
   outboxItemAttachments,
   outboxItemReady,
   outboxItemRetrying,
+  outboxItemWaitingForConnection,
   outboxItemWithEnqueueFailure,
   outboxItemWithUpload,
   outboxItemWithUploadFailure,
@@ -14,6 +17,7 @@ import {
   outboxWithUploadResult,
   recoverOutboxItemsToComposerDraft,
   replaceOutboxItem,
+  shouldHoldOutboxDispatchForConnection,
 } from '@/session/sessionOutbox';
 import type { RemoteSerializedAttachment } from '@/session/types';
 import { serializeComposerDocument } from '@/session/composerDocument';
@@ -53,6 +57,68 @@ describe('createOutboxClientId', () => {
     const b = createOutboxClientId();
     expect(a).toBeTruthy();
     expect(a).not.toBe(b);
+  });
+});
+
+describe('shouldHoldOutboxDispatchForConnection', () => {
+  const online = {
+    relayOnline: true,
+    targetAvailable: true,
+    deviceUnresponsive: false,
+    autoRecoveringError: false,
+    syncInProgress: false,
+  };
+
+  it('只在 relay、目标 presence、熔断和请求状态都健康时派发', () => {
+    expect(shouldHoldOutboxDispatchForConnection(online)).toBe(false);
+    expect(shouldHoldOutboxDispatchForConnection({ ...online, relayOnline: false })).toBe(true);
+    expect(shouldHoldOutboxDispatchForConnection({ ...online, targetAvailable: false })).toBe(true);
+    expect(shouldHoldOutboxDispatchForConnection({ ...online, deviceUnresponsive: true })).toBe(true);
+    expect(shouldHoldOutboxDispatchForConnection({ ...online, autoRecoveringError: true })).toBe(true);
+    expect(shouldHoldOutboxDispatchForConnection({ ...online, syncInProgress: true })).toBe(true);
+  });
+
+  it('presence 尚未知时不把健康连接永久卡住', () => {
+    expect(shouldHoldOutboxDispatchForConnection({
+      ...online,
+      targetAvailable: null,
+    })).toBe(false);
+  });
+
+  it('新连接代把旧 offline 降为 unknown，且本代新 offline 仍会重新阻塞', () => {
+    expect(shouldHoldOutboxDispatchForConnection({
+      ...online,
+      targetAvailable: false,
+    })).toBe(true);
+    expect(shouldHoldOutboxDispatchForConnection({
+      ...online,
+      targetAvailable: null,
+    })).toBe(false);
+    expect(shouldHoldOutboxDispatchForConnection({
+      ...online,
+      targetAvailable: false,
+    })).toBe(true);
+  });
+});
+
+describe('isSafelyUnsentOutboxEnqueueError', () => {
+  it('只允许明确发生在派发前的连接失败自动回队', () => {
+    expect(isSafelyUnsentOutboxEnqueueError(
+      new DeviceLinkError('NOT_CONNECTED', 'not connected'),
+    )).toBe(true);
+    expect(isSafelyUnsentOutboxEnqueueError(
+      new DeviceLinkError('LINK_NOT_OPEN', 'link is closed'),
+    )).toBe(true);
+    expect(isSafelyUnsentOutboxEnqueueError('[DEVICE_UNRESPONSIVE] circuit open')).toBe(true);
+  });
+
+  it('拒绝可能已经到达被控端的 in-flight 断线与 invoke 超时', () => {
+    const ambiguous = new DeviceLinkError('NOT_CONNECTED', 'ack may be lost');
+    ambiguous.inFlight = true;
+    expect(isSafelyUnsentOutboxEnqueueError(ambiguous)).toBe(false);
+    expect(isSafelyUnsentOutboxEnqueueError(
+      new DeviceLinkError('INVOKE_TIMEOUT', 'no result'),
+    )).toBe(false);
   });
 });
 
@@ -294,6 +360,14 @@ describe('outboxItemRetrying / outboxItemWithEnqueueFailure', () => {
     item = outboxItemRetrying(item);
     expect(outboxItemReady(item)).toBe(true);
   });
+
+  it('派发途中断线回到等待连接态，不变成需要用户重试的失败项', () => {
+    const dispatching = { ...itemWith(), phase: 'dispatching' as const };
+    const waiting = outboxItemWaitingForConnection(dispatching);
+    expect(waiting.phase).toBe('uploading');
+    expect(waiting.enqueueError).toBeNull();
+    expect(outboxItemReady(waiting)).toBe(true);
+  });
 });
 
 describe('outboxDisplayItem', () => {
@@ -330,7 +404,7 @@ describe('outboxDisplayItem', () => {
       readyPreviews: ['file:///tmp/ready-preview.jpg'],
       claimedUploads: [
         { localId: 'u-img', failed: false, kind: 'image', previewUri: 'file:///tmp/pending.jpg' },
-        { localId: 'u-pdf', failed: false, kind: 'file', previewUri: 'file:///tmp/scan.pdf' },
+        { localId: 'u-pdf', failed: false, kind: 'file', previewUri: 'file:///tmp/scan.pdf', name: 'scan.pdf' },
       ],
     });
     let display = outboxDisplayItem(item);
@@ -345,6 +419,7 @@ describe('outboxDisplayItem', () => {
       { key: 'c-1-slot-1', uri: 'file:///tmp/pending.jpg', ossRef: null, uploading: true },
     ]);
     expect(display.fileCount).toBe(1);
+    expect(display.fileNames).toEqual(['scan.pdf']);
     // 上传落定后:uploading 归零,ossRef 补上,本地预览保留(第一帧到落定零跳变)。
     item = outboxItemWithUpload(item, 'u-img', attachmentFor('landed.jpg'));
     display = outboxDisplayItem(item);

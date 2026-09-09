@@ -66,8 +66,31 @@ describe('isInterruptedTurnError', () => {
     ).toBe(true);
   });
 
+  it('rejects oversized-history classification so auto-resume cannot loop', () => {
+    expect(
+      isInterruptedTurnError({
+        reason: 'codex_history_oversized',
+        message: 'Codex remote compaction cannot finish because this thread\'s live history is oversized.',
+      }),
+    ).toBe(false);
+  });
+
+  it('accepts the classified empty-response reason (#2320)', () => {
+    // translator 只在「发起过 API 调用、零文本、零工具、零 usage 增量」的严格
+    // 形态下盖这个 key —— 上游/网关返回退化空响应,与流被切断同属连接层故障,
+    // 由既有连续失败上限与人工介入周期硬上限止损。
+    expect(
+      isInterruptedTurnError({
+        reason: 'empty-response',
+        message: 'The model returned an empty response.',
+      }),
+    ).toBe(true);
+    // reason 是权威判据:不要求 sdkError tag,也不要求文案形态。
+    expect(isInterruptedTurnError({ reason: 'empty-response' })).toBe(true);
+  });
+
   it('rejects errors that carry a stable reason (已分类,另有处置路径)', () => {
-    for (const reason of ['empty-response', 'turn-failed', 'silent-stop-exhausted']) {
+    for (const reason of ['turn-failed', 'silent-stop-exhausted']) {
       expect(
         isInterruptedTurnError({
           sdkError: 'server_error',
@@ -126,10 +149,14 @@ describe('isInterruptedTurnError', () => {
       'socket hang up',
       'Request timed out',
       'API Error: The operation timed out.',
+      'The operation timed out.',
+      'OpenAI Responses stream ended before a terminal response event',
       'Connection error',
       'upstream unreachable',
       '502 Bad Gateway',
       'Service Unavailable',
+      'API Error: upstream stream error: terminated',
+      'upstream stream error: socket reset',
     ]) {
       expect(isInterruptedTurnError({ message }), `${message} 应自动重连`).toBe(true);
     }
@@ -159,6 +186,8 @@ describe('isInterruptedTurnError', () => {
       ['请求非法', { sdkError: 'invalid_request', message: 'prompt too long' }],
       ['codex thread', { message: 'thread not found' }],
       ['加密内容失效', { message: 'invalid encrypted content' }],
+      ['Pi auto-retry 耗尽后交给用户点重试', { reason: 'pi-gateway-drop', message: 'The operation timed out.' }],
+      ['Codex 鉴权会话结束', { message: 'app_session_terminated' }],
     ] as Array<[string, Parameters<typeof isInterruptedTurnError>[0]]>) {
       expect(isInterruptedTurnError(signals), `${label} 不该自动重连`).toBe(false);
     }
@@ -297,6 +326,35 @@ describe('InterruptedTurnAutoResumeGuard', () => {
       }
     }
     expect(g.guard.onInterruptedTurn(SID, runInterruptedTurn(g))).toEqual({
+      action: 'exhausted',
+      reason: 'consecutive',
+      consecutiveAttempts: INTERRUPTED_TURN_MAX_CONSECUTIVE_ATTEMPTS,
+      episodeAttempts: INTERRUPTED_TURN_MAX_CONSECUTIVE_ATTEMPTS,
+    });
+  });
+
+  it('does not recharge exhausted retry budget from a late background tool event', () => {
+    const g = createGuard();
+    for (let i = 0; i < INTERRUPTED_TURN_MAX_CONSECUTIVE_ATTEMPTS; i += 1) {
+      const decision = g.guard.onInterruptedTurn(SID, runInterruptedTurn(g));
+      expect(decision.action).toBe('resume');
+      if (decision.action !== 'resume') return;
+      g.guard.noteAttemptEvent(SID, decision.attemptToken);
+      g.guard.noteAttemptSettled(SID, decision.attemptToken);
+    }
+    expect(g.guard.onInterruptedTurn(SID, g.now()).action).toBe('exhausted');
+
+    // This models the state-machine side of the listener guard; the source
+    // contract test separately locks that register.ts uses the same condition.
+    const lateBackgroundToolUse = { type: 'tool_use', turnScope: 'background' };
+    if (
+      lateBackgroundToolUse.turnScope !== 'background' &&
+      isSubstantiveProgressEvent(lateBackgroundToolUse)
+    ) {
+      g.guard.noteProgress(SID);
+    }
+
+    expect(g.guard.onInterruptedTurn(SID, g.now() + 1)).toEqual({
       action: 'exhausted',
       reason: 'consecutive',
       consecutiveAttempts: INTERRUPTED_TURN_MAX_CONSECUTIVE_ATTEMPTS,

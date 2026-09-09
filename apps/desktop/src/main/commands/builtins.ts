@@ -11,10 +11,19 @@
  */
 
 import { spawn } from 'node:child_process';
-import { BrowserWindow, webContents } from 'electron';
+import { app, BrowserWindow, webContents } from 'electron';
 import { BRAND_NAME } from '@cindy/maker-shared/branding';
 import { MAKER_PUSH } from '../maker-ipc/channels.js';
 import { createLogger } from '../logger.js';
+import { t } from '../i18n.js';
+import { throwIpcError } from '../utils/ipcValidate.js';
+import { isTrustedAppRendererWindow } from '../security/trustedAppRenderer.js';
+import { createMakeDoctorCommand } from '../cindy-make/doctorCommand.js';
+import { createMakeToolchainEnvironment } from '../cindy-make/toolchainEnvironment.js';
+import { prepareCindyMakeEnvironment } from '../cindy-make/prepare.js';
+import { searchCindyUpstream } from '../cindy-make/upstreamQuery.js';
+import { makeToolRoot } from '../cindy-make/toolInstaller.js';
+import type { MakeDoctorReport } from '../../shared/cindyMakeDoctor.js';
 // type-only:不引入对 goal-host / learn-host 的运行时依赖(避免潜在 import 环),
 // 运行时实例由 bootstrap 经 deps.getGoalController / getLearnController 注入。
 import type { GoalController } from '../goal-host/controller.js';
@@ -31,7 +40,9 @@ const log = createLogger('desktop-commands');
  * 执行结果(stdout / stderr / exitCode / elapsedMs / cmdLine / cwd / timedOut)。
  */
 export interface DesktopCommandTriggeredPayload {
-  command: 'help' | 'clear' | 'cmd' | 'issue' | 'jump-session' | 'goal' | 'workflows' | 'learn';
+  command:
+    'help' | 'clear' | 'cmd' | 'issue' | 'review' | 'jump-session' | 'goal' | 'workflows' | 'learn' | 'cindy-make-doctor' | 'cindy-make';
+  doctorReport?: MakeDoctorReport;
   sessionId?: string;
   workingDir?: string;
   args?: string;
@@ -335,6 +346,38 @@ export function registerBuiltinDesktopCommands(
   registry: DesktopCommandRegistry,
   deps: BuiltinDesktopCommandDeps,
 ): void {
+  for (const name of ['cindy-make-doctor', 'cindy-make'] as const) registry.register(
+    createMakeDoctorCommand({
+      name,
+      description: () => t(name === 'cindy-make' ? 'cindyMake.description' : 'cindyMakeDoctor.description'),
+      environment: (ctx) => createMakeToolchainEnvironment(app.getPath('userData'), {
+        forceManagedTools: ctx.forceManagedTools === true,
+      }),
+      allowInstallTest: () => !app.isPackaged,
+      searchUpstream: async (request, signal) => {
+        const { outboundFetch } = await import('../maker-host/outbound-fetch.js');
+        return searchCindyUpstream(request, signal, { fetch: outboundFetch });
+      },
+      prepare: (runId, env, signal, publish) => prepareCindyMakeEnvironment(
+        runId, env, makeToolRoot(app.getPath('userData')), signal, publish,
+      ),
+      publish: (ctx, doctorReport) => {
+        const target = typeof ctx.senderWebContentsId === 'number'
+          ? webContents.fromId(ctx.senderWebContentsId)
+          : undefined;
+        // Local diagnostics are private to the invoking trusted window; never broadcast.
+        if (
+          !target || target.isDestroyed() ||
+          !isTrustedAppRendererWindow(BrowserWindow.fromWebContents(target))
+        ) return;
+        try {
+          target.send(MAKER_PUSH.DESKTOP_COMMAND_TRIGGERED, { command: name, doctorReport });
+        } catch {
+          /* Closing a view does not change the diagnostic result. */
+        }
+      },
+    }),
+  );
   registry.register({
     name: 'help',
     description: 'Show the help card with every available command and usage example.',
@@ -443,6 +486,19 @@ export function registerBuiltinDesktopCommands(
   });
 
   registry.register({
+    name: 'review',
+    description:
+      'Review the current task in a fresh, memory-free, read-only reviewer task. Supports code changes, files, documents, and images. Usage: /review [focus or path]',
+    execute: () => {
+      // ChatInput invokes maker:start-review directly so its exact attachment
+      // snapshot crosses the durable Main boundary before the view can unmount.
+      // Refuse any unbound registry invocation instead of silently broadcasting
+      // an event that may have no mounted consumer.
+      throw new Error('/review must be started from a task composer');
+    },
+  });
+
+  registry.register({
     name: 'goal',
     description:
       'Set an autonomous goal — the agent keeps working across turns until it is met, blocked, or the budget runs out. Usage: /goal <condition>. Clear with /goal clear.',
@@ -527,12 +583,13 @@ export function registerBuiltinDesktopCommands(
       }
       // `/learn hub:<slug> [补充要求]` —— skill hub「学习此技能」预填的形态,
       // 用户可在输入框改要求、换模型后再发。slug 规则与市场一致([a-z0-9-])。
-      const hubMatch = /^hub:([a-z0-9][a-z0-9-]*)\s*/.exec(arg);
+      const hubMatch = /^hub:(?:(market|team):)?([a-z0-9][a-z0-9-]*)\s*/.exec(arg);
       const req = hubMatch
         ? {
             input: arg.slice(hubMatch[0].length).trim(),
             sourceKind: 'hub' as const,
-            hubSlug: hubMatch[1],
+            hubSlug: hubMatch[2],
+            ...(hubMatch[1] ? { hubCatalogScope: hubMatch[1] as 'market' | 'team' } : {}),
             ...(ctx.sessionId ? { originSessionId: ctx.sessionId } : {}),
           }
         : {

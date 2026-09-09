@@ -18,11 +18,15 @@
  *   - root-query sections (Add / Plugins / Reference directories)
  *   - click-outside close (ignoring the `+` trigger button)
  *
- * Per F2 spec: 480px width and 44px row height.
+ * Per F2 spec: 480px width and 44px row height. The 480px is owned by the
+ * standalone `@` popover, or by MorphPopover's `panelWidth` when `embedded`.
+ * Embedded content must be `w-full` — a second 480px inside the 1px-bordered
+ * Morph shell overflows by 2px and flashes a 2s horizontal scrollbar.
  */
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
+  Bot,
   Check,
   ClipboardList,
   File as FileIcon,
@@ -48,7 +52,7 @@ import {
   type ComposerSuggestionAction,
   type ComposerSuggestionEntry,
 } from '@/lib/composerSuggestion';
-import { extraDirBasename } from './extraDirsActions';
+import { extraDirBasename, extraDirDisplayLabel, isLibraryExtraDirSlot } from './extraDirsActions';
 
 const TOOLTIP_FALLBACK_H = 120;
 const VIEWPORT_PAD = 8;
@@ -67,7 +71,8 @@ function isPluginEntry(entry: ComposerSuggestionEntry): boolean {
 }
 
 function isAddDirEntry(entry: ComposerSuggestionEntry): boolean {
-  return entry.kind === 'action' && entry.action.id === 'add-extra-dir';
+  return entry.kind === 'action'
+    && (entry.action.id === 'add-extra-dir' || entry.action.id === 'add-writable-dir');
 }
 
 export type AtPanelState =
@@ -94,6 +99,8 @@ interface AtMentionPanelProps {
   onRetry: () => void;
   /** Reference-directories management rows (empty query only; `+`-menu parity). */
   referenceDirs?: ReferenceDirsSection | null;
+  /** Explicit read-write directory grants (empty query only). */
+  writableDirs?: ReferenceDirsSection | null;
   /** `+` 的 MorphPopover 内嵌形态；容器、阴影与 outside-click 由 MorphPopover 负责。 */
   embedded?: boolean;
   /** Panel max-height in px. Defaults to 400 (chat view); NewMaker passes a smaller value so the popover doesn't cover the logo. */
@@ -106,6 +113,7 @@ const ACTION_ICONS: Record<ComposerSuggestionAction['id'], typeof Paperclip> = {
   'plan-mode': ClipboardList,
   collaboration: UsersRound,
   'add-extra-dir': FolderPlus,
+  'add-writable-dir': FolderPlus,
 };
 
 export function AtMentionPanel({
@@ -118,6 +126,7 @@ export function AtMentionPanel({
   onClose,
   onRetry,
   referenceDirs = null,
+  writableDirs = null,
   embedded = false,
   maxHeight = 400,
 }: AtMentionPanelProps) {
@@ -141,10 +150,16 @@ export function AtMentionPanel({
     ? indexed.filter(({ entry }) => !isPluginEntry(entry) && !isAddDirEntry(entry))
     : [];
   const pluginEntries = isEmptyRootQuery ? indexed.filter(({ entry }) => isPluginEntry(entry)) : [];
-  const addDirEntry = isEmptyRootQuery ? indexed.find(({ entry }) => isAddDirEntry(entry)) : undefined;
+  const addDirEntry = isEmptyRootQuery
+    ? indexed.find(({ entry }) => entry.kind === 'action' && entry.action.id === 'add-extra-dir')
+    : undefined;
+  const addWritableDirEntry = isEmptyRootQuery
+    ? indexed.find(({ entry }) => entry.kind === 'action' && entry.action.id === 'add-writable-dir')
+    : undefined;
   const addSectionVisible = isEmptyRootQuery && addEntries.length > 0;
   const pluginSectionVisible = isEmptyRootQuery && pluginEntries.length > 0;
   const referenceDirsVisible = isEmptyRootQuery && (!!referenceDirs || !!addDirEntry);
+  const writableDirsVisible = isEmptyRootQuery && (!!writableDirs || !!addWritableDirEntry);
 
   useEffect(() => {
     if (entries.length === 0) return;
@@ -237,7 +252,7 @@ export function AtMentionPanel({
     <div
       className={cn(
         'flex h-[24px] items-center px-[10px]',
-        'text-[12px] font-medium text-[var(--cmd-palette-item-meta)]',
+        'text-12 font-medium text-[var(--cmd-palette-item-meta)]',
       )}
     >
       {label}
@@ -292,7 +307,7 @@ export function AtMentionPanel({
         />
         <span
           className={cn(
-            'min-w-0 flex-1 truncate text-[13px]',
+            'min-w-0 flex-1 truncate text-13',
             emphasized ? 'text-[var(--warning-accent)]' : 'text-[var(--model-item-text)]',
           )}
         >
@@ -331,6 +346,8 @@ export function AtMentionPanel({
       meta = item.description || t('newChat.atMention.desktopWindow');
     } else if (item.type === 'session') {
       meta = t('newChat.atMention.task');
+    } else if (item.type === 'bot') {
+      meta = t('newChat.atMention.bot');
     } else if (item.type === 'plugin-command') {
       // Plugin rows follow the compact icon + name presentation used by the
       // installed-plugin menu; the command remains an internal selection key.
@@ -358,6 +375,8 @@ export function AtMentionPanel({
             ? Monitor
             : item.type === 'session'
               ? History
+              : item.type === 'bot'
+                ? Bot
               : item.type === 'plugin-command' || item.type === 'plugin-resource'
                 ? Plug
               : FileIcon;
@@ -399,7 +418,7 @@ export function AtMentionPanel({
         )}
         <span
           className={cn(
-            'min-w-0 truncate text-[14px] font-medium',
+            'min-w-0 truncate text-14 font-medium',
             'text-[var(--cmd-palette-item-text)]',
           )}
         >
@@ -408,7 +427,7 @@ export function AtMentionPanel({
         {disabled && entry.disabledReason ? (
           <span
             className={cn(
-              'shrink-0 text-[12px] truncate max-w-[240px]',
+              'shrink-0 text-12 truncate max-w-[240px]',
               'text-[var(--cmd-palette-item-meta)]',
               'ml-auto',
             )}
@@ -419,7 +438,7 @@ export function AtMentionPanel({
           <Tip text={meta} mono>
             <span
               className={cn(
-                'shrink-0 text-[12px] truncate max-w-[240px]',
+                'shrink-0 text-12 truncate max-w-[240px]',
                 'text-[var(--cmd-palette-item-meta)]',
                 'ml-auto',
               )}
@@ -453,7 +472,11 @@ export function AtMentionPanel({
         ref={panelRef}
         onScroll={(e) => setPanelScroll(e.currentTarget.scrollTop)}
         className={cn(
-          'w-[480px] overflow-y-auto',
+          // embedded: fill the Morph shell. A nested w-[480px] is 2px wider
+          // than the border-box panel and paints a horizontal scrollbar thumb
+          // for ~2s via the global .is-scrolling auto-hide.
+          embedded ? 'w-full min-w-0' : 'w-[480px]',
+          'overflow-x-hidden overflow-y-auto',
           'p-[6px]',
           !embedded && [
             'rounded-[12px] border',
@@ -475,10 +498,10 @@ export function AtMentionPanel({
         )}
         {showErrorState && (
           <div className="flex flex-col items-center justify-center py-[16px] gap-[10px]">
-            <div className="text-[13px] text-[var(--destructive)]">
+            <div className="text-13 text-[var(--destructive)]">
               {t('newChat.atMention.scanFailed')}
             </div>
-            <div className="text-[12px] text-[var(--cmd-palette-item-meta)] px-[12px] text-center">
+            <div className="text-12 text-[var(--cmd-palette-item-meta)] px-[12px] text-center">
               {state.kind === 'error' ? state.message : ''}
             </div>
             <button
@@ -490,7 +513,7 @@ export function AtMentionPanel({
                 onRetry();
               }}
               className={cn(
-                'h-[28px] px-[12px] rounded-full text-[12px] font-medium',
+                'h-[28px] px-[12px] rounded-full text-12 font-medium',
                 'bg-[var(--cmd-palette-item-hover)] text-[var(--cmd-palette-item-text)]',
               )}
             >
@@ -502,7 +525,7 @@ export function AtMentionPanel({
           <div
             className={cn(
               'flex items-center justify-center',
-              'select-none h-[40px] text-[13px]',
+              'select-none h-[40px] text-13',
               'text-[var(--cmd-palette-empty)]',
             )}
           >
@@ -538,15 +561,70 @@ export function AtMentionPanel({
                               size={16}
                               className="shrink-0 text-[var(--cmd-palette-item-icon)] opacity-60"
                             />
+                            <Tip
+                              text={isLibraryExtraDirSlot(p) ? extraDirDisplayLabel(p) : p}
+                              mono={!isLibraryExtraDirSlot(p)}
+                              side="top"
+                            >
+                              <span className="min-w-0 flex-1 truncate text-left text-14 text-[var(--cmd-palette-item-text)]">
+                                {extraDirDisplayLabel(p)}
+                              </span>
+                            </Tip>
+                            {isLibraryExtraDirSlot(p) ? null : (
+                              <button
+                                type="button"
+                                onMouseDown={(e) => e.preventDefault()}
+                                onClick={() => referenceDirs.onRemove(p)}
+                                className={cn(
+                                  'rounded-full p-1 opacity-0 transition-opacity',
+                                  'hover:bg-[var(--cmd-palette-item-hover)]',
+                                  'group-hover:opacity-70 hover:!opacity-100',
+                                  'focus-visible:opacity-100 focus-visible:outline-none',
+                                  'focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]',
+                                )}
+                                aria-label={t('extraDirs.remove', { name: extraDirBasename(p) })}
+                              >
+                                <X size={12} className="text-[var(--cmd-palette-item-text)]" />
+                              </button>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {referenceDirs && referenceDirs.dirs.length === 0 && (
+                      <div className="px-[10px] py-[8px] text-12 text-[var(--cmd-palette-item-meta)]">
+                        {t('extraDirs.empty')}
+                      </div>
+                    )}
+                    {addDirEntry && renderEntryRow(addDirEntry)}
+                  </>
+                )}
+                {writableDirsVisible && (
+                  <>
+                    {renderSectionHeader(t('extraDirs.writableSectionTitle'))}
+                    {writableDirs && writableDirs.dirs.length > 0 && (
+                      <div role="list" aria-label={t('extraDirs.writableSectionTitle')}>
+                        {writableDirs.dirs.map((p) => (
+                          <div
+                            key={p}
+                            className={cn(
+                              'group flex h-[44px] items-center gap-2 rounded-[6px] px-[10px]',
+                              'hover:bg-[var(--cmd-palette-item-hover)]',
+                            )}
+                          >
+                            <FolderPlus
+                              size={16}
+                              className="shrink-0 text-[var(--cmd-palette-item-icon)] opacity-60"
+                            />
                             <Tip text={p} mono side="top">
-                              <span className="min-w-0 flex-1 truncate text-left text-[14px] text-[var(--cmd-palette-item-text)]">
+                              <span className="min-w-0 flex-1 truncate text-left text-14 text-[var(--cmd-palette-item-text)]">
                                 {extraDirBasename(p)}
                               </span>
                             </Tip>
                             <button
                               type="button"
                               onMouseDown={(e) => e.preventDefault()}
-                              onClick={() => referenceDirs.onRemove(p)}
+                              onClick={() => writableDirs.onRemove(p)}
                               className={cn(
                                 'rounded-full p-1 opacity-0 transition-opacity',
                                 'hover:bg-[var(--cmd-palette-item-hover)]',
@@ -562,12 +640,12 @@ export function AtMentionPanel({
                         ))}
                       </div>
                     )}
-                    {referenceDirs && referenceDirs.dirs.length === 0 && (
-                      <div className="px-[10px] py-[8px] text-[12px] text-[var(--cmd-palette-item-meta)]">
-                        {t('extraDirs.empty')}
+                    {writableDirs && writableDirs.dirs.length === 0 && (
+                      <div className="px-[10px] py-[8px] text-12 text-[var(--cmd-palette-item-meta)]">
+                        {t('extraDirs.writableEmpty')}
                       </div>
                     )}
-                    {addDirEntry && renderEntryRow(addDirEntry)}
+                    {addWritableDirEntry && renderEntryRow(addWritableDirEntry)}
                   </>
                 )}
               </>
@@ -577,7 +655,7 @@ export function AtMentionPanel({
             {isEmptyRootQuery && (
               <div
                 className={cn(
-                  'select-none px-[10px] py-[8px] text-[12px]',
+                  'select-none px-[10px] py-[8px] text-12',
                   'text-[var(--cmd-palette-item-meta)]',
                 )}
               >
@@ -587,7 +665,7 @@ export function AtMentionPanel({
             {!isEmptyRootQuery && state.kind === 'ready' && state.truncated && (
               <div
                 className={cn(
-                  'select-none px-[10px] py-[8px] text-[12px]',
+                  'select-none px-[10px] py-[8px] text-12',
                   'text-[var(--cmd-palette-item-meta)]',
                 )}
               >
@@ -605,7 +683,7 @@ export function AtMentionPanel({
                 }}
                 className={cn(
                   'flex w-full items-center gap-2 px-[10px] py-[8px] rounded-[6px] text-left',
-                  'text-[12px] text-[var(--destructive)]',
+                  'text-12 text-[var(--destructive)]',
                   'transition-colors hover:bg-[var(--cmd-palette-item-hover)]',
                 )}
               >
@@ -633,10 +711,10 @@ export function AtMentionPanel({
             maxHeight: tooltipPos.maxHeight,
           }}
         >
-          <div className="text-[14px] font-medium text-[var(--cmd-palette-item-text)]">
+          <div className="text-14 font-medium text-[var(--cmd-palette-item-text)]">
             {focusedItem.name}
           </div>
-          <div className="mt-[8px] text-[13px] leading-[1.5] text-[var(--cmd-palette-tooltip-body)]">
+          <div className="mt-[8px] text-13 leading-[1.5] text-[var(--cmd-palette-tooltip-body)]">
             {focusedItem.description}
           </div>
         </div>

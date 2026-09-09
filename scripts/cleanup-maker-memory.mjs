@@ -185,6 +185,16 @@ async function main() {
   // --archive-stale 时 apply 会把全部 staleCandidates 加入归档 — dry-run
   // 必须如实反映实际归档量 (Codex P1 on #2561 第二十二轮: reflect stale
   // archiving in dry-run output), 否则用户/自动化会批准一个比实际更小的清理。
+  // 同一文件可既是完全重复又命中 stale — apply 第一次归档后第二次 ENOENT
+  // 跳过, dry-run 应按 filename 去重后再计数 (Codex P2 on #2561)。
+  const uniqueArchiveFilenames = (p, archiveStale = false) => {
+    const names = new Set(p.archiveItems.map((i) => i.filename));
+    if (archiveStale) {
+      for (const c of p.staleCandidates) names.add(c.filename);
+    }
+    return names;
+  };
+
   const summarize = (p, archiveStale = false) => ({
     shardDir: shard,
     totalRecords: p.records.length,
@@ -197,7 +207,7 @@ async function main() {
       updatedAt: s.updatedAt,
     })),
     digests: p.digests,
-    archiveCount: p.archiveItems.length + (archiveStale ? p.staleCandidates.length : 0),
+    archiveCount: uniqueArchiveFilenames(p, archiveStale).size,
   });
 
   if (opts.dryRun) {

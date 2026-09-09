@@ -75,41 +75,36 @@ describe('planMemoryCleanup', () => {
     expect(plan.archiveItems.map((i) => i.filename)).toEqual(['feedback_rule_a.md']);
   });
 
-  it('skips candidates rewritten between list and hash binding (no un-reviewed archive)', async () => {
+  it('binds expectedHash to the same classified bytes including updatedAt', async () => {
     await shard('feedback_rule_a.md', 'feedback', 'PR polling rule', 'same hook', 'same body',
       '2026-01-01T00:00:00.000Z');
     await shard('feedback_rule_b.md', 'feedback', 'PR polling rule', 'same hook', 'same body',
       '2026-03-01T00:00:00.000Z');
 
-    // 模拟宿主在 list() (分类) 之后、hash 绑定 (readWithRaw) 之前重写
-    // feedback_rule_a.md — expectedHash 与分类必须绑定同一读, 重写导致
-    // contentHash 不一致 → plan 跳过该候选, 不归档用户未审阅的内容
-    // (Codex P1 on #2561 第二十八轮: bind planned hashes to the classified
-    // bytes)。
-    const realReadFile = fs.readFile.bind(fs);
-    let aReads = 0;
-    const spy = vi.spyOn(fs, 'readFile').mockImplementation(async (p, ...rest) => {
-      if (String(p).endsWith('feedback_rule_a.md')) {
-        aReads += 1;
-        if (aReads === 2) {
-          // 第 2 次读 (bindExpectedHash 的 readWithRaw) 返回宿主新写入。
-          return Buffer.from(
-            "---\ntitle: REWRITTEN\ndescription: new\ntype: feedback\nupdatedAt: '2026-04-01T00:00:00.000Z'\n---\nrewritten by host\n",
-          );
-        }
-      }
-      return realReadFile(p as string, ...rest);
-    });
+    const plan = await planMemoryCleanup(dir);
+    expect(plan.duplicates).toHaveLength(1);
+    expect(plan.archiveItems).toHaveLength(1);
+    const raw = await readFile(path.join(dir, 'feedback_rule_a.md'));
+    const { createHash } = await import('node:crypto');
+    const expected = createHash('sha256').update(raw).digest('hex');
+    expect(plan.archiveItems[0].expectedHash).toBe(expected);
+  });
 
-    try {
-      const plan = await planMemoryCleanup(dir);
-      // 分类仍显示重复组 (基于 list), 但 archiveItems 跳过被重写的候选 —
-      // 不归档未审阅内容。
-      expect(plan.duplicates).toHaveLength(1);
-      expect(plan.archiveItems).toHaveLength(0);
-    } finally {
-      spy.mockRestore();
-    }
+  it('fails apply when only updatedAt was refreshed after plan', async () => {
+    await shard('feedback_rule_a.md', 'feedback', 'PR polling rule', 'same hook', 'same body',
+      '2026-01-01T00:00:00.000Z');
+    await shard('feedback_rule_b.md', 'feedback', 'PR polling rule', 'same hook', 'same body',
+      '2026-03-01T00:00:00.000Z');
+
+    const plan = await planMemoryCleanup(dir);
+    await shard('feedback_rule_a.md', 'feedback', 'PR polling rule', 'same hook', 'same body',
+      '2026-04-01T00:00:00.000Z');
+    const result = await runMemoryCleanup(plan);
+    expect(result.archived).toHaveLength(0);
+    expect(result.failed.some((f) => f.filename === 'feedback_rule_a.md')).toBe(true);
+    await expect(readFile(path.join(dir, 'feedback_rule_a.md'), 'utf8')).resolves.toContain(
+      '2026-04-01T00:00:00.000Z',
+    );
   });
 
   it('reports near-duplicates (same title, different body) without auto-archiving', async () => {
@@ -777,15 +772,57 @@ describe('runMemoryCleanup', () => {
     }
   });
 
-  it('renames retained back to src when copy restore fails', async () => {
+  it('does not rename retained over src recreated by the host', async () => {
     await shard('feedback_a.md', 'feedback', 'Same', 'hook', 'same', '2026-01-01T00:00:00.000Z');
     await shard('feedback_b.md', 'feedback', 'Same', 'hook', 'same', '2026-02-01T00:00:00.000Z');
 
     const plan = await planMemoryCleanup(dir);
-    // 模拟: open fd 在 move 后写 retained (二次校验不一致), copyFile 恢复抛
-    // ENOSPC (磁盘满) — rename 兜底把 retained 改回合法分片名, 记忆留在
-    // list()/MEMORY.md 正常路径 (Codex P1 on #2561 第二十七轮: restore
-    // retained shards before rebuilding)。
+    const realLink = fs.link.bind(fs);
+    const linkSpy = vi.spyOn(fs, 'link').mockImplementation(async (src, dst) => {
+      const r = await realLink(src as string, dst as string);
+      if (
+        String(dst).includes(ARCHIVE_DIR_NAME) &&
+        String(src).includes('cleanup-trash') &&
+        !String(dst).endsWith('.archive')
+      ) {
+        await writeFile(String(dst), 'WRITTEN AFTER MOVE BY OPEN FD', 'utf8');
+        await writeFile(
+          path.join(dir, 'feedback_a.md'),
+          "---\ntitle: HOST\ndescription: new\ntype: feedback\nupdatedAt: '2026-03-01T00:00:00.000Z'\n---\nHOST RECREATED\n",
+          'utf8',
+        );
+      }
+      return r;
+    });
+    const copySpy = vi
+      .spyOn(fs, 'copyFile')
+      .mockRejectedValue(Object.assign(new Error('disk full'), { code: 'ENOSPC' }));
+    const renameSpy = vi.spyOn(fs, 'rename');
+
+    try {
+      const result = await runMemoryCleanup(plan);
+      expect(result.failed.some((f) => f.filename === 'feedback_a.md')).toBe(true);
+      expect(result.archived).toHaveLength(0);
+      await expect(readFile(path.join(dir, 'feedback_a.md'), 'utf8')).resolves.toContain(
+        'HOST RECREATED',
+      );
+      expect(
+        renameSpy.mock.calls.some(
+          (call) => String(call[1]).endsWith('feedback_a.md') && String(call[0]).includes('.archive'),
+        ),
+      ).toBe(false);
+    } finally {
+      linkSpy.mockRestore();
+      copySpy.mockRestore();
+      renameSpy.mockRestore();
+    }
+  });
+
+  it('restores retained to src via exclusive link when copy restore fails', async () => {
+    await shard('feedback_a.md', 'feedback', 'Same', 'hook', 'same', '2026-01-01T00:00:00.000Z');
+    await shard('feedback_b.md', 'feedback', 'Same', 'hook', 'same', '2026-02-01T00:00:00.000Z');
+
+    const plan = await planMemoryCleanup(dir);
     const realLink = fs.link.bind(fs);
     const linkSpy = vi.spyOn(fs, 'link').mockImplementation(async (src, dst) => {
       const r = await realLink(src as string, dst as string);
@@ -804,7 +841,6 @@ describe('runMemoryCleanup', () => {
 
     try {
       const result = await runMemoryCleanup(plan);
-      // rename 兜底成功: src 恢复 (合法分片名, 内容 = retained 新内容), failed。
       expect(result.failed.some((f) => f.filename === 'feedback_a.md')).toBe(true);
       expect(result.archived).toHaveLength(0);
       await expect(readFile(path.join(dir, 'feedback_a.md'), 'utf8')).resolves.toContain(

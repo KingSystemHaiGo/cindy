@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { formatCompactTokens } from '@cindy/maker-shared/usage-format';
 import { describe, expect, it } from 'vitest';
 
 describe('mobile message actions desktop-first surface', () => {
@@ -8,6 +9,7 @@ describe('mobile message actions desktop-first surface', () => {
     const sharedSource = readFileSync(resolve(process.cwd(), '../../packages/maker-shared/src/messagePresentation.ts'), 'utf8');
 
     expect(source).toContain('const MESSAGE_CONTROL_HIT_SLOP = { bottom: 10, left: 10, right: 10, top: 10 };');
+    expect(source).toContain('const MESSAGE_CONTROL_TOUCH_SIZE = 44;');
     expect(source).toContain('buildMessageActionBarPresentation');
     expect(sharedSource).toContain("input.canCopy ? 'copy' : null");
     expect(sharedSource).toContain("input.canFork ? 'fork' : null");
@@ -28,6 +30,8 @@ describe('mobile message actions desktop-first surface', () => {
     expect(source).toContain("disabledActions={actionBusy ? ['rewind', 'delete'] : undefined}");
     expect(source).toContain('testID="message.moreButton"');
     expect(source).toContain('{ height: buttonSize, width: buttonSize }');
+    expect(source).toContain('minHeight: MESSAGE_CONTROL_TOUCH_SIZE');
+    expect(source).toContain('minWidth: MESSAGE_CONTROL_TOUCH_SIZE');
     expect(source).toContain('height: 24');
     expect(source).toContain('width: 24');
     expect(source).toContain('borderRadius: radius.pill');
@@ -58,7 +62,9 @@ describe('mobile message actions desktop-first surface', () => {
     // 行。手机版曾漏掉这条,跨 Agent 切换的分隔线药丸下多出一行「··· 刚刚」。
     const source = readFileSync(resolve(process.cwd(), 'src/session/MessageRenderer.tsx'), 'utf8');
 
-    expect(source).toContain('const showCompletedActionBar = mobileMessageShowsActionBar({');
+    expect(source).toContain(
+      'const showCompletedActionBar = !shareSelectionActive && mobileMessageShowsActionBar({',
+    );
     expect(source).toContain('hasSystemCard: !!item.message.systemCardType,');
     expect(source).toContain('isTurnFinalAssistant: item.message.isTurnFinalAssistant === true,');
     // 时间、花费与 More 都必须由该判据统一 gate,不得绕过它单独计算。
@@ -89,12 +95,15 @@ describe('mobile message actions desktop-first surface', () => {
   it('keeps message controls outside the user bubble like the desktop action bar', () => {
     const source = readFileSync(resolve(process.cwd(), 'src/session/MessageRenderer.tsx'), 'utf8');
     const bubbleStart = source.indexOf('const bubble = (');
-    const returnStart = source.indexOf('return (', bubbleStart);
-    const bubbleSource = source.slice(bubbleStart, returnStart);
-    const renderSource = source.slice(returnStart, source.indexOf('function copyActionLabel', returnStart));
+    const messageNodeStart = source.indexOf('const messageNode = (', bubbleStart);
+    const bubbleSource = source.slice(bubbleStart, messageNodeStart);
+    const renderSource = source.slice(
+      messageNodeStart,
+      source.indexOf('function copyActionLabel', messageNodeStart),
+    );
 
     expect(bubbleStart).toBeGreaterThan(-1);
-    expect(returnStart).toBeGreaterThan(bubbleStart);
+    expect(messageNodeStart).toBeGreaterThan(bubbleStart);
     expect(bubbleSource).toContain('testID={isUser ? \'message.userBubble\' : \'message.agentBubble\'}');
     expect(bubbleSource).not.toContain('testID="message.actionBar"');
     expect(renderSource).toContain('styles.messageItem');
@@ -111,6 +120,8 @@ describe('mobile message actions desktop-first surface', () => {
     const start = source.indexOf('function WorkGroupCard');
     const end = source.indexOf('function FoldablePanel', start);
     const workGroupSource = source.slice(start, end);
+    const expandedBodyStart = workGroupSource.indexOf('{expanded ? (');
+    const childrenMapStart = workGroupSource.indexOf('{item.children.map((child) => {');
 
     // 运行中用状态图标,结束后回到桌面同款 Layers 工作摘要图标。
     expect(source).toContain('Layers,');
@@ -119,10 +130,10 @@ describe('mobile message actions desktop-first surface', () => {
     expect(workGroupSource).toContain('chevronSize={header.chevronSize}');
     expect(workGroupSource).toContain('title={title}');
     expect(workGroupSource).toContain('subtitle={header.subtitle ?? undefined}');
-    // Work group 需要受控展开:运行中只在最近 5 条与全部历史之间切换。
+    // Work group 受控展开；折叠态只保留卡头，不提前构造任何隐藏活动行。
     expect(workGroupSource).not.toContain('defaultExpanded');
     expect(workGroupSource).toContain('controlledExpanded={expanded}');
-    expect(workGroupSource).toContain('collapsedBody={livePreview}');
+    expect(workGroupSource).not.toContain('collapsedBody=');
     expect(workGroupSource).toContain('onControlledToggle={onToggle}');
     expect(workGroupSource).not.toContain('live-preview-dismissed');
     expect(workGroupSource).toContain('? <CompactActivityIndicator color={colors.textTertiary}');
@@ -130,7 +141,12 @@ describe('mobile message actions desktop-first surface', () => {
     expect(workGroupSource).toContain('variant={header.variant}');
     expect(workGroupSource).toContain('summaryCount: header.summaryCount');
     expect(workGroupSource).toContain('<RenderItemView key={child.key} item={child} actions={actions} />');
-    expect(workGroupSource).toContain('projectRecentMobileWorkActivities(item.children, isStreaming, MAX_LIVE_WORK_ACTIVITIES)');
+    expect(workGroupSource).not.toContain('projectRecentMobileWorkActivities');
+    expect(workGroupSource).toContain('() => (expanded');
+    expect(workGroupSource).not.toContain('expanded || !isStreaming');
+    expect(workGroupSource).toContain('const contentLayout = useMemo(() => (expanded');
+    expect(expandedBodyStart).toBeGreaterThan(-1);
+    expect(childrenMapStart).toBeGreaterThan(expandedBodyStart);
     expect(workGroupSource).toContain('<ExpandedWorkThinkingRow key={child.key} item={child} />');
     expect(workGroupSource).toContain('activityProjection?.toolActivitiesByChildKey.get(child.key)');
     // thinking / tool 行都固定 28pt，外层不能再给 thinking 子项追加组间距。
@@ -297,6 +313,17 @@ describe('mobile message actions desktop-first surface', () => {
     expect(agentStatusSource).toContain('<CompactActivityIndicator');
   });
 
+  it('compacts sub-agent token usage with the shared desktop/mobile formatter', () => {
+    const source = readFileSync(resolve(process.cwd(), 'src/session/MessageRenderer.tsx'), 'utf8');
+    const metaStart = source.indexOf('function buildAgentTaskMeta');
+    const metaEnd = source.indexOf('\nfunction readAgentTaskToolInput', metaStart);
+    const metaSource = source.slice(metaStart, metaEnd);
+
+    expect(source).toContain("import { formatCompactTokens } from '@cindy/maker-shared/usage-format';");
+    expect(metaSource).toContain('`${formatCompactTokens(model.totalTokens)} tokens`');
+    expect(formatCompactTokens(143_615)).toBe('143.6k');
+  });
+
   it('does not keep a hidden badge rendering path in foldable message hierarchy panels', () => {
     const source = readFileSync(resolve(process.cwd(), 'src/session/MessageRenderer.tsx'), 'utf8');
     const sharedSource = readFileSync(resolve(process.cwd(), '../../packages/maker-shared/src/messagePresentation.ts'), 'utf8');
@@ -343,8 +370,9 @@ describe('mobile message actions desktop-first surface', () => {
     expect(foldableSource).toContain('useFoldableExpandedState(blockId, defaultExpanded)');
     expect(thinkingSource).toContain('blockId={item.key}');
     expect(renderItemSource).toContain('<ToolGroupCard item={item} actions={actions} />');
-    // 思考卡接收会话流式信号,用于流式实时时长(对齐桌面 500ms tick)。
+    // 思考卡接收会话流式信号；界面只显示到秒，不需要半秒级刷新。
     expect(renderItemSource).toContain('isSessionStreaming={actions.isSessionStreaming === true}');
+    expect(source).toContain('setInterval(() => setNow(Date.now()), 1_000)');
   });
 
   it('does not render user or assistant role labels inside message bubbles', () => {

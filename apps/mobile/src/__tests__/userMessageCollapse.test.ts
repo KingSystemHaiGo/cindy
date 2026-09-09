@@ -11,6 +11,7 @@ import {
   mayExceedVisualLineThreshold,
   resolveUserMessageCollapse,
   shouldAutoCollapseUserMessageContent,
+  truncateTextToVisualLines,
 } from '@/session/userMessageCollapse';
 
 describe('shouldAutoCollapseUserMessageContent (首帧估算)', () => {
@@ -126,6 +127,12 @@ describe('resolveUserMessageCollapse (实测优先,估算兜底)', () => {
   });
 });
 
+describe('truncateTextToVisualLines', () => {
+  it('keeps only the visible line budget and drops later paragraphs', () => {
+    expect(truncateTextToVisualLines('第一行\n第二行\n隐藏内容', 2)).toBe('第一行\n第二行');
+  });
+});
+
 describe('MessageRenderer 长消息测量接线', () => {
   it('caps the invisible native text layout at one line past the collapse threshold', () => {
     const source = readFileSync(resolve(process.cwd(), 'src/session/MessageRenderer.tsx'), 'utf8');
@@ -147,5 +154,25 @@ describe('MessageRenderer 长消息测量接线', () => {
 
     expect(bubbleSource).toContain('allowIosUITextView={!shouldCollapseLongMessage}');
     expect(source).toContain('if (selectable && allowIosUITextView && Platform.OS === \'ios\')');
+  });
+
+  it('keeps expanded user markdown hugging the bubble instead of pinning list width', () => {
+    const source = readFileSync(resolve(process.cwd(), 'src/session/MessageRenderer.tsx'), 'utf8');
+    const bubbleStart = source.indexOf('function MessageBubble');
+    const bubbleEnd = source.indexOf('function copyActionLabel', bubbleStart);
+    const bubbleSource = source.slice(bubbleStart, bubbleEnd);
+    const markdownBodyStart = source.indexOf('function MarkdownBody');
+    const markdownBodyEnd = source.indexOf('function ChatPathChipSpan', markdownBodyStart);
+    const markdownBodySource = source.slice(markdownBodyStart, markdownBodyEnd);
+
+    expect(bubbleSource).toContain('pinContentWidth={!isUser}');
+    expect(markdownBodySource).toContain('if (!pinContentWidth) return;');
+    const codeStart = markdownBodySource.indexOf("if (block.type === 'code')");
+    const headingStart = markdownBodySource.indexOf("if (block.type === 'heading')", codeStart);
+    const codeSource = markdownBodySource.slice(codeStart, headingStart);
+    expect(codeStart).toBeGreaterThan(-1);
+    expect(headingStart).toBeGreaterThan(codeStart);
+    expect(codeSource).not.toContain('<ScrollView');
+    expect(codeSource).toContain('围栏代码在气泡内换行');
   });
 });

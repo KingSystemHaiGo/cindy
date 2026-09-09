@@ -15,12 +15,14 @@
  * 重试,覆盖被控端启动窗口;对**永久**错误(被控开关关 / channel 不允许)立即放弃,不空转。
  */
 
+import { projectScheduleSidebarIndex } from '../scheduler/lib/projectScheduleSidebarIndex';
+import type { ScheduleSidebarIndexSnapshot } from '../scheduler/lib/scheduleSidebarIndexRuns';
 import type { Session } from '@/lib/ccAgent.types';
 import { createLogger } from '@/lib/logger';
 import { extractIpcError } from '@/utils/ipcError';
 import { DEVICE_LINK_RECONCILIATION_PROBE_MARKER } from '@cindy/maker-shared/device-link-contract';
 import type { RemoteSessionListSessionLike } from '@cindy/maker-shared/session-list';
-import { remoteProjectsStore } from './remoteProjectsStore';
+import { remoteProjectsStore, type RemoteSessionStatus } from './remoteProjectsStore';
 import { removeRemoteSessionActivityEntry } from './remoteSessionActivityStore';
 import type { CachedDeviceSessionsSnapshot } from './mirrorCacheClient';
 
@@ -45,6 +47,9 @@ export function collectSessionListSnapshot(): CachedDeviceSessionsSnapshot[] {
 
 /** 与 listing tier 的拉取上限一致(useDeviceLinkRemoteProjects 的 LIST_LIMIT)。 */
 const LIST_LIMIT = 200;
+
+/** 与本地侧栏 / local-db:sessions:list 的现行产品上限一致。 */
+const ARCHIVED_LIST_LIMIT = 1000;
 
 /** 满窗口时每轮最多补查多少个缺席缓存 id，避免退化成无界 N+1。 */
 const MISSING_STATUS_PROBE_LIMIT = 8;
@@ -119,7 +124,10 @@ function hasOptionalFiniteNumber(record: Record<string, unknown>, key: string): 
   );
 }
 
-function isRemoteSessionListSession(value: unknown): value is RemoteSessionListSessionLike {
+function isRemoteSessionListSession(
+  value: unknown,
+  expectedStatus: RemoteSessionStatus,
+): value is RemoteSessionListSessionLike {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const session = value as Record<string, unknown>;
   const count = session._count;
@@ -129,7 +137,7 @@ function isRemoteSessionListSession(value: unknown): value is RemoteSessionListS
     typeof session.title === 'string' &&
     isNullableString(session.workingDir) &&
     typeof session.model === 'string' &&
-    session.status === 'active' &&
+    session.status === expectedStatus &&
     typeof session.agentKind === 'string' &&
     typeof session.createdAt === 'string' &&
     typeof session.updatedAt === 'string' &&
@@ -162,6 +170,9 @@ function isRemoteSessionListSession(value: unknown): value is RemoteSessionListS
     (session.extraDirs === undefined ||
       (Array.isArray(session.extraDirs) &&
         session.extraDirs.every((dir) => typeof dir === 'string'))) &&
+    (session.writableDirs === undefined ||
+      (Array.isArray(session.writableDirs) &&
+        session.writableDirs.every((dir) => typeof dir === 'string'))) &&
     (count === undefined ||
       count === null ||
       (isRecord(count) &&
@@ -170,8 +181,11 @@ function isRemoteSessionListSession(value: unknown): value is RemoteSessionListS
   );
 }
 
-function parseRemoteSessionList(value: unknown): Session[] {
-  if (!Array.isArray(value) || !value.every(isRemoteSessionListSession)) {
+function parseRemoteSessionList(value: unknown, expectedStatus: RemoteSessionStatus): Session[] {
+  if (
+    !Array.isArray(value) ||
+    !value.every((session) => isRemoteSessionListSession(session, expectedStatus))
+  ) {
     throw new Error('Invalid remote sessions response');
   }
   // local-db:sessions:list 是跨版本的列表投影；旧端允许缺少新版 Session 的附加字段。
@@ -187,12 +201,15 @@ function backoffMs(attempt: number): number {
 const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 export interface RefreshOptions {
+  scope?: 'sessions' | 'schedule' | 'both';
   /** 注入式 sleep(测试用,默认真实 setTimeout)。 */
   sleep?: (ms: number) => Promise<void>;
   /** 最大尝试次数(含首次),默认 DEFAULT_MAX_ATTEMPTS。 */
   maxAttempts?: number;
   /** sessions:list 始终有界，默认 merge；仅已知完整的调用方才可显式 replace。 */
   snapshotMode?: 'replace' | 'merge';
+  /** 要读取的远程状态桶；默认 active，archived 仅由侧栏筛选按需触发。 */
+  status?: RemoteSessionStatus;
   /** 周期 tick 可弱合并到任意在途 refresh；事件型 refresh 默认强语义补跑。 */
   coalescingMode?: 'strong' | 'weak';
 }
@@ -214,6 +231,10 @@ interface RefreshTask {
 }
 
 const refreshTasks = new Map<string, RefreshTask>();
+
+function refreshTaskKey(deviceId: string, status: RemoteSessionStatus): string {
+  return `${deviceId}\u0000${status}`;
+}
 
 /**
  * 满窗口缺席行的轮询队列(per-device)。不能用 snapshot epoch 推导数组下标：前一轮
@@ -253,7 +274,9 @@ export async function refreshRemoteDeviceSessions(
   name?: string,
   opts: RefreshOptions = {},
 ): Promise<RefreshResult> {
-  const existing = refreshTasks.get(deviceId);
+  const status = opts.status ?? 'active';
+  const taskKey = refreshTaskKey(deviceId, status);
+  const existing = refreshTasks.get(taskKey);
   if (existing) {
     const requestedSnapshotMode = opts.snapshotMode ?? 'merge';
     // periodic tick 是弱语义：已有任意 refresh 在途时直接复用，不能每个 interval tick
@@ -265,15 +288,19 @@ export async function refreshRemoteDeviceSessions(
     existing.opts = {
       ...existing.opts,
       ...opts,
+      scope:
+        (existing.opts.scope ?? 'sessions') === (opts.scope ?? 'sessions') ? opts.scope : 'both',
       // 显式 replace 是更强的 snapshot 覆盖要求，不能被后续 merge 降级；默认的事件型
       // refresh 则保持安全的有界 merge，并通过上面的强 coalescing 语义确保补跑。
       snapshotMode:
         (existing.opts.snapshotMode ?? 'merge') === 'replace' || requestedSnapshotMode === 'replace'
           ? 'replace'
           : 'merge',
+      // 走到这里的一定不是弱周期 tick；补跑按事件语义带 fresh。
+      coalescingMode: undefined,
     };
     // 先让当前 in-flight snapshot 失效,否则它可能在排队的补跑开始前覆盖 push 带来的新状态。
-    remoteProjectsStore.nextSnapshotEpoch(deviceId);
+    remoteProjectsStore.nextSnapshotEpoch(deviceId, status);
     return existing.promise;
   }
 
@@ -284,9 +311,9 @@ export async function refreshRemoteDeviceSessions(
     opts,
   };
   task.promise = drainRefreshTask(deviceId, task).finally(() => {
-    if (refreshTasks.get(deviceId) === task) refreshTasks.delete(deviceId);
+    if (refreshTasks.get(taskKey) === task) refreshTasks.delete(taskKey);
   });
-  refreshTasks.set(deviceId, task);
+  refreshTasks.set(taskKey, task);
   return task.promise;
 }
 
@@ -325,7 +352,7 @@ async function probeMissingSessionStatuses(
     }),
   );
   // 更强的 refresh / remove / disconnect 已使本轮失效时，不应用迟到的补查结果。
-  if (!remoteProjectsStore.isLatestSnapshotEpoch(deviceId, epoch)) return;
+  if (!remoteProjectsStore.isLatestSnapshotEpoch(deviceId, epoch, 'active')) return;
   const terminalIds = new Set<string>();
   for (const result of results) {
     if (result.errorCode === 'NOT_FOUND') {
@@ -368,46 +395,93 @@ async function runRefreshRemoteDeviceSessions(
 ): Promise<RefreshResult> {
   const sleep = opts.sleep ?? realSleep;
   const maxAttempts = opts.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
+  const status = opts.status ?? 'active';
+  const listLimit = status === 'archived' ? ARCHIVED_LIST_LIMIT : LIST_LIMIT;
   const deviceName = name ?? remoteProjectsStore.getDeviceName(deviceId) ?? deviceId;
-  const epoch = remoteProjectsStore.nextSnapshotEpoch(deviceId);
+  const epoch = remoteProjectsStore.nextSnapshotEpoch(deviceId, status);
   let timeoutAttempts = 0;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     // 被一次更新的重拉取代(期间又发起了新的 refresh)→ 停手,交给那一次(也避免无谓重试)。
-    if (!remoteProjectsStore.isLatestSnapshotEpoch(deviceId, epoch)) return 'superseded';
+    if (!remoteProjectsStore.isLatestSnapshotEpoch(deviceId, epoch, status)) return 'superseded';
     try {
-      const value = await window.electronAPI.deviceLink.invoke(deviceId, 'local-db:sessions:list', [
-        LIST_LIMIT,
-        'active',
-        { includePinned: true },
-      ]);
-      // 乱序保护:本次拉取已不是最新一次 → 丢弃,别覆盖更新的结果。
-      if (!remoteProjectsStore.isLatestSnapshotEpoch(deviceId, epoch)) return 'superseded';
-      const sessions = parseRemoteSessionList(value);
-      if ((opts.snapshotMode ?? 'merge') === 'merge') {
-        const incomingIds = new Set(sessions.map((session) => session.id));
-        const missingSessionIds = remoteProjectsStore
-          .getDeviceSessions(deviceId)
-          .filter((session) => !incomingIds.has(session.id))
-          .map((session) => session.id);
-        // 未满 LIST_LIMIT 证明 active 集合完整，可安全 replace 并清掉缺席的归档/删除行。
-        // 满窗口时先 merge，再用既有只读 sessions:get 有界轮询窗口外缓存 id 的终态。
-        if (sessions.length < LIST_LIMIT) {
-          missingStatusProbeQueues.delete(deviceId);
-          remoteProjectsStore.setDeviceSessions(deviceId, deviceName, sessions);
-          for (const sessionId of missingSessionIds) {
-            removeRemoteSessionActivityEntry(sessionId);
+      if (opts.scope !== 'schedule') {
+        const value = await window.electronAPI.deviceLink.invoke(
+          deviceId,
+          'local-db:sessions:list',
+          [
+            listLimit,
+            status,
+            {
+              includePinned: true,
+              // 周期 tick 保持单飞；created / bootstrap 等事件重拉必须绕开写前查询。
+              ...(opts.coalescingMode === 'weak' ? {} : { fresh: true }),
+            },
+          ],
+        );
+        // 乱序保护:本次拉取已不是最新一次 → 丢弃,别覆盖更新的结果。
+        if (!remoteProjectsStore.isLatestSnapshotEpoch(deviceId, epoch, status))
+          return 'superseded';
+        const sessions = parseRemoteSessionList(value, status);
+        if ((opts.snapshotMode ?? 'merge') === 'merge') {
+          const incomingIds = new Set(sessions.map((session) => session.id));
+          const missingSessionIds = remoteProjectsStore
+            .getDeviceSessions(deviceId, status)
+            .filter((session) => !incomingIds.has(session.id))
+            .map((session) => session.id);
+          // archived 使用与本地侧栏一致的 1000 条产品窗口，可直接替换并清掉断线期间的
+          // 删除 / 取消归档陈旧行；active 仍保持 200 条轻量窗口，满窗时有界补查缺席缓存。
+          if (status === 'archived' || sessions.length < LIST_LIMIT) {
+            if (status === 'active') {
+              missingStatusProbeQueues.delete(deviceId);
+              for (const sessionId of missingSessionIds) {
+                removeRemoteSessionActivityEntry(sessionId);
+              }
+            }
+            remoteProjectsStore.setDeviceSessions(deviceId, deviceName, sessions, status);
+          } else {
+            remoteProjectsStore.mergeDeviceSessions(deviceId, deviceName, sessions, status);
+            if (status === 'active') {
+              await probeMissingSessionStatuses(deviceId, epoch, missingSessionIds);
+            }
           }
         } else {
-          remoteProjectsStore.mergeDeviceSessions(deviceId, deviceName, sessions);
-          await probeMissingSessionStatuses(deviceId, epoch, missingSessionIds);
+          remoteProjectsStore.setDeviceSessions(deviceId, deviceName, sessions, status);
         }
-      } else {
-        remoteProjectsStore.setDeviceSessions(deviceId, deviceName, sessions);
+      }
+      if (opts.scope === 'schedule' || opts.scope === 'both') {
+        try {
+          const raw = await window.electronAPI.deviceLink.invoke(
+            deviceId,
+            'maker:schedule:list-sidebar-index-runs',
+            [],
+          );
+          if (!remoteProjectsStore.isLatestSnapshotEpoch(deviceId, epoch, status))
+            return 'superseded';
+          if (
+            !raw ||
+            typeof raw !== 'object' ||
+            !Array.isArray((raw as ScheduleSidebarIndexSnapshot).runs)
+          ) {
+            throw new Error('Invalid remote schedule index');
+          }
+          remoteProjectsStore.setDeviceScheduleIndex(
+            deviceId,
+            projectScheduleSidebarIndex((raw as ScheduleSidebarIndexSnapshot).runs),
+          );
+        } catch (error) {
+          // Older peers may not expose this existing channel. Keep the last mirror;
+          // failure of optional schedule metadata must not hide a valid session list.
+          if (opts.scope === 'schedule' || String(error).includes(ACCESS_REVOKED_MARKER))
+            throw error;
+          log.debug('remote schedule index unavailable');
+        }
       }
       return 'ok'; // 成功
     } catch (err) {
-      if (!remoteProjectsStore.isLatestSnapshotEpoch(deviceId, epoch)) return 'superseded';
+      if (!remoteProjectsStore.isLatestSnapshotEpoch(deviceId, epoch, status)) {
+        return 'superseded';
+      }
       const message = err instanceof Error ? err.message : String(err);
       // 访问被撤销:语义性终态,不重试、也不静默 give-up —— 让调用方 handleRevoked(见 ACCESS_REVOKED_MARKER)。
       if (message.includes(ACCESS_REVOKED_MARKER)) {

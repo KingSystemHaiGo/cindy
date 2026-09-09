@@ -1,5 +1,9 @@
 import type { BrowserControlRuntime } from '@cindy/browser-control-runtime';
 import type { AgentKind } from '@cindy/maker-core';
+import type {
+  IOSSimulatorInstanceErrorCode,
+  IOSSimulatorRuntimeErrorCode,
+} from '@cindy/ios-simulator-runtime';
 
 import type { Recipe, SiteGuide } from './browser/recipe-loader.js';
 
@@ -199,6 +203,16 @@ export interface SlackHookMcpDeps {
   logger?: LiziMcpLogger;
 }
 
+/** Native routine service; only caller-bound companion tools expose it to agents. */
+export interface RoutineToolService {
+  list(botId: string): Promise<import('@cindy/maker-scheduler').Routine[]>;
+  sources(): Promise<import('@cindy/maker-scheduler').RoutineSource[]>;
+  save(botId: string, input: import('@cindy/maker-scheduler').RoutineInput, id?: string): Promise<import('@cindy/maker-scheduler').Routine>;
+  history(botId: string, id: string): Promise<import('@cindy/maker-scheduler').RoutineRun[]>;
+  remove(botId: string, id: string): Promise<void>;
+  runNow(botId: string, id: string): Promise<void>;
+}
+
 /**
  * Host injects a `getScheduler()` accessor — the cindy_scheduler MCP server
  * never holds a long-lived Scheduler reference because the host may
@@ -313,6 +327,12 @@ export interface SshHostSnapshotLike {
     port: number;
     user: string;
     authMethod: 'agent' | 'key';
+    /** Main-only path metadata used solely to redact model-visible errors. */
+    identityFile?: string;
+    sshAuthentication?: {
+      identityAgent?: string;
+      configuredIdentityFiles?: string[];
+    };
     source: 'ssh-config' | 'manual';
   };
   status:
@@ -370,6 +390,8 @@ export interface SshPoolLike {
 export interface SshMcpDeps {
   getPool(): Promise<SshPoolLike>;
   ensureReady(id: string): Promise<void>;
+  /** Host-owned synchronous boundary redactor. It must not retain its inputs. */
+  redactSensitiveText(snapshot: SshHostSnapshotLike, text: string): string;
   logger?: LiziMcpLogger;
 }
 
@@ -421,6 +443,17 @@ export interface SessionSearchOptions {
   role?: 'user' | 'assistant' | 'system';
   /** 默认 10 */
   limit?: number;
+  /**
+   * Host-owned caller identity used to enforce Bot history isolation. This is
+   * populated by the MCP adapter from the current runtime context and is never
+   * accepted from model tool arguments.
+   */
+  callerSessionId?: string;
+  /**
+   * Host-owned memory namespace. A `bot:` scope without a recoverable caller
+   * Session must fail closed instead of falling back to cross-session search.
+   */
+  callerMemoryScopeKey?: string;
 }
 
 export interface SessionSearchHit {
@@ -446,8 +479,12 @@ export type SessionSearchFn = (
 // 'cindy_slack'(与老 lizi_slack_bot 无关)2026-07-19 上线: Slack 网关工具,
 // 经 hook 通道由 slack-hook-server 以托管 user token 调 Slack 官方 MCP,
 // 接替退役的 cindy-slack 意识。
+// 'cindy_docs'(文档工坊)2026-08-19 上线: PDF / Word / Excel / PPT 的生成与
+// 检查原语。**零系统依赖**——不走任何需要用户先装 LibreOffice / Office 的路径,
+// 对应宿主内置能力开关 id 'docs'(不是需要安装的外置 .cindy 插件)。
 export type LiziMcpId =
   | 'android'
+  | 'ios_simulator'
   | 'browser'
   | 'computer'
   | 'cindy_feishu_bot'
@@ -459,6 +496,7 @@ export type LiziMcpId =
   | 'cindy_contacts'
   | 'cindy_helper'
   | 'cindy_orca'
+  | 'cindy_docs'
   | 'cindy_lsp';
 
 // ── Host-callback Result pattern ────────────────────────────────────────────
@@ -499,6 +537,8 @@ export type ControlWorkerAgent = 'claude-code' | 'codex' | 'pi';
 /** Browser automation MCP host deps. Core browser execution is injected by host. */
 export interface BrowserMcpDeps {
   getRuntime(): BrowserControlRuntime;
+  /** Switch the host-wide, persisted automation target; returns the actual mode. */
+  setBackend?(backend: 'external' | 'rsb-webview'): Promise<'external' | 'rsb-webview'>;
   /** Whether the active backend accepts managed resource downloads. */
   supportsResourceDownloads?(): boolean;
   /** Whether the active backend accepts semantic element queries. */
@@ -535,6 +575,7 @@ export type ComputerMcpToolName =
   | 'list_apps'
   | 'list_windows'
   | 'get_window_state'
+  | 'verify_state'
   | 'click'
   | 'double_click'
   | 'right_click'
@@ -587,6 +628,8 @@ export interface ComputerDriverPermissionState {
 
 export interface ComputerMcpCallContext {
   sessionId?: string;
+  /** Request cancellation stays on the host side; never serialized to the driver. */
+  signal?: AbortSignal;
   /** Identifies the agent runtime whose MCP server dispatched this call. */
   agentKind?: string;
 }
@@ -729,9 +772,142 @@ export interface AndroidMcpDeps {
   logger?: LiziMcpLogger;
 }
 
+export type IOSSimulatorMcpErrorCode =
+  | IOSSimulatorRuntimeErrorCode
+  | IOSSimulatorInstanceErrorCode
+  | 'SESSION_CONTEXT_REQUIRED'
+  | 'SESSION_NOT_FOUND'
+  | 'UNSUPPORTED_SESSION_KIND'
+  | 'IOS_SIMULATOR_PLUGIN_REQUIRED'
+  | 'IOS_SIMULATOR_PLUGIN_DISABLED'
+  | 'IOS_SIMULATOR_DISABLED'
+  | 'WDA_UNAVAILABLE'
+  | 'XCODE_BUILD_FAILED'
+  | 'DRIVER_DISCONNECTED'
+  | 'ORIENTATION_UNSUPPORTED'
+  | 'IOS_SIMULATOR_HOST_ERROR';
+
+export type IOSSimulatorToolAvailabilityState =
+  | 'available'
+  | 'requires-instance'
+  | 'instance-dependent'
+  | 'unavailable';
+
+export interface IOSSimulatorToolAvailability {
+  state: IOSSimulatorToolAvailabilityState;
+  reasonCode?: string;
+  backend?: 'wda' | 'native-hid' | 'simctl' | 'host';
+}
+
+export interface IOSSimulatorToolAvailabilityReport {
+  ready: boolean;
+  instanceCount: number;
+  runningInstanceCount: number;
+  tools: Record<string, IOSSimulatorToolAvailability>;
+  notice?: {
+    errorCode: IOSSimulatorMcpErrorCode;
+    message: string;
+    data?: Record<string, unknown>;
+  };
+}
+
+export type IOSSimulatorMcpAccessDecision =
+  | { allowed: true }
+  | {
+      allowed: false;
+      errorCode: IOSSimulatorMcpErrorCode;
+      message: string;
+      data?: Record<string, unknown>;
+    };
+
+export type IOSSimulatorMcpToolName =
+  | 'check_environment'
+  | 'doctor'
+  | 'list_devices'
+  | 'list_instances'
+  | 'create_instance'
+  | 'attach_device'
+  | 'detach_device'
+  | 'start_instance'
+  | 'stop_instance'
+  | 'get_screen_map'
+  | 'audit_accessibility'
+  | 'compare_screen_maps'
+  | 'wait_for_ui'
+  | 'tap'
+  | 'swipe'
+  | 'drag'
+  | 'long_press'
+  | 'key_press'
+  | 'batch'
+  | 'touch_path'
+  | 'touch2_path'
+  | 'type_text'
+  | 'press_home'
+  | 'set_orientation'
+  | 'set_appearance'
+  | 'set_increase_contrast'
+  | 'set_content_size'
+  | 'set_location'
+  | 'start_location_route'
+  | 'clear_location'
+  | 'set_privacy'
+  | 'push_notification'
+  | 'set_status_bar'
+  | 'clear_status_bar'
+  | 'lock_screen'
+  | 'unlock_screen'
+  | 'build_app'
+  | 'read_build_diagnostics'
+  | 'install_app'
+  | 'launch_app'
+  | 'terminate_app'
+  | 'open_url'
+  | 'take_screenshot'
+  | 'capture_visual_baseline'
+  | 'visual_diff'
+  | 'capture_state'
+  | 'get_diagnostics'
+  | 'start_recording'
+  | 'stop_recording';
+
+export interface IOSSimulatorMcpCallContext {
+  sessionId?: string;
+  /** Workdir bound by the Host for project-scoped capability policy. */
+  workingDir?: string;
+  /** Host-internal origin. MCP transport always uses agent; renderer IPC uses user. */
+  origin?: 'agent' | 'user';
+}
+
+/** Host adapter used by the reusable iOS Simulator MCP server. */
+export interface IOSSimulatorMcpDeps {
+  callTool(
+    name: IOSSimulatorMcpToolName,
+    args: Record<string, unknown>,
+    context?: IOSSimulatorMcpCallContext,
+  ): Promise<unknown>;
+  describeTools?(
+    context?: IOSSimulatorMcpCallContext,
+  ): Promise<IOSSimulatorToolAvailabilityReport>;
+  logger?: LiziMcpLogger;
+}
+
+export type LiziMcpCallerKind = 'root' | 'descendant' | 'unknown';
+
 export interface LiziMcpSessionContext {
   agentKind: string;
   workingDir: string;
+  /** Host-owned memory namespace override shared with the agent prompt path. */
+  memoryScopeKey?: string;
+  /**
+   * 当前 tool-call 的权威 session ctx accessor。
+   *
+   * Claude in-process 路径返回闭包绑定的当前 session；Codex / Pi bridge
+   * 路径从请求作用域恢复当前 session。只要提供了本 accessor，它就是唯一可信
+   * 来源：返回 undefined 表示本次调用无法确认归属，调用方必须 fail closed，
+   * 不能再回落到构建 server 时捕获的 ctx 或环境中的其它 AsyncLocalStorage store。
+   */
+  getSessionContext?: () => LiziMcpSessionContext | undefined;
   /**
    * SSH remote 会话的 host id (本地会话缺省)。workingDir 此时是远端机器上的
    * 路径字符串 — cindy_memory 等按 workdir 分区的工具必须用
@@ -758,6 +934,10 @@ export interface LiziMcpSessionContext {
    * 模型或插件可控的工具参数。
    */
   sessionInstanceId?: string;
+  /** Host-owned caller provenance; never sourced from model tool arguments. */
+  mcpCallerKind?: LiziMcpCallerKind;
+  /** True only when the harness bridge has installed provenance enforcement. */
+  mcpCallerAttested?: boolean;
 }
 
 export interface CodexHttpMcpConfig {

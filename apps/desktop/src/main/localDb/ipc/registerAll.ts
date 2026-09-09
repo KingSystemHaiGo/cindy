@@ -1,3 +1,5 @@
+import { registerRoutineRemoteResources } from '../../routines/remote.js';
+import { registerRoutinesIpc } from '../../routines/service.js';
 /**
  * chat-data-localization F2/F5：聚合注册所有 localDb IPC handlers + ensure-ready。
  *
@@ -10,8 +12,14 @@
 import { ipcMain } from 'electron';
 
 import { closeDb, ensureReady, getCurrentUserId } from '../index';
-import { getCurrentDbClientUserId } from '../client/current';
-import { registerSessionIpc } from './sessions';
+import { getCurrentDbClientUserId, tryGetDbClient } from '../client/current';
+import {
+  registerSessionIpc,
+  type RegisterSessionIpcOpts,
+  setSessionRemovalCancelOperations,
+  setSessionRemovalCleanup,
+  setSessionWorktreeRecycle,
+} from './sessions';
 import { registerMessageIpc } from './messages';
 import { registerOrcaWorkflowIpc } from './orcaTeams';
 import { registerSessionImportIpc } from './session-import';
@@ -19,23 +27,83 @@ import { registerSessionShareIpc } from './session-share';
 import { registerRecentWorkdirsIpc } from './recentWorkdirs';
 import { registerProjectAliasesIpc } from './projectAliases';
 import { registerRightSidebarTabsIpc } from './rightSidebarTabs';
+import { registerSubagentRunsIpc } from './subagentRuns';
+import { enqueueDurableWrite } from '../../messagePersistBroadcaster';
 import { registerDevSqliteVecIpc } from './dev/sqliteVec';
 import { registerSearchIpc } from './search';
 import { registerRemoteHistoryIpc } from './history';
+import { recoverActiveBotTemplateSkills, registerBotIpc } from './bots';
+import { registerBotRemoteResourceProvider } from './botRemoteResourceProvider';
 
 import { createLogger } from '../../logger';
 import { recordDesktopDevLocalDbStartupResult } from '../../devStartupStatus';
 import { createOwnerEnsureCoordinator } from './ownerEnsureCoordinator';
+import { reconcileSessionMediaRefsForDeletedSessions } from '../../cindy-media/sessionCleanup';
+import { reconcileMediaRefCompensationsForOwner } from '../../cindy-media/refCompensationJournal';
+import { setSessionRouteLockImplementation } from '../sessionRouteLock';
 
 const log = createLogger('registerAll');
+const MEDIA_REF_COMPENSATION_BUSY_RETRY_MS = 12_000;
+
+function startMediaRefCompensationReconcile(
+  userId: string,
+  client: NonNullable<ReturnType<typeof tryGetDbClient>>,
+  isOwnerCurrent: () => boolean,
+): void {
+  const run = async (allowBusyRetry: boolean): Promise<void> => {
+    if (!isOwnerCurrent()) return;
+    const result = await reconcileMediaRefCompensationsForOwner({
+      ownerId: userId,
+      db: client.drizzle,
+      isOwnerCurrent,
+    });
+    if (!allowBusyRetry || result.busy === 0 || !isOwnerCurrent()) return;
+    const retry = setTimeout(() => {
+      void run(false).catch((error) => {
+        log.warn('delayed media reference compensation reconcile failed', {
+          userId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }, MEDIA_REF_COMPENSATION_BUSY_RETRY_MS);
+    retry.unref?.();
+  };
+  void run(true).catch((error) => {
+    log.warn('media reference compensation reconcile failed', {
+      userId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  });
+}
 
 export interface RegisterLocalDbIpcOpts {
+  isSessionTurnPendingCompletion?: (sessionId: string) => boolean;
+  readHistoryLiveMessages?: (sessionId: string) => import('../../../renderer/lib/ccAgent.types').Message[];
+  resolveContextWindow?: RegisterSessionIpcOpts['resolveContextWindow'];
   /** Current stable app-session owner. False makes queued/in-flight work stale. */
   isOwnerCurrent?: (userId: string) => boolean;
   /** Dispose any secondary DB client committed by a stale onReady callback. */
   discardStaleOwner?: (userId: string) => void | Promise<void>;
   /** ensureReady 打开/创建目标库前执行；失败时阻断，避免跳过认领后创建空库。 */
   beforeEnsureReady?: (userId: string) => void | Promise<void>;
+  /** Stop Host-owned session operations before an archived/deleted worktree is recycled. */
+  cancelSessionOperations?: (sessionId: string) => Promise<void>;
+  /** Release Host-owned runtime and ownership after task removal is revalidated. */
+  cleanupRemovedSession?: (sessionId: string) => Promise<void>;
+  /** Record worktree recycle intent before a terminal session status is persisted. */
+  requestWorktreeRecycle?: (sessionId: string, resources?: readonly string[]) => Promise<void>;
+  /** Close a moved local Pi/Codex runtime after revalidating that its turn is idle. */
+  closeIdleSessionForMove?: (sessionId: string) => Promise<boolean>;
+  /** Reconcile persisted Host-owned task runtimes once the owner DB is readable. */
+  reconcilePersistedSessionRuntimes?: () => Promise<void>;
+  /** Serialize startup tombstone cleanup with task restore/start/send operations. */
+  withSessionLock?: <T>(sessionId: string, task: () => Promise<T>) => Promise<T>;
+  /**
+   * Is the parent task currently loaded as a live PI session? Decides whether a
+   * finished durable Subagent may still advertise `resume`, which the control
+   * handler only accepts while that session exists.
+   */
+  isParentPiSessionLive?: (sessionId: string) => boolean;
   /**
    * 可选回调：localDb.ensureReady 成功（含已就绪复用路径）后触发。
    * 用途：启动依赖 localDb 的 host 单例（如 scheduler-host）。失败时协调器会
@@ -50,11 +118,72 @@ export interface RegisterLocalDbIpcOpts {
 }
 
 export function registerLocalDbIpc(opts: RegisterLocalDbIpcOpts = {}): void {
+  setSessionRemovalCancelOperations(opts.cancelSessionOperations ?? null);
+  setSessionRemovalCleanup(opts.cleanupRemovedSession ?? null);
+  setSessionWorktreeRecycle(opts.requestWorktreeRecycle ?? null);
+  setSessionRouteLockImplementation(opts.withSessionLock ?? null);
   const runEnsureReady = createOwnerEnsureCoordinator({
     isOwnerCurrent: opts.isOwnerCurrent ?? (() => true),
     beforeEnsureReady: opts.beforeEnsureReady,
     ensureReady,
-    onReady: opts.onReady,
+    onReady: async (userId) => {
+      await opts.onReady?.(userId);
+      const client = tryGetDbClient();
+      if (
+        !client ||
+        getCurrentDbClientUserId() !== userId ||
+        !(opts.isOwnerCurrent?.(userId) ?? true)
+      ) {
+        return;
+      }
+      const isReadyOwnerCurrent = (): boolean =>
+        tryGetDbClient() === client &&
+        getCurrentDbClientUserId() === userId &&
+        (opts.isOwnerCurrent?.(userId) ?? true);
+      // 数据库与账号边界都已就绪后再补装旧版内置伙伴能力；不依赖用户先打开
+      // 伙伴页面。列表/get 仍保留幂等恢复，覆盖同进程账号切换后的读取路径。
+      await recoverActiveBotTemplateSkills();
+      if (!isReadyOwnerCurrent()) return;
+      startMediaRefCompensationReconcile(userId, client, isReadyOwnerCurrent);
+
+      const cancelSessionOperations = opts.cancelSessionOperations;
+      const cleanupRemovedSession = opts.cleanupRemovedSession;
+      const withSessionLock = opts.withSessionLock;
+      const db = client.drizzle;
+      void (async () => {
+        if (!isReadyOwnerCurrent()) return;
+        try {
+          await opts.reconcilePersistedSessionRuntimes?.();
+        } catch (error) {
+          log.warn('persisted task runtime reconcile failed', {
+            userId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+        if (
+          !isReadyOwnerCurrent() ||
+          !cancelSessionOperations ||
+          !cleanupRemovedSession ||
+          !withSessionLock
+        ) {
+          return;
+        }
+        await reconcileSessionMediaRefsForDeletedSessions({
+          db,
+          isOwnerCurrent: isReadyOwnerCurrent,
+          withSessionLock,
+          quiesceSession: async (sessionId) => {
+            await cancelSessionOperations(sessionId);
+            await cleanupRemovedSession(sessionId);
+          },
+        });
+      })().catch((error) => {
+        log.warn('deleted task media reconcile failed', {
+          userId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    },
     onReadyError: (userId, err) => {
       log.warn(
         JSON.stringify({
@@ -98,11 +227,13 @@ export function registerLocalDbIpc(opts: RegisterLocalDbIpcOpts = {}): void {
       result = await runEnsureReady(userId);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      log.error(JSON.stringify({
-        event: 'localDb.ipc.ensure-ready.failed',
-        userId,
-        error: message,
-      }));
+      log.error(
+        JSON.stringify({
+          event: 'localDb.ipc.ensure-ready.failed',
+          userId,
+          error: message,
+        }),
+      );
       result = {
         ready: false,
         error: { code: 'DB_INIT_FAILED', message },
@@ -121,15 +252,33 @@ export function registerLocalDbIpc(opts: RegisterLocalDbIpcOpts = {}): void {
     return result;
   });
 
-  registerSessionIpc(getCurrentDbClientUserId);
-  registerMessageIpc();
+  registerSessionIpc(getCurrentDbClientUserId, {
+    resolveContextWindow: opts.resolveContextWindow,
+    closeIdleSessionForMove: opts.closeIdleSessionForMove,
+  });
+  registerMessageIpc(opts.isSessionTurnPendingCompletion, opts.readHistoryLiveMessages);
   registerRemoteHistoryIpc();
+  registerBotIpc();
+  registerRoutinesIpc();
+  registerRoutineRemoteResources();
+  registerBotRemoteResourceProvider();
   registerSessionImportIpc();
   registerSessionShareIpc();
   registerOrcaWorkflowIpc();
   registerRecentWorkdirsIpc();
   registerProjectAliasesIpc();
   registerRightSidebarTabsIpc();
+  // Durable Subagent projection writes share the agent event path's FIFO, so a
+  // reconciliation and an agent_task_update cannot both insert the first
+  // sighting of the same run. Supplied here because the storage layer must not
+  // import the broadcaster back (it already depends on localDb).
+  registerSubagentRunsIpc({
+    enqueueDurableWrite,
+    // `resume` is a runtime capability, not a property of the stored run: the
+    // handler needs the parent task loaded as a live PI session. Supplied from
+    // the composition root so this layer never imports the Maker.
+    ...(opts.isParentPiSessionLive ? { isParentPiSessionLive: opts.isParentPiSessionLive } : {}),
+  });
   registerSearchIpc();
   registerDevSqliteVecIpc();
 }

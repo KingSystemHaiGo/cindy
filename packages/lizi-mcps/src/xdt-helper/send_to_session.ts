@@ -43,6 +43,8 @@ export type SendToSessionCallback = (params: {
       wakeKind: "resumed" | "already-active" | "created" | "queued";
       targetTitle: string | null;
       targetLastUserSendAt: string | null;
+      /** jump 进入队列时的可寻址句柄，可用于本人编辑/撤回。 */
+      queuedMessageId?: string;
       /** create + useWorktree 成功时为新 session 的 worktree 绝对路径;其余情况 host 可省略。 */
       worktreePath?: string | null;
       model?: string;
@@ -55,6 +57,7 @@ export type SendToSessionCallback = (params: {
     | "DELETED"
     | "BUSY"
     | "AGENT_NOT_READY"
+    | "UNSUPPORTED_CAPABILITY"
     | "BUDGET_MODEL_REQUIRES_API_MODE"
     | "PROVIDER_ROUTE_UNAVAILABLE"
     | "INVALID_ARGS"
@@ -98,6 +101,7 @@ const DESCRIPTION = [
   "- BUSY: 仅 create 模式的罕见兜底(新建 session 意外已有 turn 在跑)。jump 模式撞忙不再返 BUSY,而是入队并成功返回 wake_kind=queued。",
   "- WORKTREE_UNAVAILABLE: 仅 create + use_worktree=true:无法创建 worktree(非 git 仓库 / git 未装 / git worktree add 失败,message 带具体原因)。skill 决定是去掉 use_worktree 重试还是放弃。",
   "- AGENT_NOT_READY: 目标 session 恢复或投递时 agent 未能启动。skill 应告知用户稍后重试。",
+  "- UNSUPPORTED_CAPABILITY: 目标 session 不接受跨任务投递（例如 host 管理的隔离 Review）。skill 不应重试或改走其它输入入口。",
   "- HOST_NOT_READY: 主进程服务尚未就绪。skill 应告知用户稍等几秒后重试。",
   "",
   "【重要】这不是 chat 对话工具,而是 session 间 handoff 的控制层入口。不要拿它替代普通的 user→agent 对话。",
@@ -216,6 +220,7 @@ export function registerSendToSessionTool(
         wake_kind: result.wakeKind,
         target_title: result.targetTitle,
         target_last_user_send_at: result.targetLastUserSendAt,
+        ...(result.queuedMessageId ? { queued_message_id: result.queuedMessageId } : {}),
         worktree_path: result.worktreePath ?? null,
         ...(result.model !== undefined ? { model: result.model } : {}),
         ...(result.effort !== undefined ? { effort: result.effort } : {}),

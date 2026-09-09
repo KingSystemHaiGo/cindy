@@ -101,6 +101,65 @@ describe('isCameraUnavailableOnSimulator', () => {
 });
 
 describe('createMobileLocalAttachmentUploadController', () => {
+  it('releases send waiters when credential preparation never settles and preserves the attachment', async () => {
+    vi.useFakeTimers();
+    try {
+      const { deps, pendingSnapshots, uploaded, failed } = makeDeps();
+      const controller = createMobileLocalAttachmentUploadController(deps);
+      controller.enqueue([candidate('a.jpg')], { token: new Promise(() => {}) });
+      const pending = controller.waitForIdle();
+      await vi.advanceTimersByTimeAsync(180_000);
+      expect(await pending).toEqual({ failedCount: 1 });
+      expect(uploaded).toEqual([]);
+      expect(failed).toHaveLength(1);
+      expect(pendingSnapshots.at(-1)?.[0]).toMatchObject({ name: 'a.jpg', failed: true });
+      controller.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('a timed-out source cannot publish into a subsequent retry and only its temporary result is cleaned', async () => {
+    vi.useFakeTimers();
+    try {
+      let resolveSource!: (value: { uri: string }) => void;
+      const cleanupLocalUris = vi.fn(async () => {});
+      const source = { ...candidate('a.jpg'), cleanupLocalUris, resolve: vi.fn()
+        .mockImplementationOnce(() => new Promise((resolve) => { resolveSource = resolve; }))
+        .mockResolvedValueOnce({ uri: 'file:///tmp/retry.jpg' }) };
+      const { deps, uploaded, pendingSnapshots } = makeDeps();
+      const controller = createMobileLocalAttachmentUploadController(deps);
+      controller.enqueue([source], { token: 't' });
+      await vi.advanceTimersByTimeAsync(180_000);
+      const id = pendingSnapshots.at(-1)![0].localId;
+      controller.retry(id, { token: 't' });
+      await vi.advanceTimersByTimeAsync(0);
+      await controller.waitForIdle();
+      resolveSource({ uri: 'file:///tmp/late.jpg' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(uploaded).toHaveLength(1);
+      expect(uploaded[0].candidate.uri).toBe('file:///tmp/retry.jpg');
+      expect(cleanupLocalUris).toHaveBeenCalledWith(['file:///tmp/late.jpg']);
+      expect(cleanupLocalUris.mock.calls.flat(2)).not.toContain(source.uri);
+      controller.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('reclaims an upload arriving after the total deadline without publishing it', async () => {
+    vi.useFakeTimers();
+    try {
+      const gate = gatedUpload();
+      const { deps, uploaded, discarded } = makeDeps({ upload: gate.upload });
+      const controller = createMobileLocalAttachmentUploadController(deps);
+      controller.enqueue([candidate('a.jpg')], { token: 't' });
+      await vi.advanceTimersByTimeAsync(180_000);
+      expect(await controller.waitForIdle()).toEqual({ failedCount: 1 });
+      gate.release('a.jpg');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(uploaded).toEqual([]);
+      expect(discarded).toEqual([attachmentFor('a.jpg')]);
+      controller.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+
   it('enqueue 后立即出现在 pending,上传成功后回调宿主并清空 pending', async () => {
     const { deps, pendingSnapshots, uploaded } = makeDeps();
     const controller = createMobileLocalAttachmentUploadController(deps);
@@ -138,11 +197,13 @@ describe('createMobileLocalAttachmentUploadController', () => {
     expect(uploaded[0]?.uploadedUri).toBe('file:///tmp/downsampled.jpg');
   });
 
-  it('resolve 型任务:onUploaded 回传就位后的 candidate(实际上传的 uri),保留 sourceId', async () => {
+  it('resolve 型任务:onUploaded 回传就位后的 candidate,保留来源与 composer 代际', async () => {
     const { deps, uploaded } = makeDeps();
     const controller = createMobileLocalAttachmentUploadController(deps);
     controller.enqueue([{
       ...candidate('IMG_0001.HEIC'),
+      attachmentScopeGeneration: 7,
+      attachmentScopeKey: 'session-a',
       uri: 'ph://asset-1',
       sourceId: 'asset-1',
       resolve: () => Promise.resolve({ uri: 'file:///tmp/IMG_0001.jpg', name: 'IMG_0001.jpg', skipPreprocess: true }),
@@ -152,6 +213,8 @@ describe('createMobileLocalAttachmentUploadController', () => {
     expect(uploaded[0]?.candidate.uri).toBe('file:///tmp/IMG_0001.jpg');
     expect(uploaded[0]?.candidate.name).toBe('IMG_0001.jpg');
     expect(uploaded[0]?.candidate.sourceId).toBe('asset-1');
+    expect(uploaded[0]?.candidate.attachmentScopeKey).toBe('session-a');
+    expect(uploaded[0]?.candidate.attachmentScopeGeneration).toBe(7);
     expect(uploaded[0]?.candidate.kind).toBe('image');
   });
 
@@ -217,7 +280,7 @@ describe('createMobileLocalAttachmentUploadController', () => {
     expect(discarded.map((item) => item.name)).toEqual(['slow.jpg']);
   });
 
-  it('removeAll:排队任务即刻出队、在途任务完成后回收,controller 仍可继续 enqueue(切换电脑场景)', async () => {
+  it('removeAll:切换任务/电脑时排队任务即刻出队、迟到完成只回收不回调', async () => {
     const gate = gatedUpload();
     const { deps, pendingSnapshots, uploaded, discarded } = makeDeps({ upload: gate.upload });
     const controller = createMobileLocalAttachmentUploadController(deps);
@@ -596,6 +659,7 @@ describe('claim(划归乐观消息)', () => {
       failed: false,
       kind: 'image',
       previewUri: 'file:///tmp/a.jpg',
+      name: 'a.jpg',
     }]);
     controller.claim(claimable.map((task) => task.localId));
     // 托盘同步清空,限额与发送等待不再计入。
@@ -685,6 +749,7 @@ describe('claim(划归乐观消息)', () => {
       failed: true,
       kind: 'image',
       previewUri: 'file:///tmp/a.jpg',
+      name: 'a.jpg',
     }]);
 
     const snapshotCount = pendingSnapshots.length;
