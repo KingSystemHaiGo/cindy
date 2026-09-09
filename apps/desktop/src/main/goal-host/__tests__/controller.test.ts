@@ -3835,6 +3835,41 @@ describe('GoalController', () => {
     expect(local.updates.at(-1)).toEqual({ sessionId: 's1', goal: null });
   });
 
+  it('clearGoal still deletes the row when the audit snapshot read fails', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const warns: Array<{ msg: string; meta?: unknown }> = [];
+    const local = makeController({
+      recordRunEvent: (e) => void events.push(e),
+      logger: {
+        info: () => {},
+        warn: (msg, meta) => warns.push({ msg, meta }),
+        error: () => {},
+      },
+    });
+    await startGoal(local);
+    vi.spyOn(local.storage, 'get').mockRejectedValueOnce(new Error('db proxy unavailable'));
+
+    await expect(local.controller.clearGoal('s1')).resolves.toBeUndefined();
+
+    expect(await local.storage.get('s1')).toBeNull();
+    expect(local.updates.at(-1)).toEqual({ sessionId: 's1', goal: null });
+    expect(warns.some((w) => String(w.msg).includes('skipped clearGoal audit snapshot'))).toBe(true);
+    const cleared = events.filter((e) => e.type === 'cleared');
+    expect(cleared).toHaveLength(1);
+    expect(cleared[0]?.reason).toBe('cleared by user');
+  });
+
+  it('does not emit cleared until storage.clear succeeds', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    await startGoal(local);
+    vi.spyOn(local.storage, 'clear').mockRejectedValueOnce(new Error('clear unavailable'));
+
+    await expect(local.controller.clearGoal('s1')).rejects.toThrow('clear unavailable');
+    expect(await local.storage.get('s1')).not.toBeNull();
+    expect(events.some((e) => e.type === 'cleared')).toBe(false);
+  });
+
   // ── updateGoal(纯代码改目标 / 上限,不写默认 override) ──
   it('updateGoal resumes a budgetLimited max-turns goal when the new maxTurns allows more turns', async () => {
     await h.storage.set(seededGoal({ status: 'budgetLimited', turnsUsed: 5, maxTurns: 5, lastReason: 'max turns reached' }));

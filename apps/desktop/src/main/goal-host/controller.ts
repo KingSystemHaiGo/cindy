@@ -1281,16 +1281,31 @@ export class GoalController {
     }
     await this.awaitPendingLifecycle(clearBoundary);
     if (this.turns.get(sessionId) !== clearBoundary) return;
-    const clearedState = await this.deps.storage.get(sessionId);
+    // 审计快照是 best-effort: storage.get 失败不得阻断用户请求的删除
+    // (Codex #2107 P1)。cleared 事件只在 clear 真正成功后发出, 避免
+    // 删行失败却留下假 closeout。
+    let auditSnapshot: GoalState | null = null;
+    try {
+      auditSnapshot = await this.deps.storage.get(sessionId);
+    } catch (error) {
+      this.deps.logger.warn('[goal] skipped clearGoal audit snapshot (storage.get failed)', {
+        sessionId,
+        error: String(error),
+      });
+    }
     if (this.turns.get(sessionId) !== clearBoundary) return;
-    if (clearedState) {
-      this.recordRunEvent('cleared', sessionId, clearedState, {
-        from: clearedState.status,
+    await this.trackPersistence(clearBoundary, this.deps.storage.clear(sessionId));
+    if (this.turns.get(sessionId) !== clearBoundary) return;
+    if (auditSnapshot) {
+      this.recordRunEvent('cleared', sessionId, auditSnapshot, {
+        from: auditSnapshot.status,
+        reason: 'cleared by user',
+      });
+    } else {
+      this.recordRunEvent('cleared', sessionId, null, {
         reason: 'cleared by user',
       });
     }
-    await this.trackPersistence(clearBoundary, this.deps.storage.clear(sessionId));
-    if (this.turns.get(sessionId) !== clearBoundary) return;
     this.deps.emitStatus({ sessionId, goal: null });
     this.turns.delete(sessionId);
   }
