@@ -1388,24 +1388,6 @@ describe('parseClaudeCodeMessageLine', () => {
     }
   });
 
-  it('scan summary rejects files without top-level events in the head window', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-scan-reject-'));
-    const file = path.join(dir, `${sdkSessionId}.jsonl`);
-    fs.writeFileSync(
-      file,
-      [
-        line({ type: 'system', subtype: 'noise', cwd: '/tmp/project' }),
-        line({ type: 'user', isSidechain: true, message: { role: 'user', content: 'sidechain' } }),
-      ].join('\n'),
-    );
-
-    try {
-      expect(await readClaudeCodeSessionScanSummary(file)).toBeNull();
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
   it('keeps the rejection reason across cache hits for unchanged files (no drift to noEvents)', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-cache-reason-'));
     const file = path.join(dir, `${sdkSessionId}.jsonl`);
@@ -1430,6 +1412,24 @@ describe('parseClaudeCodeMessageLine', () => {
       expect(first).toEqual({ kind: 'rejected', reason: 'internal' });
       const cached = await readClaudeCodeSessionScanSummaryResult(file);
       expect(cached).toEqual({ kind: 'rejected', reason: 'internal' });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('scan summary rejects files without top-level events in the head window', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-scan-reject-'));
+    const file = path.join(dir, `${sdkSessionId}.jsonl`);
+    fs.writeFileSync(
+      file,
+      [
+        line({ type: 'system', subtype: 'noise', cwd: '/tmp/project' }),
+        line({ type: 'user', isSidechain: true, message: { role: 'user', content: 'sidechain' } }),
+      ].join('\n'),
+    );
+
+    try {
+      expect(await readClaudeCodeSessionScanSummary(file)).toBeNull();
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

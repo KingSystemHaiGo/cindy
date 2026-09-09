@@ -120,7 +120,7 @@ export interface ClaudeCodeExternalScanResult {
   roots: string[];
   candidates: ClaudeCodeExternalSessionCandidate[];
   rejectedCount: number;
-  /** 拒绝原因分类(合计等于 rejectedCount;供导入页区分展示, 解决 #1791 可发现性问题)。 */
+  /** 拒绝原因分类(合计等于 rejectedCount;设置导入页可展示, 对齐 #1791 可发现性要求)。 */
   rejected?: {
     unreadable: number;
     internal: number;
