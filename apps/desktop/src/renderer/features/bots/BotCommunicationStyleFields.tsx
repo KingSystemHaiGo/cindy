@@ -3,6 +3,7 @@ import type { ReactNode } from 'react';
 
 import { SettingsSegmentedControl } from '@/components/settings/SettingsSegmentedControl';
 import { SettingsTextInput } from '@/components/settings/SettingsTextInput';
+import { FormField } from '@/components/ui/form-field';
 import { Textarea } from '@/components/ui/input';
 import {
   BOT_STYLE_EMOJI_DENSITIES,
@@ -26,18 +27,15 @@ type EmojiDensityControl = BotStyleEmojiDensity | typeof FOLLOW_DEFAULT;
 
 function StyleRow({
   label,
-  hint,
   children,
 }: {
   label: string;
-  hint?: string;
   children: ReactNode;
 }) {
   return (
     <div className="flex flex-col gap-2">
       <div className="min-w-0">
         <p className="text-13 font-medium text-[var(--text-primary)]">{label}</p>
-        {hint ? <p className="mt-0.5 text-12 leading-5 text-[var(--text-secondary)]">{hint}</p> : null}
       </div>
       <div className="min-w-0 overflow-x-auto">{children}</div>
     </div>
@@ -69,68 +67,79 @@ export function BotCommunicationStyleFields({
       testId="bot-communication-style"
     >
       <div className="flex flex-col gap-4">
-        <StyleRow label={t('bots.profile.style.tone')} hint={t('bots.profile.style.toneHint')}>
-          <SettingsSegmentedControl<ToneControl>
-            aria-label={t('bots.profile.style.tone')}
-            value={style.tone ?? FOLLOW_DEFAULT}
-            onValueChange={(tone) => {
-              if (tone === FOLLOW_DEFAULT) {
-                const next = { ...style };
-                delete next.tone;
-                delete next.customTone;
-                patch(next, 'instant');
-                return;
-              }
-              patch({ ...style, tone }, 'instant');
-            }}
-            options={[
-              { value: FOLLOW_DEFAULT, label: t('bots.profile.style.tones.followDefault') },
-              ...BOT_STYLE_TONES.map((tone) => ({
-                value: tone,
-                label: t(`bots.profile.style.tones.${tone}`),
-              })),
-            ]}
-          />
-        </StyleRow>
+        <FormField label={t('bots.profile.style.tone')} hint={t('bots.profile.style.toneHint')}>
+          {(control) => (
+            <div className="min-w-0 overflow-x-auto">
+              <SettingsSegmentedControl<ToneControl>
+                id={control.id}
+                aria-label={t('bots.profile.style.tone')}
+                aria-describedby={control['aria-describedby']}
+                value={style.tone ?? FOLLOW_DEFAULT}
+                onValueChange={(tone) => {
+                  if (tone === FOLLOW_DEFAULT) {
+                    const next = { ...style };
+                    delete next.tone;
+                    delete next.customTone;
+                    patch(next, 'instant');
+                    return;
+                  }
+                  patch({ ...style, tone }, 'instant');
+                }}
+                options={[
+                  { value: FOLLOW_DEFAULT, label: t('bots.profile.style.tones.followDefault') },
+                  ...BOT_STYLE_TONES.map((tone) => ({
+                    value: tone,
+                    label: t(`bots.profile.style.tones.${tone}`),
+                  })),
+                ]}
+              />
+            </div>
+          )}
+        </FormField>
         {style.tone === 'custom' ? (
-          <label className="flex min-w-0 flex-col text-12 text-[var(--text-secondary)]">
-            {t('bots.profile.style.customTone')}
-            <Textarea
-              aria-label={t('bots.profile.style.customTone')}
-              value={style.customTone ?? ''}
-              maxLength={BOT_STYLE_LIMITS.customTone}
-              rows={3}
-              className="mt-1.5"
-              onChange={(text) => patch({ ...style, customTone: text }, 'text')}
-              onBlur={(event) => commitTrimmed({ ...style, customTone: event.currentTarget.value })}
-            />
-          </label>
+          <FormField label={t('bots.profile.style.customTone')}>
+            {(control) => (
+              <Textarea
+                {...control}
+                aria-label={t('bots.profile.style.customTone')}
+                value={style.customTone ?? ''}
+                maxLength={BOT_STYLE_LIMITS.customTone}
+                rows={3}
+                onChange={(text) => patch({ ...style, customTone: text }, 'text')}
+                onBlur={(event) => commitTrimmed({ ...style, customTone: event.currentTarget.value })}
+              />
+            )}
+          </FormField>
         ) : null}
 
-        <label className="flex min-w-0 flex-col text-12 text-[var(--text-secondary)]">
-          {t('bots.profile.style.addressUserAs')}
-          <SettingsTextInput
-            ariaLabel={t('bots.profile.style.addressUserAs')}
-            value={style.addressUserAs ?? ''}
-            maxLength={BOT_STYLE_LIMITS.addressUserAs}
-            size="lg"
-            className="mt-1.5 w-full"
-            onChange={(text) => patch({ ...style, addressUserAs: text }, 'text')}
-            onBlur={(event) => commitTrimmed({ ...style, addressUserAs: event.currentTarget.value })}
-          />
-        </label>
-        <label className="flex min-w-0 flex-col text-12 text-[var(--text-secondary)]">
-          {t('bots.profile.style.selfName')}
-          <SettingsTextInput
-            ariaLabel={t('bots.profile.style.selfName')}
-            value={style.selfName ?? ''}
-            maxLength={BOT_STYLE_LIMITS.selfName}
-            size="lg"
-            className="mt-1.5 w-full"
-            onChange={(text) => patch({ ...style, selfName: text }, 'text')}
-            onBlur={(event) => commitTrimmed({ ...style, selfName: event.currentTarget.value })}
-          />
-        </label>
+        <FormField label={t('bots.profile.style.addressUserAs')}>
+          {(control) => (
+            <SettingsTextInput
+              {...control}
+              ariaLabel={t('bots.profile.style.addressUserAs')}
+              value={style.addressUserAs ?? ''}
+              maxLength={BOT_STYLE_LIMITS.addressUserAs}
+              size="lg"
+              className="w-full"
+              onChange={(text) => patch({ ...style, addressUserAs: text }, 'text')}
+              onBlur={(event) => commitTrimmed({ ...style, addressUserAs: event.currentTarget.value })}
+            />
+          )}
+        </FormField>
+        <FormField label={t('bots.profile.style.selfName')}>
+          {(control) => (
+            <SettingsTextInput
+              {...control}
+              ariaLabel={t('bots.profile.style.selfName')}
+              value={style.selfName ?? ''}
+              maxLength={BOT_STYLE_LIMITS.selfName}
+              size="lg"
+              className="w-full"
+              onChange={(text) => patch({ ...style, selfName: text }, 'text')}
+              onBlur={(event) => commitTrimmed({ ...style, selfName: event.currentTarget.value })}
+            />
+          )}
+        </FormField>
 
         <StyleRow label={t('bots.profile.style.replyLength')}>
           <SettingsSegmentedControl<ReplyLengthControl>
@@ -177,31 +186,35 @@ export function BotCommunicationStyleFields({
           />
         </StyleRow>
 
-        <label className="flex min-w-0 flex-col text-12 text-[var(--text-secondary)]">
-          {t('bots.profile.style.bannedPhrases')}
-          <p className="mt-0.5 text-12 leading-5">{t('bots.profile.style.bannedPhrasesHint')}</p>
-          <Textarea
-            aria-label={t('bots.profile.style.bannedPhrases')}
-            value={style.bannedPhrases ?? ''}
-            maxLength={BOT_STYLE_LIMITS.bannedPhrases}
-            rows={3}
-            className="mt-1.5"
-            onChange={(text) => patch({ ...style, bannedPhrases: text }, 'text')}
-            onBlur={(event) => commitTrimmed({ ...style, bannedPhrases: event.currentTarget.value })}
-          />
-        </label>
-        <label className="flex min-w-0 flex-col text-12 text-[var(--text-secondary)]">
-          {t('bots.profile.style.languageHabits')}
-          <Textarea
-            aria-label={t('bots.profile.style.languageHabits')}
-            value={style.languageHabits ?? ''}
-            maxLength={BOT_STYLE_LIMITS.languageHabits}
-            rows={4}
-            className="mt-1.5"
-            onChange={(text) => patch({ ...style, languageHabits: text }, 'text')}
-            onBlur={(event) => commitTrimmed({ ...style, languageHabits: event.currentTarget.value })}
-          />
-        </label>
+        <FormField
+          label={t('bots.profile.style.bannedPhrases')}
+          hint={t('bots.profile.style.bannedPhrasesHint')}
+        >
+          {(control) => (
+            <Textarea
+              {...control}
+              aria-label={t('bots.profile.style.bannedPhrases')}
+              value={style.bannedPhrases ?? ''}
+              maxLength={BOT_STYLE_LIMITS.bannedPhrases}
+              rows={3}
+              onChange={(text) => patch({ ...style, bannedPhrases: text }, 'text')}
+              onBlur={(event) => commitTrimmed({ ...style, bannedPhrases: event.currentTarget.value })}
+            />
+          )}
+        </FormField>
+        <FormField label={t('bots.profile.style.languageHabits')}>
+          {(control) => (
+            <Textarea
+              {...control}
+              aria-label={t('bots.profile.style.languageHabits')}
+              value={style.languageHabits ?? ''}
+              maxLength={BOT_STYLE_LIMITS.languageHabits}
+              rows={4}
+              onChange={(text) => patch({ ...style, languageHabits: text }, 'text')}
+              onBlur={(event) => commitTrimmed({ ...style, languageHabits: event.currentTarget.value })}
+            />
+          )}
+        </FormField>
       </div>
     </BotSettingsBlock>
   );

@@ -395,6 +395,20 @@ describe('Bot settings profile consolidation', () => {
     expect(screen.getByLabelText('bots.profile.style.replyLength')).toBeTruthy();
   });
 
+  it('associates communication-style hints with their controls', () => {
+    renderSettings();
+    const banned = screen.getByLabelText('bots.profile.style.bannedPhrases');
+    const bannedHintId = banned.getAttribute('aria-describedby');
+    expect(bannedHintId).toBeTruthy();
+    expect(document.getElementById(bannedHintId!)?.textContent).toBe(
+      'bots.profile.style.bannedPhrasesHint',
+    );
+    const tone = screen.getByLabelText('bots.profile.style.tone');
+    const toneHintId = tone.getAttribute('aria-describedby');
+    expect(toneHintId).toBeTruthy();
+    expect(document.getElementById(toneHintId!)?.textContent).toBe('bots.profile.style.toneHint');
+  });
+
   it('keeps archived teammates read-only', () => {
     renderSettings({ status: 'archived' });
     expect(screen.getByTestId('bot-lifecycle-settings')).toBeTruthy();
