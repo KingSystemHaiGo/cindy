@@ -57,9 +57,17 @@ describe('通用「新建」保留 newMakerDraft 选择', () => {
     expect(block).not.toContain('workingDir: null');
   });
 
-  it('显式「新建对话」入口 handleCreateDialogue 仍清空 workingDir(不受本次修复影响)', () => {
+  it('显式「新建对话」入口仍清空 workingDir,但由创建页集中迁移目标', () => {
     const block = extractHandlerBlock(sidebarUpperSource, 'handleCreateDialogue');
-    expect(block).toContain('resetDraftWorkspaceTargets();');
+    // 2026-08-12 起 handler 接受可选的显式设备目标(按设备分组时对话组给出所属设备);
+    // 未给时仍按当前机器作用域推断,route state 由统一的 target 变量组装。
+    expect(block).toContain('state: makeDialogueNewMakerRouteState(target)');
+    expect(block).toContain('target = selectedDialogueDeviceResolution.target;');
+    expect(block).toContain("selectedDialogueDeviceResolution.status === 'pending'");
+    expect(block).not.toContain('resetDraftWorkspaceTargets');
+    expect(draftRouteSource).toMatch(
+      /applyDraftTarget\(\{\s*deviceId: dialogueTargetRequest\.deviceId,\s*deviceName: dialogueTargetRequest\.deviceName,\s*workingDir: null,/,
+    );
   });
 
   // 保留与清空的分界(2026-07-25 用户定稿):workingDir / 文本 / 模型是便利性
@@ -68,7 +76,7 @@ describe('通用「新建」保留 newMakerDraft 选择', () => {
   // 通用入口依旧不 patch store(前两条断言不受影响)。
   it('NewMakerDraftRoute mount 时清空 extraDirs(引用目录不跨草稿保留)', () => {
     expect(draftRouteSource).toContain(
-      "if (getDraft().extraDirs.length > 0) patchDraft({ extraDirs: [] });",
+      "if (getDraft().extraDirs.length > 0 || getDraft().writableDirs.length > 0) {",
     );
   });
 });

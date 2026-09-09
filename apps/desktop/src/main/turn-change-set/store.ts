@@ -30,6 +30,10 @@ import { detectSensitivePath } from '../security/sensitivePath.js';
 import * as broadcastTap from '../device-link/broadcast-tap.js';
 import { MAKER_PUSH } from '../maker-ipc/channels.js';
 import { atomicWriteFileSync } from '../utils/atomicWriteFile.js';
+import {
+  turnChangeSetSessionDirectory,
+  turnChangeSetStorageRoot,
+} from './storagePaths';
 
 const log = createLogger('turn-change-set');
 const MAX_LIST_ROWS = 100;
@@ -162,12 +166,11 @@ function assertSafeSegment(value: string, label: string): void {
 }
 
 function storageRoot(): string {
-  return path.join(app.getPath('userData'), 'turn-change-sets');
+  return turnChangeSetStorageRoot(app.getPath('userData'));
 }
 
 function sessionDir(sessionId: string): string {
-  assertSafeSegment(sessionId, 'session id');
-  return path.join(storageRoot(), sessionId);
+  return turnChangeSetSessionDirectory(app.getPath('userData'), sessionId);
 }
 
 function detailPath(sessionId: string, id: string): string {
@@ -918,13 +921,10 @@ export async function captureKnownFileBefore(input: KnownFileWriteCapture): Prom
   const pending = ensurePending(input.sessionId, input.provider, input.cwd);
   const target = safeRelativeTarget(input.cwd, input.targetPath);
   if (!target) {
-    // A known write target literally outside the workspace (agent temp files,
-    // scratchpad, OS temp dirs) is a deliberate scope exclusion, not a capture
-    // loss: turn change tracking only covers the workspace tree. Recording
-    // 'outside-workspace' here spawned a dead-end "+0 -0" partial card for
-    // turns that never touched the workspace at all. The realpath escape check
-    // below still records the reason — there the workspace tree appears
-    // touched, which is worth flagging.
+    // Literal out-of-workspace targets are deliberately skipped without recording
+    // a reason because the workspace tree was never touched. The realpath escape
+    // check below still records 'outside-workspace' when a workspace path resolves
+    // beyond that tree, which is worth flagging.
     return;
   }
   if (detectSensitivePath(target.relativePath, { allowEnvTemplates: true })) {

@@ -53,6 +53,10 @@ export function clearGoalRunEvents(): void {
   goalRunRecorder.clear();
 }
 
+/** Incremented on every resetGoalController call. attemptStartScheduler uses
+ * this to bail out if a teardown raced its await. */
+let _teardownGeneration = 0;
+
 export function startGoalController(deps: StartGoalControllerDeps): GoalController {
   if (_controller) return _controller;
   const logger = createLogger('goal-host');
@@ -161,11 +165,19 @@ export function getGoalController(): GoalController | null {
   return _controller;
 }
 
-/** 切账号 / 登出时调(与 resetScheduler 对齐;bootstrap-electron 的账号边界 teardown 已接入)。 */
-export function resetGoalController(): void {
-  if (_controller) _controller.dispose();
+/** 切账号 / 登出时调(与 resetScheduler 对齐;当前 bootstrap 不联动)。 */
+export async function resetGoalController(): Promise<void> {
+  const controller = _controller;
   _controller = null;
+  _teardownGeneration++;
+  if (controller) await controller.dispose();
   // 清空观测环:recorder 是模块级单例,不清空会让旧账号的 sessionId/reason 泄漏给
   // 重置后的新查看方,造成排障误判与隐私暴露。
   goalRunRecorder.clear();
+}
+
+/** Return current teardown generation. Callers that await across a teardown
+ * boundary should compare before/after to detect stale continuations. */
+export function getGoalTeardownGeneration(): number {
+  return _teardownGeneration;
 }

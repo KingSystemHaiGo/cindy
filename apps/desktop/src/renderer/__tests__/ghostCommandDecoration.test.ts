@@ -58,13 +58,13 @@ function makeGhost(
     version: '1.0.0',
     kind: 'chip',
     entry: 'main.js',
-    slots: ['tool'],
     command,
   };
   return {
     manifest,
     dir: '',
     enabled: opts.enabled ?? true,
+    approval: { state: 'approved', revision: '00000000-0000-4000-8000-000000000001' },
     ...(opts.icon ? { iconDataUrl: opts.icon } : {}),
   };
 }

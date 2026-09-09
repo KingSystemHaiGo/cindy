@@ -1,4 +1,5 @@
 import { promises as fs } from 'node:fs';
+import fsSync from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -8,9 +9,39 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createComputerMcpServer } from './server.js';
 import type { ComputerMcpDeps } from '../types.js';
 
+const canLinkFile = (() => {
+  const root = fsSync.mkdtempSync(path.join(os.tmpdir(), 'computer-file-link-probe-'));
+  try {
+    const target = path.join(root, 'target');
+    fsSync.writeFileSync(target, 'probe');
+    fsSync.symlinkSync(target, path.join(root, 'link'), 'file');
+    return true;
+  } catch {
+    return false;
+  } finally {
+    fsSync.rmSync(root, { recursive: true, force: true });
+  }
+})();
+
 /** Temp session workingDir for path-boundary-constrained tools (recording/replay). */
 async function makeWorkingDir(): Promise<string> {
   return fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'computer-wd-')));
+}
+
+async function writeTrajectory(
+  root: string,
+  actions: Array<{ tool: string; arguments?: Record<string, unknown> }>,
+  directoryName = 'rec',
+): Promise<string> {
+  const directory = path.join(root, directoryName);
+  await Promise.all(
+    actions.map(async (action, index) => {
+      const turn = path.join(directory, `turn-${String(index + 1).padStart(5, '0')}`);
+      await fs.mkdir(turn, { recursive: true });
+      await fs.writeFile(path.join(turn, 'action.json'), JSON.stringify(action), 'utf8');
+    }),
+  );
+  return directory;
 }
 
 function textPayload(result: unknown): unknown {
@@ -20,7 +51,10 @@ function textPayload(result: unknown): unknown {
   return JSON.parse(first.text);
 }
 
-async function makeHarness(deps: ComputerMcpDeps, options?: Parameters<typeof createComputerMcpServer>[1]) {
+async function makeHarness(
+  deps: ComputerMcpDeps,
+  options?: Parameters<typeof createComputerMcpServer>[1],
+) {
   const server = createComputerMcpServer(deps, options);
   const [clientTx, serverTx] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: 'computer-test-client', version: '0.0.0' });
@@ -35,6 +69,20 @@ async function makeHarness(deps: ComputerMcpDeps, options?: Parameters<typeof cr
 }
 
 describe('createComputerMcpServer', () => {
+  it('halts replay after an unknown action effect even with stop_on_error false', async () => {
+    const root = await makeWorkingDir();
+    const h = await makeHarness({ getStatus: vi.fn(), callTool: vi.fn(async () => ({ effect: 'unverifiable' })) }, {
+      sessionId: 'replay-unknown', getSessionContext: () => ({ sessionId: 'replay-unknown', agentKind: 'test', workingDir: root }),
+    });
+    try {
+      const dir = await writeTrajectory(root, [
+        { tool: 'click', arguments: { pid: 1, window_id: 2, x: 1, y: 2 } },
+        { tool: 'click', arguments: { pid: 1, window_id: 2, x: 3, y: 4 } },
+      ]);
+      const payload = textPayload(await h.client.callTool({ name: 'call_tool', arguments: { name: 'replay_trajectory', args: { dir, stop_on_error: false } } }));
+      expect(payload).toMatchObject({ data: { attempted: 1, succeeded: 0, failed: 1 } });
+    } finally { await h.cleanup(); await fs.rm(root, { recursive: true, force: true }); }
+  });
   it('lists desktop computer-use tools', async () => {
     const deps: ComputerMcpDeps = {
       getStatus: vi.fn(),
@@ -60,19 +108,26 @@ describe('createComputerMcpServer', () => {
     expect(payload.tools.map((tool) => tool.name)).toContain('replay_trajectory');
     expect(payload.tools.map((tool) => tool.name)).toContain('type_text');
     const listWindows = payload.tools.find((tool) => tool.name === 'list_windows');
+    const typeText = payload.tools.find((tool) => tool.name === 'type_text');
     expect(listWindows?.inputSchema?.properties).toHaveProperty('query');
     expect(listWindows?.inputSchema?.properties).toHaveProperty('workspace_root');
     expect(listWindows?.inputSchema?.properties).toHaveProperty('process_name');
     expect(payload.workflow).toContain('query/workspace_root/process_name');
     expect(listWindows?.description).toContain('{"process_name":"Simulator"}');
+    expect(payload.workflow).toContain('{"process_name":"Simulator"}');
     expect(payload.tools.find((tool) => tool.name === 'get_window_state')?.description)
-      .toContain('{"capture_mode":"vision"}');
+      .toContain('include_screenshot:false');
     expect(payload.tools.find((tool) => tool.name === 'click')?.description)
       .toContain('Always include pid');
     expect(payload.tools.find((tool) => tool.name === 'launch_app')?.description)
       .toContain('{"process_name":"Simulator"}');
+    expect(payload.tools.find((tool) => tool.name === 'launch_app')?.inputSchema?.properties)
+      .not.toHaveProperty('use_external_simulator');
+    expect(payload.tools.find((tool) => tool.name === 'hotkey')?.inputSchema?.properties)
+      .not.toHaveProperty('use_external_ios_workflow');
+    expect(typeText?.inputSchema?.properties).toHaveProperty('delivery_mode');
     expect(payload.workflow).toContain('always for coordinates');
-    expect(payload.workflow).toContain('{"capture_mode":"vision"}');
+    expect(payload.workflow).toContain('include_screenshot:false');
     await h.cleanup();
   });
 
@@ -152,7 +207,7 @@ describe('createComputerMcpServer', () => {
     })) as { ok: boolean };
 
     expect(payload.ok).toBe(true);
-    expect(deps.callTool).toHaveBeenCalledWith('get_accessibility_tree', {});
+    expect(deps.callTool).toHaveBeenCalledWith('get_accessibility_tree', {}, { signal: expect.any(AbortSignal) });
     await h.cleanup();
   });
 
@@ -181,7 +236,7 @@ describe('createComputerMcpServer', () => {
       workspace_root: '/repo',
       process_name: 'Electron',
       session: 'agent-session-1',
-    }, { sessionId: 'agent-session-1' });
+    }, { signal: expect.any(AbortSignal), sessionId: 'agent-session-1' });
     await h.cleanup();
   });
 
@@ -204,7 +259,7 @@ describe('createComputerMcpServer', () => {
     expect(deps.callTool).toHaveBeenCalledWith('list_windows', {
       process_name: 'Simulator',
       session: 'agent-session-1',
-    }, { sessionId: 'agent-session-1' });
+    }, { signal: expect.any(AbortSignal), sessionId: 'agent-session-1' });
     await h.cleanup();
   });
 
@@ -226,7 +281,7 @@ describe('createComputerMcpServer', () => {
     expect(payload.ok).toBe(true);
     expect(deps.callTool).toHaveBeenCalledWith('list_windows', {
       process_name: 'Simulator',
-    });
+    }, { signal: expect.any(AbortSignal) });
     await h.cleanup();
   });
 
@@ -279,7 +334,7 @@ describe('createComputerMcpServer', () => {
       window_id: 7,
       capture_mode: 'vision',
       session: 'agent-session-1',
-    }, { sessionId: 'agent-session-1' });
+    }, { signal: expect.any(AbortSignal), sessionId: 'agent-session-1' });
     await h.cleanup();
   });
 
@@ -303,7 +358,7 @@ describe('createComputerMcpServer', () => {
       pid: 123,
       window_id: 7,
       capture_mode: 'vision',
-    });
+    }, { signal: expect.any(AbortSignal) });
     await h.cleanup();
   });
 
@@ -385,6 +440,30 @@ describe('createComputerMcpServer', () => {
     await h.cleanup();
   });
 
+  it('forwards an explicit type_text delivery mode to cua-driver', async () => {
+    const deps: ComputerMcpDeps = {
+      getStatus: vi.fn(),
+      callTool: vi.fn(async () => ({ ok: true })),
+    };
+    const h = await makeHarness(deps);
+
+    const result = await h.client.callTool({
+      name: 'call_tool',
+      arguments: {
+        name: 'type_text',
+        args: { pid: 123, text: 'hello', delivery_mode: 'foreground' },
+      },
+    });
+
+    expect(textPayload(result)).toMatchObject({ ok: true });
+    expect(deps.callTool).toHaveBeenCalledWith('type_text', {
+      pid: 123,
+      text: 'hello',
+      delivery_mode: 'foreground',
+    }, { signal: expect.any(AbortSignal) });
+    await h.cleanup();
+  });
+
   it('dispatches zoom with cua-driver 0.5 region bounds', async () => {
     const deps: ComputerMcpDeps = {
       getStatus: vi.fn(),
@@ -407,7 +486,7 @@ describe('createComputerMcpServer', () => {
       y1: 20,
       x2: 110,
       y2: 120,
-    });
+    }, { signal: expect.any(AbortSignal) });
     await h.cleanup();
   });
 
@@ -437,7 +516,113 @@ describe('createComputerMcpServer', () => {
       creates_new_application_instance: true,
       electron_debugging_port: 9222,
       additional_arguments: ['--flag'],
+    }, { signal: expect.any(AbortSignal) });
+    await h.cleanup();
+  });
+
+  it('dispatches standalone Simulator.app launches through the normal desktop driver', async () => {
+    const deps: ComputerMcpDeps = {
+      getStatus: vi.fn(),
+      callTool: vi.fn(async () => ({ ok: true })),
+    };
+    const h = await makeHarness(deps);
+
+    const payload = textPayload(await h.client.callTool({
+      name: 'call_tool',
+      arguments: {
+        name: 'launch_app',
+        args: { name: 'Simulator' },
+      },
+    })) as { ok: boolean };
+
+    expect(payload.ok).toBe(true);
+    expect(deps.callTool).toHaveBeenCalledWith('launch_app', {
+      name: 'Simulator',
+    }, { signal: expect.any(AbortSignal) });
+    await h.cleanup();
+  });
+
+  it('dispatches Xcode launches through the normal desktop driver', async () => {
+    const deps: ComputerMcpDeps = {
+      getStatus: vi.fn(),
+      callTool: vi.fn(async () => ({ ok: true })),
+    };
+    const h = await makeHarness(deps);
+
+    const payload = textPayload(await h.client.callTool({
+      name: 'call_tool',
+      arguments: {
+        name: 'launch_app',
+        args: {
+          name: 'Xcode',
+          bundle_id: 'com.apple.dt.Xcode',
+          urls: ['file:///repo/App.xcworkspace'],
+        },
+      },
+    })) as { ok: boolean };
+
+    expect(payload.ok).toBe(true);
+    expect(deps.callTool).toHaveBeenCalledWith('launch_app', {
+      name: 'Xcode',
+      bundle_id: 'com.apple.dt.Xcode',
+      urls: ['file:///repo/App.xcworkspace'],
+    }, { signal: expect.any(AbortSignal) });
+    await h.cleanup();
+  });
+
+  it.each([
+    ['Xcode hotkey', 'hotkey', { pid: 686, window_id: 282, keys: ['cmd', 'r'] }],
+    ['Simulator click', 'click', { pid: 44412, window_id: 29131, x: 20, y: 20 }],
+  ])(
+    'dispatches %s without requiring process provenance',
+    async (_label, name, args) => {
+      const deps: ComputerMcpDeps = {
+        getStatus: vi.fn(),
+        callTool: vi.fn(async () => ({ ok: true })),
+      };
+      const h = await makeHarness(deps, { sessionId: 'agent-session-1' });
+
+      const payload = textPayload(await h.client.callTool({
+        name: 'call_tool',
+        arguments: {
+          name,
+          args,
+        },
+      })) as { ok: boolean };
+
+      expect(payload.ok).toBe(true);
+      expect(deps.callTool).toHaveBeenCalledWith(
+        name,
+        { ...args, session: 'agent-session-1' },
+        { signal: expect.any(AbortSignal), sessionId: 'agent-session-1' });
+      await h.cleanup();
+    },
+  );
+
+  it('rejects model-supplied external iOS override fields before dispatch', async () => {
+    const deps: ComputerMcpDeps = {
+      getStatus: vi.fn(),
+      callTool: vi.fn(),
+    };
+    const h = await makeHarness(deps);
+
+    const result = await h.client.callTool({
+      name: 'call_tool',
+      arguments: {
+        name: 'launch_app',
+        args: {
+          bundle_id: 'com.apple.iphonesimulator',
+          use_external_simulator: true,
+        },
+      },
     });
+    const payload = textPayload(result) as { ok: boolean; errorCode: string };
+
+    expect(payload).toMatchObject({
+      ok: false,
+      errorCode: 'INVALID_ARGS',
+    });
+    expect(deps.callTool).not.toHaveBeenCalled();
     await h.cleanup();
   });
 
@@ -484,7 +669,7 @@ describe('createComputerMcpServer', () => {
       window_id: 7,
       element_index: 2,
       value: 'Option',
-    });
+    }, { signal: expect.any(AbortSignal) });
     await h.cleanup();
   });
 
@@ -531,7 +716,7 @@ describe('createComputerMcpServer', () => {
       direction: 'down',
       amount: 3,
       by: 'page',
-    });
+    }, { signal: expect.any(AbortSignal) });
     await h.cleanup();
   });
 
@@ -557,7 +742,7 @@ describe('createComputerMcpServer', () => {
       x: 10,
       y: 20,
       session: 'agent-session-1',
-    }, { sessionId: 'agent-session-1' });
+    }, { signal: expect.any(AbortSignal), sessionId: 'agent-session-1' });
     await h.cleanup();
   });
 
@@ -599,14 +784,14 @@ describe('createComputerMcpServer', () => {
       x: 10,
       y: 20,
       session: 'dynamic-session-1',
-    }, { sessionId: 'dynamic-session-1', agentKind: 'codex' });
+    }, { signal: expect.any(AbortSignal), sessionId: 'dynamic-session-1', agentKind: 'codex' });
     expect(deps.callTool).toHaveBeenNthCalledWith(2, 'click', {
       pid: 123,
       window_id: 7,
       x: 11,
       y: 21,
       session: 'dynamic-session-2',
-    }, { sessionId: 'dynamic-session-2', agentKind: 'codex' });
+    }, { signal: expect.any(AbortSignal), sessionId: 'dynamic-session-2', agentKind: 'codex' });
     await h.cleanup();
   });
 
@@ -631,7 +816,7 @@ describe('createComputerMcpServer', () => {
       y: 20,
       cursor_id: 'agent-session-1',
       session: 'agent-session-1',
-    }, { sessionId: 'agent-session-1' });
+    }, { signal: expect.any(AbortSignal), sessionId: 'agent-session-1' });
     await h.cleanup();
   });
 
@@ -653,7 +838,7 @@ describe('createComputerMcpServer', () => {
     expect(payload.ok).toBe(true);
     expect(deps.callTool).toHaveBeenCalledWith('get_agent_cursor_state', {
       cursor_id: 'agent-session-1',
-    }, { sessionId: 'agent-session-1' });
+    }, { signal: expect.any(AbortSignal), sessionId: 'agent-session-1' });
     await h.cleanup();
   });
 
@@ -686,7 +871,7 @@ describe('createComputerMcpServer', () => {
       output_dir: path.join(root, 'rec'),
       record_video: true,
       session: 'recording-session',
-    }, { sessionId: 'recording-session', agentKind: 'claude-code' });
+    }, { signal: expect.any(AbortSignal), sessionId: 'recording-session', agentKind: 'claude-code' });
     await h.cleanup();
     await fs.rm(root, { recursive: true, force: true });
   });
@@ -784,29 +969,476 @@ describe('createComputerMcpServer', () => {
     await h.cleanup();
   });
 
-  it('dispatches replay trajectory tool (dir constrained to workingDir)', async () => {
+  it('replays a validated trajectory through Cindy action dispatch', async () => {
     const deps: ComputerMcpDeps = {
       getStatus: vi.fn(),
       callTool: vi.fn(async () => ({ ok: true })),
     };
     const root = await makeWorkingDir();
+    await writeTrajectory(root, [
+      {
+        tool: 'click',
+        arguments: { pid: 123, window_id: 7, x: 10, y: 20 },
+      },
+    ]);
     const h = await makeHarness(deps, {
       getSessionContext: () => ({ agentKind: 'claude-code', workingDir: root }),
     });
 
-    await h.client.callTool({
+    const payload = textPayload(
+      await h.client.callTool({
+        name: 'call_tool',
+        arguments: {
+          name: 'replay_trajectory',
+          args: { dir: 'rec', delay_ms: 0, stop_on_error: false },
+        },
+      }),
+    ) as {
+      ok: boolean;
+      data: { attempted: number; succeeded: number; failed: number };
+    };
+
+    expect(payload).toMatchObject({
+      ok: true,
+      data: { attempted: 1, succeeded: 1, failed: 0 },
+    });
+    expect(deps.callTool).toHaveBeenCalledWith(
+      'click',
+      { pid: 123, window_id: 7, x: 10, y: 20 },
+      { signal: expect.any(AbortSignal), agentKind: 'claude-code' });
+    expect(deps.callTool).not.toHaveBeenCalledWith(
+      'replay_trajectory',
+      expect.anything(),
+      expect.anything(),
+    );
+    await h.cleanup();
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it(
+    'replays inside a workingDir reached through a symbolic link',
+    async () => {
+      const deps: ComputerMcpDeps = {
+        getStatus: vi.fn(),
+        callTool: vi.fn(async () => ({ ok: true })),
+      };
+      const container = await makeWorkingDir();
+      const realWorkingDir = path.join(container, 'real-workspace');
+      const linkedWorkingDir = path.join(container, 'linked-workspace');
+      await fs.mkdir(realWorkingDir);
+      await fs.symlink(
+        realWorkingDir,
+        linkedWorkingDir,
+        process.platform === 'win32' ? 'junction' : 'dir',
+      );
+      await writeTrajectory(realWorkingDir, [
+        {
+          tool: 'get_window_state',
+          arguments: {
+            pid: 121,
+            window_id: 1,
+            screenshot_out_file: 'screens/state.png',
+          },
+        },
+      ]);
+      const h = await makeHarness(deps, {
+        getSessionContext: () => ({
+          agentKind: 'claude-code',
+          workingDir: linkedWorkingDir,
+        }),
+      });
+
+      const payload = textPayload(await h.client.callTool({
+        name: 'call_tool',
+        arguments: {
+          name: 'replay_trajectory',
+          args: { dir: 'rec', delay_ms: 0 },
+        },
+      })) as { ok: boolean; data: { succeeded: number } };
+
+      expect(payload).toMatchObject({ ok: true, data: { succeeded: 1 } });
+      expect(deps.callTool).toHaveBeenCalledWith(
+        'get_window_state',
+        {
+          pid: 121,
+          window_id: 1,
+          screenshot_out_file: path.join(realWorkingDir, 'screens', 'state.png'),
+        },
+        { signal: expect.any(AbortSignal), agentKind: 'claude-code' });
+      await h.cleanup();
+      await fs.rm(container, { recursive: true, force: true });
+    },
+  );
+
+  it('replays external iOS desktop actions through the normal driver path', async () => {
+    const deps: ComputerMcpDeps = {
+      getStatus: vi.fn(),
+      callTool: vi.fn(async () => ({ ok: true })),
+    };
+    const root = await makeWorkingDir();
+    await writeTrajectory(root, [
+      { tool: 'launch_app', arguments: { name: 'Simulator' } },
+      { tool: 'click', arguments: { pid: 202, window_id: 2, x: 30, y: 40 } },
+    ]);
+    const h = await makeHarness(deps, {
+      getSessionContext: () => ({ agentKind: 'claude-code', workingDir: root }),
+    });
+
+    const payload = textPayload(await h.client.callTool({
       name: 'call_tool',
       arguments: {
         name: 'replay_trajectory',
-        args: { dir: 'rec', delay_ms: 100, stop_on_error: false },
+        args: { dir: 'rec', delay_ms: 0, stop_on_error: false },
+      },
+    })) as { ok: boolean; data: { attempted: number; succeeded: number } };
+
+    expect(payload).toMatchObject({
+      ok: true,
+      data: { attempted: 2, succeeded: 2 },
+    });
+    expect(deps.callTool).toHaveBeenNthCalledWith(
+      1,
+      'launch_app',
+      { name: 'Simulator' },
+      { signal: expect.any(AbortSignal), agentKind: 'claude-code' },
+    );
+    expect(deps.callTool).toHaveBeenNthCalledWith(
+      2,
+      'click',
+      { pid: 202, window_id: 2, x: 30, y: 40 },
+      { signal: expect.any(AbortSignal), agentKind: 'claude-code' },
+    );
+    await h.cleanup();
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it('executes the immutable preflight snapshot when the action file changes later', async () => {
+    const root = await makeWorkingDir();
+    const trajectory = await writeTrajectory(root, [
+      { tool: 'type_text', arguments: { pid: 616, text: 'original text' } },
+    ]);
+    const actionPath = path.join(trajectory, 'turn-00001', 'action.json');
+    const callTool = vi.fn(async () => {
+      await fs.writeFile(
+        actionPath,
+        JSON.stringify({ tool: 'launch_app', arguments: { name: 'Simulator' } }),
+        'utf8',
+      );
+      return { ok: true };
+    });
+    const deps: ComputerMcpDeps = {
+      getStatus: vi.fn(),
+      callTool,
+    };
+    const h = await makeHarness(deps, {
+      getSessionContext: () => ({ agentKind: 'claude-code', workingDir: root }),
+    });
+
+    const payload = textPayload(await h.client.callTool({
+      name: 'call_tool',
+      arguments: {
+        name: 'replay_trajectory',
+        args: { dir: 'rec', delay_ms: 0 },
+      },
+    })) as { ok: boolean; data: { succeeded: number } };
+
+    expect(payload).toMatchObject({ ok: true, data: { succeeded: 1 } });
+    expect(callTool).toHaveBeenCalledWith(
+      'type_text',
+      { pid: 616, text: 'original text' },
+      { signal: expect.any(AbortSignal), agentKind: 'claude-code' });
+    expect(callTool).not.toHaveBeenCalledWith('launch_app', expect.anything());
+    await h.cleanup();
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it(
+    'rejects a recorded turn that escapes through a symlink',
+    async () => {
+      const deps: ComputerMcpDeps = {
+        getStatus: vi.fn(),
+        callTool: vi.fn(async () => ({ ok: true })),
+      };
+      const root = await makeWorkingDir();
+      const outside = await makeWorkingDir();
+      await fs.mkdir(path.join(root, 'rec'), { recursive: true });
+      await fs.writeFile(
+        path.join(outside, 'action.json'),
+        JSON.stringify({ tool: 'get_screen_size', arguments: {} }),
+        'utf8',
+      );
+      await fs.symlink(
+        outside,
+        path.join(root, 'rec', 'turn-00001'),
+        process.platform === 'win32' ? 'junction' : 'dir',
+      );
+      const h = await makeHarness(deps, {
+        getSessionContext: () => ({
+          agentKind: 'claude-code',
+          workingDir: root,
+        }),
+      });
+
+      const result = await h.client.callTool({
+        name: 'call_tool',
+        arguments: {
+          name: 'replay_trajectory',
+          args: { dir: 'rec', delay_ms: 0 },
+        },
+      });
+
+      expect(textPayload(result)).toMatchObject({
+        ok: false,
+        errorCode: 'TRAJECTORY_VALIDATION_FAILED',
+        data: { turn: 'turn-00001' },
+      });
+      expect(deps.callTool).not.toHaveBeenCalled();
+      await h.cleanup();
+      await fs.rm(root, { recursive: true, force: true });
+      await fs.rm(outside, { recursive: true, force: true });
+    },
+  );
+
+  it.skipIf(!canLinkFile)(
+    'rejects a symbolic-link action file even when its target stays in the task',
+    async () => {
+      const deps: ComputerMcpDeps = {
+        getStatus: vi.fn(),
+        callTool: vi.fn(async () => ({ ok: true })),
+      };
+      const root = await makeWorkingDir();
+      const turn = path.join(root, 'rec', 'turn-00001');
+      await fs.mkdir(turn, { recursive: true });
+      await fs.writeFile(
+        path.join(root, 'safe-action.json'),
+        JSON.stringify({ tool: 'get_screen_size', arguments: {} }),
+        'utf8',
+      );
+      await fs.symlink(path.join(root, 'safe-action.json'), path.join(turn, 'action.json'));
+      const h = await makeHarness(deps, {
+        getSessionContext: () => ({ agentKind: 'claude-code', workingDir: root }),
+      });
+
+      const result = await h.client.callTool({
+        name: 'call_tool',
+        arguments: {
+          name: 'replay_trajectory',
+          args: { dir: 'rec', delay_ms: 0 },
+        },
+      });
+
+      expect(textPayload(result)).toMatchObject({
+        ok: false,
+        errorCode: 'TRAJECTORY_VALIDATION_FAILED',
+        data: { turn: 'turn-00001' },
+      });
+      expect(deps.callTool).not.toHaveBeenCalled();
+      await h.cleanup();
+      await fs.rm(root, { recursive: true, force: true });
+    },
+  );
+
+  it('rejects trajectories whose aggregate action files exceed the memory budget', async () => {
+    const deps: ComputerMcpDeps = {
+      getStatus: vi.fn(),
+      callTool: vi.fn(async () => ({ ok: true })),
+    };
+    const root = await makeWorkingDir();
+    await writeTrajectory(
+      root,
+      Array.from({ length: 9 }, (_, index) => ({
+        tool: 'type_text',
+        arguments: { pid: 800 + index, text: 'x'.repeat(240_000) },
+      })),
+    );
+    const h = await makeHarness(deps, {
+      getSessionContext: () => ({ agentKind: 'claude-code', workingDir: root }),
+    });
+
+    const result = await h.client.callTool({
+      name: 'call_tool',
+      arguments: {
+        name: 'replay_trajectory',
+        args: { dir: 'rec', delay_ms: 0, stop_on_error: false },
       },
     });
 
-    expect(deps.callTool).toHaveBeenCalledWith('replay_trajectory', {
-      dir: path.join(root, 'rec'),
-      delay_ms: 100,
-      stop_on_error: false,
-    }, { agentKind: 'claude-code' });
+    expect(textPayload(result)).toMatchObject({
+      ok: false,
+      errorCode: 'TRAJECTORY_VALIDATION_FAILED',
+      data: { turn: 'turn-00009' },
+    });
+    expect(deps.callTool).not.toHaveBeenCalled();
+    await h.cleanup();
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it('bounds accumulated replay result summaries', async () => {
+    const deps: ComputerMcpDeps = {
+      getStatus: vi.fn(),
+      callTool: vi.fn(async () => 'x'.repeat(10_000)),
+    };
+    const root = await makeWorkingDir();
+    await writeTrajectory(
+      root,
+      Array.from({ length: 40 }, () => ({ tool: 'get_screen_size', arguments: {} })),
+    );
+    const h = await makeHarness(deps, {
+      getSessionContext: () => ({ agentKind: 'claude-code', workingDir: root }),
+    });
+
+    const payload = textPayload(await h.client.callTool({
+      name: 'call_tool',
+      arguments: {
+        name: 'replay_trajectory',
+        args: { dir: 'rec', delay_ms: 0 },
+      },
+    })) as { data: { turns: Array<{ result_summary: string }> } };
+
+    expect(payload.data.turns).toHaveLength(40);
+    expect(payload.data.turns.every((turn) => turn.result_summary.length <= 2_048)).toBe(true);
+    expect(
+      payload.data.turns.reduce((total, turn) => total + turn.result_summary.length, 0),
+    ).toBeLessThanOrEqual(64 * 1024);
+    await h.cleanup();
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it('preserves recorded tool summaries instead of exposing Cindy envelopes', async () => {
+    const deps: ComputerMcpDeps = {
+      getStatus: vi.fn(),
+      callTool: vi
+        .fn()
+        .mockResolvedValueOnce('screen is 1440x900')
+        .mockRejectedValueOnce(new Error('driver capture failed')),
+    };
+    const root = await makeWorkingDir();
+    await writeTrajectory(root, [
+      { tool: 'get_screen_size', arguments: {} },
+      { tool: 'get_screen_size', arguments: {} },
+    ]);
+    const h = await makeHarness(deps, {
+      getSessionContext: () => ({ agentKind: 'claude-code', workingDir: root }),
+    });
+
+    const payload = textPayload(await h.client.callTool({
+      name: 'call_tool',
+      arguments: {
+        name: 'replay_trajectory',
+        args: { dir: 'rec', delay_ms: 0, stop_on_error: false },
+      },
+    })) as {
+      data: {
+        turns: Array<{ result_summary: string }>;
+        first_failure: { error: string };
+      };
+    };
+
+    expect(payload.data.turns.map((turn) => turn.result_summary)).toEqual([
+      'screen is 1440x900',
+      'driver capture failed',
+    ]);
+    expect(payload.data.first_failure.error).toBe('driver capture failed');
+    await h.cleanup();
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it('stops dispatching recorded actions after the MCP request is cancelled', async () => {
+    const controller = new AbortController();
+    const deps: ComputerMcpDeps = {
+      getStatus: vi.fn(),
+      callTool: vi.fn(async () => {
+        controller.abort();
+        return { ok: true };
+      }),
+    };
+    const root = await makeWorkingDir();
+    await writeTrajectory(root, [
+      { tool: 'get_screen_size', arguments: {} },
+      { tool: 'get_screen_size', arguments: {} },
+    ]);
+    const h = await makeHarness(deps, {
+      getSessionContext: () => ({ agentKind: 'claude-code', workingDir: root }),
+    });
+
+    await expect(
+      h.client.callTool(
+        {
+          name: 'call_tool',
+          arguments: {
+            name: 'replay_trajectory',
+            args: { dir: 'rec', delay_ms: 100, stop_on_error: false },
+          },
+        },
+        undefined,
+        { signal: controller.signal },
+      ),
+    ).rejects.toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    expect(deps.callTool).toHaveBeenCalledTimes(1);
+    await h.cleanup();
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it('rejects nested trajectory replay before any action is dispatched', async () => {
+    const deps: ComputerMcpDeps = {
+      getStatus: vi.fn(),
+      callTool: vi.fn(async () => ({ ok: true })),
+    };
+    const root = await makeWorkingDir();
+    await writeTrajectory(root, [
+      { tool: 'replay_trajectory', arguments: { dir: 'another-recording' } },
+    ]);
+    const h = await makeHarness(deps, {
+      getSessionContext: () => ({ agentKind: 'claude-code', workingDir: root }),
+    });
+
+    const result = await h.client.callTool({
+      name: 'call_tool',
+      arguments: {
+        name: 'replay_trajectory',
+        args: { dir: 'rec', delay_ms: 0 },
+      },
+    });
+
+    expect(textPayload(result)).toMatchObject({
+      ok: false,
+      errorCode: 'TRAJECTORY_VALIDATION_FAILED',
+      data: { turn: 'turn-00001' },
+    });
+    expect(deps.callTool).not.toHaveBeenCalled();
+    await h.cleanup();
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it('fails closed before replay when a recorded action is malformed', async () => {
+    const deps: ComputerMcpDeps = {
+      getStatus: vi.fn(),
+      callTool: vi.fn(),
+    };
+    const root = await makeWorkingDir();
+    const turn = path.join(root, 'rec', 'turn-00001');
+    await fs.mkdir(turn, { recursive: true });
+    await fs.writeFile(path.join(turn, 'action.json'), '{not-json', 'utf8');
+    const h = await makeHarness(deps, {
+      getSessionContext: () => ({ agentKind: 'claude-code', workingDir: root }),
+    });
+
+    const result = await h.client.callTool({
+      name: 'call_tool',
+      arguments: {
+        name: 'replay_trajectory',
+        args: { dir: 'rec', delay_ms: 0 },
+      },
+    });
+
+    expect(textPayload(result)).toMatchObject({
+      ok: false,
+      errorCode: 'TRAJECTORY_VALIDATION_FAILED',
+      data: { turn: 'turn-00001' },
+    });
+    expect(deps.callTool).not.toHaveBeenCalled();
     await h.cleanup();
     await fs.rm(root, { recursive: true, force: true });
   });

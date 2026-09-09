@@ -5,6 +5,7 @@ import type { AsrEvent, AsrProvider, AudioTrace } from '@cindy/voice-input-core'
 import { createLogger } from '../logger.js';
 import { createOutboundHttpAgent } from '../maker-host/outbound-fetch.js';
 import { resamplePcm16 } from './RealtimeAsrWebSocketProvider.js';
+import { volcengineSaucLanguageCode } from './language.js';
 import { mergeRecoveredTranscript } from './transcriptMerge.js';
 import { describeAsrHandshakeTraceId, describeAsrWebSocketTarget } from './voiceInputAsrConfig.js';
 
@@ -130,6 +131,7 @@ export class VolcengineSaucAsrProvider implements AsrProvider {
   }
 
   private async openSocket(): Promise<void> {
+    const openStartedAt = performance.now();
     const connection = this.connectionProvider
       ? await this.connectionProvider()
       : {
@@ -137,10 +139,13 @@ export class VolcengineSaucAsrProvider implements AsrProvider {
           authorizationToken: this.proxyApiKey!,
         };
     if (this.stopRequested) throw new Error('Volcengine SAUC ASR connection stopped.');
+    const connectionResolvedAt = performance.now();
     // `ws` 不吃系统代理;直连时为 undefined,行为与不传一致。
     const agent = await createOutboundHttpAgent(connection.websocketUrl);
     // 解析代理是一次异步往返,期间可能已停录 —— 复查后再建连,不留孤儿 socket。
     if (this.stopRequested) throw new Error('Volcengine SAUC ASR connection stopped.');
+    const dialStartedAt = performance.now();
+    let socketOpenedAt = 0;
     const socket = new WebSocket(connection.websocketUrl, {
       headers: {
         Authorization: `Bearer ${connection.authorizationToken}`,
@@ -192,6 +197,7 @@ export class VolcengineSaucAsrProvider implements AsrProvider {
           fail(new Error('Volcengine SAUC ASR connection opened after stop.'), true);
           return;
         }
+        socketOpenedAt = performance.now();
         this.startKeepAlive();
         this.sendInitialRequest();
       };
@@ -220,6 +226,14 @@ export class VolcengineSaucAsrProvider implements AsrProvider {
         cleanup();
         this.connected = true;
         this.started = true;
+        const readyAt = performance.now();
+        log.debug('connected', {
+          connectionMs: Math.round(connectionResolvedAt - openStartedAt),
+          proxyResolveMs: Math.round(dialStartedAt - connectionResolvedAt),
+          socketOpenMs: socketOpenedAt ? Math.round(socketOpenedAt - dialStartedAt) : undefined,
+          firstResponseMs: socketOpenedAt ? Math.round(readyAt - socketOpenedAt) : undefined,
+          totalMs: Math.round(readyAt - openStartedAt),
+        });
         this.callback({ type: 'connected', at: Date.now() });
         resolve();
       };
@@ -275,12 +289,26 @@ export class VolcengineSaucAsrProvider implements AsrProvider {
     // cut off by an empty final marker.
     const finalChunk = silencePcm16(this.pcmSampleRate, NONSTREAM_END_WINDOW_MS);
     socket.send(encodeAudioOnlyRequest(finalChunk, -this.nextSequence()));
+    const flushStartedAt = performance.now();
+    let flushTimedOut = false;
     await new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, FLUSH_TIMEOUT_MS);
+      const timer = setTimeout(() => {
+        flushTimedOut = true;
+        resolve();
+      }, FLUSH_TIMEOUT_MS);
       this.flushResolvers.push(() => {
         clearTimeout(timer);
         resolve();
       });
+    });
+    // Stop-to-submit latency is dominated by this wait for the server's last
+    // response; log it so a slow final pass is distinguishable from the
+    // controller's own stable wait.
+    log.debug('flush settled', {
+      waitMs: Math.round(performance.now() - flushStartedAt),
+      timedOut: flushTimedOut,
+      sentAudioMs: Math.round(this.sentAudioMs),
+      hasStable: this.stableEmitted,
     });
     if (this.lastTranscript && !this.stableEmitted) {
       this.callback({ type: 'stable', text: this.lastTranscript, at: Date.now() });
@@ -314,6 +342,10 @@ export class VolcengineSaucAsrProvider implements AsrProvider {
     }
     this.teardownSocketForReconnect();
     this.callback({ type: 'disconnected', at: Date.now() });
+  }
+
+  async dispose(): Promise<void> {
+    if (!this.stopRequested) await this.stop();
   }
 
   private resetState(): void {
@@ -430,6 +462,7 @@ export class VolcengineSaucAsrProvider implements AsrProvider {
   private sendInitialRequest(): void {
     const socket = this.socket;
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    const language = volcengineSaucLanguageCode(this.sourceLanguage);
     socket.send(encodeFullClientRequest({
       user: {
         uid: 'xdt-maker',
@@ -449,9 +482,7 @@ export class VolcengineSaucAsrProvider implements AsrProvider {
         end_window_size: NONSTREAM_END_WINDOW_MS,
         enable_punc: true,
         enable_itn: true,
-        ...(this.sourceLanguage && this.sourceLanguage.toLowerCase() !== 'auto'
-          ? { language: this.sourceLanguage }
-          : {}),
+        ...(language ? { language } : {}),
       },
     }));
   }

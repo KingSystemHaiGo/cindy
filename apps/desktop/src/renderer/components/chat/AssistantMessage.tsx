@@ -117,12 +117,16 @@ const StreamingBody = memo(function StreamingBody({
   localFileRefs,
   currentSessionId,
   currentSessionTitle,
+  streamFadeKey,
+  allowPrivilegedLinks,
 }: {
   workingDir: string;
   content: string;
   localFileRefs?: readonly KnownLocalFileRef[];
   currentSessionId?: string;
   currentSessionTitle?: string | null;
+  streamFadeKey?: string;
+  allowPrivilegedLinks: boolean;
 }) {
   const { committedText, pendingLine } = useMemo(
     () => splitAtLastNewline(content),
@@ -135,9 +139,11 @@ const StreamingBody = memo(function StreamingBody({
           workingDir={workingDir}
           content={committedText}
           isStreaming
+          streamFadeKey={streamFadeKey}
           localFileRefs={localFileRefs}
           currentSessionId={currentSessionId}
           currentSessionTitle={currentSessionTitle}
+          allowPrivilegedLinks={allowPrivilegedLinks}
         />
       )}
       {pendingLine && (
@@ -151,6 +157,14 @@ interface AssistantMessageProps {
   /** F1 transit: pass through to MarkdownRenderer for local-path resolution
    *  in markdown links. Stable per-session; doesn't trigger extra renders. */
   workingDir: string;
+  /**
+   * Whether this content may reach privileged link targets (`file:` and Cindy
+   * deep links) on *this* machine. False for anything whose author is another
+   * machine — a device-link or SSH task — where `workingDir` names a path the
+   * control side does not own. Default true keeps every existing caller,
+   * which renders local sessions, exactly as it was.
+   */
+  allowPrivilegedLinks?: boolean;
   localFileRefs?: readonly KnownLocalFileRef[];
   currentSessionId?: string;
   currentSessionTitle?: string | null;
@@ -176,6 +190,8 @@ interface AssistantMessageProps {
    *  的收尾 assistant 正文传 true —— 任务执行过程中的中间句不挂 bar(bar 即使
    *  opacity-0 也占 24px 布局高度,每句都挂会拉散消息流)。默认 false。 */
   showActionBar?: boolean;
+  /** 伙伴对话使用常显、无费用、无 Fork 的轻量消息操作栏。 */
+  simplifiedBotConversation?: boolean;
   /** Per-turn 费用 (USD) — 仅该轮最后一条 assistant 有值, action bar 时间旁显示。 */
   turnMoney?: RegionalMoney;
   turnCostUsd?: number;
@@ -198,6 +214,7 @@ interface AssistantMessageProps {
 
 export const AssistantMessage = memo(function AssistantMessage({
   workingDir,
+  allowPrivilegedLinks = true,
   localFileRefs,
   currentSessionId,
   currentSessionTitle,
@@ -210,6 +227,7 @@ export const AssistantMessage = memo(function AssistantMessage({
   forkBlocked,
   sessionRunning,
   showActionBar = false,
+  simplifiedBotConversation = false,
   turnMoney,
   turnCostUsd,
   turnCostIsEstimate,
@@ -286,6 +304,9 @@ export const AssistantMessage = memo(function AssistantMessage({
   // /goal:隐藏助手输出末尾由 goal 协议要求模型吐出的裁决 JSON 块(仅显示层剥离,
   // 原文仍保留在 DB / transcript)。pattern:末尾的 ```json {...goal_status...} ``` 围栏块。
   const displayContent = stripGoalVerdictBlock(content);
+  const streamFadeKey = messageClientId
+    ? `${currentSessionId ?? ''}\u0000${messageClientId}`
+    : undefined;
 
   return (
     <div
@@ -324,6 +345,8 @@ export const AssistantMessage = memo(function AssistantMessage({
             localFileRefs={localFileRefs}
             currentSessionId={currentSessionId}
             currentSessionTitle={currentSessionTitle}
+            streamFadeKey={streamFadeKey}
+            allowPrivilegedLinks={allowPrivilegedLinks}
           />
         ) : (
           // 默认分支 (USE_LINE_COMMIT_STREAMING=false) + 非 streaming 都走完整
@@ -333,9 +356,11 @@ export const AssistantMessage = memo(function AssistantMessage({
             workingDir={workingDir}
             content={displayContent}
             isStreaming={isStreaming}
+            streamFadeKey={streamFadeKey}
             localFileRefs={localFileRefs}
             currentSessionId={currentSessionId}
             currentSessionTitle={currentSessionTitle}
+            allowPrivilegedLinks={allowPrivilegedLinks}
           />
         )}
         {/* 自绘卡在场:提供原文 ↔ 意识卡片切换(信任边界,主机绘制,始终可切回原文)。 */}
@@ -343,7 +368,7 @@ export const AssistantMessage = memo(function AssistantMessage({
           <button
             type="button"
             onClick={() => setShowOriginal((v) => !v)}
-            className="mt-1 text-[11px] underline decoration-dotted underline-offset-2"
+            className="mt-1 text-11 underline decoration-dotted underline-offset-2"
             style={{ color: 'var(--text-tertiary)' }}
           >
             {showOriginal ? t('chat.ghostHook.viewGhostCard') : t('chat.ghostHook.viewOriginal')}
@@ -352,7 +377,7 @@ export const AssistantMessage = memo(function AssistantMessage({
         {/* 出口钩子后台处理中:回复已显示、意识还在跑那段的轻指示(规则 7:
             spinner 挂 wrapper 的 compositor-only transform,仅 pending 时挂载)。 */}
         {ghostReplyPending && !ghostRenderCard && (
-          <div className="mt-1 flex items-center gap-1.5 text-[11px]" style={{ color: 'var(--text-tertiary)' }}>
+          <div className="mt-1 flex items-center gap-1.5 text-11" style={{ color: 'var(--text-tertiary)' }}>
             <span className="inline-flex animate-spin motion-reduce:animate-none">
               <Loader2 size={11} />
             </span>
@@ -364,7 +389,7 @@ export const AssistantMessage = memo(function AssistantMessage({
             下知道这轮不是自己选的模型回答的;icon 用 warning 语义色(token 豁免
             簇),文字保持 tertiary 灰阶,不喧宾夺主。 */}
         {modelMismatch && (
-          <div className="mt-1 flex items-center gap-1.5 text-[11px]" style={{ color: 'var(--text-tertiary)' }}>
+          <div className="mt-1 flex items-center gap-1.5 text-11" style={{ color: 'var(--text-tertiary)' }}>
             <TriangleAlert size={11} style={{ color: 'var(--warning-fg)' }} aria-hidden />
             {t('chat.modelMismatch.notice', {
               actual: formatModelShortLabel(modelMismatch.actual) || modelMismatch.actual,
@@ -382,6 +407,7 @@ export const AssistantMessage = memo(function AssistantMessage({
           copyLinkText={messageDeepLink}
           align="left"
           hovered={hovered}
+          simplifiedBotConversation={simplifiedBotConversation}
           onFork={canFork ? handleFork : undefined}
           onAddToChat={messageDeepLink ? handleAddToChat : undefined}
           onShareAsImage={handleShareAsImage}

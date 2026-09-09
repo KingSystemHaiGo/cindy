@@ -43,11 +43,17 @@ Cindy 的产品形态不止本地桌面单机。同一个功能可能运行在�
 ## 恢复动作先回答故障半径（device-link 共享链路）
 
 设备互联是 1:N 拓扑：被控端与 relay 之间只有一条连接，同账号的全部控制端共用它。
-故障域从小到大分三层——单个请求、单个 peer 的 link、整条 relay 连接。修改
+故障域从小到大分四层——单个请求、单个 peer 的 link、整条 relay 连接、**relay 聚合
+背压**（第四层：故障原因不是任何单个请求或 peer，而是本机对 relay 的**聚合出站速率**；
+relay 以 close 1013 `inbound backpressure` 主动断连，此时任何「立即重连 + 全量重放」
+的恢复动作都会立刻复现故障，形成「重连 → 洪峰 → 再被踢」的自放大循环，2026-08-08
+线上：两次 1013 间隔 15s，第二条连接只活了 7s，期间控制端全部超时熔断）。修改
 `packages/device-link` 或 Desktop dispatch 层的重试／超时／teardown／重连逻辑前，
 先回答三个问题：
 
-1. **触发条件是哪一层的故障？** 单个请求失败、单个 peer 停止 ACK，还是整条连接断开？
+1. **触发条件是哪一层的故障？** 单个请求失败、单个 peer 停止 ACK、整条连接断开，
+   还是 relay 对聚合速率的背压？对第四层，恢复动作除了同半径（连接级冷却/降速）
+   外还要问一句：**重连成功后的重放会不会立刻重造触发条件？**
 2. **恢复动作作用在哪一层？** 默认选择与故障同半径的最小动作。动作半径大于故障半径
    （如「单 peer 可靠重试耗尽 → 强拆整条 relay 连接」）就是把一台设备的故障放大成
    所有设备同时掉线；确需扩大半径的，必须在 PR 描述里写明理由，且理由要经得起
@@ -61,6 +67,29 @@ Cindy 的产品形态不止本地桌面单机。同一个功能可能运行在�
 单测全绿、多轮 review 通过，上线后一台休眠手机反复把同账号所有设备（含桌面↔桌面）
 一起打掉线，由 #1405 收窄止损半径修复。协议兼容、allowlist、单测三层防线对这类问题
 全部免疫，只有 review 时点名问「半径」才拦得住。
+
+## 模块通过 Remote Resource 接入移动端
+
+面向移动端新增独立产品入口时，默认通过 `@cindy/device-link` 的 Remote Resource
+协议接入，不为每个业务模块复制 DTO、store、channel 与 push reason。稳定 wire 入口只有：
+
+- `maker:remote-resources:manifest`：主机声明 collection、placement 与客户端可展示的有限原语；
+- `maker:remote-resources:list` / `maker:remote-resources:get`：读取资源投影；
+- `maker:remote-resources:invoke`：调用主机已注册、已校验的 opaque action；
+- `maker:remote-resources:changed`：只表达 collection/ref 失效，控制端据此重拉。
+
+Desktop 功能模块通过 `RemoteResourceRegistry` 注册 provider；主机保留业务权威和安全边界，
+provider 只投影用户可见信息。密钥、Token、渠道凭证、系统路径、内部 prompt 与运行时对象不得
+进入资源响应。Mobile shell 只理解有限的展示/交互原语，不按 Bot、Schedule 或 Plugin 的内部
+enum 编译分支，也不接受任意 HTML、React 或无限 UI DSL。
+
+资源身份必须包含 `deviceId + collectionId + kind + id`。资源路由打开时应重新调用 `resource:get`
+解析 `conversation` 等 link，不能把可能 rollover 的 Session id 当成永久资源身份。已有对话继续
+复用 canonical Session 的消息、输入、确认与恢复链路，不复制一套模块专属聊天协议。
+
+协议按字段追加演进。未知字段、未知 collection 和未知 action 不得导致整个首页或会话崩溃；
+结构化 Session 内容必须携带可读 `fallbackMarkdown`，旧客户端至少能阅读并继续任务。只有新增
+移动端此前无法表达的内容或交互原语时，才要求客户端发版。
 
 ## PR 门禁
 

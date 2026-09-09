@@ -14,7 +14,7 @@
  * 完整设备名 + 远程控制逻辑说明。
  */
 
-import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useState, useSyncExternalStore, type CSSProperties } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { Eye, MonitorOff, X } from 'lucide-react';
@@ -122,7 +122,7 @@ export function useControlledBy(): Controller[] {
  */
 interface ControlledBannerProps {
   placement?: 'floating' | 'inline' | 'composer';
-  maxWidth?: number;
+  maxWidth?: CSSProperties['maxWidth'];
   /** composer placement 的任务 ID,用于隔离完整 / 呼吸灯折叠态。 */
   sessionId?: string | null;
 }
@@ -226,11 +226,11 @@ export function ControlledBanner({
           style={{ backgroundColor: 'var(--status-bar-accent)' }}
           aria-hidden
         />
-        <span className="min-w-0 truncate text-[12px] text-[var(--text-primary)]">{label}</span>
+        <span className="min-w-0 truncate text-12 text-[var(--text-primary)]">{label}</span>
         <button
           type="button"
           onClick={hasMultipleControllers ? onViewControllers : () => void onRevoke()}
-          className="flex min-w-0 max-w-[45%] shrink items-center gap-1 rounded-full px-2 py-0.5 text-[12px] text-[var(--text-secondary)] transition-colors hover:text-[var(--text-primary)]"
+          className="flex min-w-0 max-w-[45%] shrink items-center gap-1 rounded-full px-2 py-0.5 text-12 text-[var(--text-secondary)] transition-colors hover:text-[var(--text-primary)]"
         >
           {hasMultipleControllers ? (
             <Eye size={13} className="shrink-0" />

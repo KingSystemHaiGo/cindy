@@ -5,7 +5,7 @@
  *  1. 组环境信息并解析本次真实提交身份—— agent 不参与;
  *  2. await confirm(确认卡片,含真实身份)—— **唯一**通往 postIssue 的路径;
  *  3. confirmed 后以用户确认的 title/body/type 为准(用户编辑版优先);
- *  4. body 末尾附 env 块,clamp 后严格按已确认身份 POST,失败不切换身份。
+ *  4. body 末尾附「提交时的任务环境」块,clamp 后严格按已确认身份 POST,失败不切换身份。
  *
  * 模块保持 electron-free,全部依赖注入(规则 14),单测直接调 submitGithubIssueWithConfirm。
  */
@@ -14,12 +14,19 @@ import type { CindyRegion } from '@cindy/maker-shared/brand-identity';
 
 import { CINDY_REGION_CODE } from '../../shared/regionCode.js';
 import { normalizeIssuePublicName } from '../../shared/issuePublicName.js';
+import {
+  issueHarnessForAgentKind,
+  normalizeIssueModelId,
+  type IssueAgentKind,
+} from '../../shared/issueRuntimeMetadata.js';
 import type { SubmittedIssueRecord } from '../../shared/myIssues.js';
 import { myIssueUrl } from '../../shared/myIssues.js';
+import { redactSensitive } from '../learn-host/redaction';
 import type {
   IssueConfirmDecision,
   IssueDraft,
   IssueEnvInfo,
+  IssueSubmissionChoices,
   IssueSubmissionIdentity,
 } from './issueConfirmBridge';
 
@@ -31,6 +38,8 @@ export type GithubIssueSubmitResult =
       issueUrl: string;
       finalTitle: string;
       editedByUser: boolean;
+      /** agent 初稿进入确认卡前是否命中过常见敏感信息并被自动替换。 */
+      privacyRedacted: boolean;
     }
   | {
       ok: false;
@@ -46,6 +55,7 @@ export type GithubIssueSubmitResult =
 
 export interface SubmitIssueRequest {
   sessionId: string;
+  agentKind: IssueAgentKind;
   workingDir: string;
   title: string;
   body: string;
@@ -70,11 +80,11 @@ export interface GithubIssueSubmitServiceDeps {
     sessionId: string,
     draft: IssueDraft,
     env: IssueEnvInfo,
-    submissionIdentity: IssueSubmissionIdentity,
+    submissionChoices: IssueSubmissionChoices,
     suggestedPublicName?: string,
   ) => Promise<IssueConfirmDecision>;
-  /** 每次发起确认前现查；已绑定但凭证失效时应抛 AUTH_NOT_READY，不能冒充未绑定。 */
-  resolveSubmissionIdentity: (workingDir: string) => Promise<IssueSubmissionIdentity>;
+  /** 平台身份必有；仅当实时验证到可用账号时附加 GitHub 用户身份。 */
+  resolveSubmissionChoices: (workingDir: string) => Promise<IssueSubmissionChoices>;
   /** body factory must be evaluated for each network attempt after auth refresh. */
   postIssue: (
     submissionIdentity: IssueSubmissionIdentity,
@@ -82,6 +92,8 @@ export interface GithubIssueSubmitServiceDeps {
   ) => Promise<GithubIssuePostResponse>;
   getAppVersion: () => string;
   getOsInfo: () => { platform: string; arch: string; osVersion: string };
+  /** 返回 /issue 所在轮开始时冻结的 Cindy 模型 ID；读取失败不得阻断反馈提交。 */
+  getTurnModelId: (sessionId: string) => Promise<string | undefined>;
   /** 本构建的区域身份(构建期烘焙);同版本号的 cn / global 是两个不同的包。 */
   getRegion: () => CindyRegion;
   /** main 侧 OS locale,仅当 renderer 未回传 uiLanguage 时兜底。 */
@@ -100,32 +112,49 @@ export interface GithubIssueSubmitServiceDeps {
 const SERVER_TITLE_MAX = 200;
 const SERVER_DESC_MAX = 5000;
 
+/** Keep provider-controlled model IDs inert when they are appended to public GitHub Markdown. */
+function markdownCodeSpan(value: string): string {
+  let fence = '`';
+  for (const match of value.matchAll(/`+/g)) {
+    if (match[0].length >= fence.length) {
+      fence = '`'.repeat(match[0].length + 1);
+    }
+  }
+  return `${fence} ${value} ${fence}`;
+}
+
 export async function submitGithubIssueWithConfirm(
   deps: GithubIssueSubmitServiceDeps,
   req: SubmitIssueRequest,
 ): Promise<GithubIssueSubmitResult> {
+  let modelId = 'unknown';
+  try {
+    modelId = normalizeIssueModelId(await deps.getTurnModelId(req.sessionId)) ?? 'unknown';
+  } catch {
+    // Runtime metadata is supplemental. A failed local lookup must not block issue submission.
+  }
   const env: IssueEnvInfo = {
     appVersion: deps.getAppVersion(),
     ...deps.getOsInfo(),
+    harness: issueHarnessForAgentKind(req.agentKind),
+    modelId,
     region: deps.getRegion(),
   };
 
-  let submissionIdentity: IssueSubmissionIdentity;
+  let submissionChoices: IssueSubmissionChoices;
   try {
-    submissionIdentity = await deps.resolveSubmissionIdentity(req.workingDir);
+    submissionChoices = await deps.resolveSubmissionChoices(req.workingDir);
   } catch (err) {
     return mapSubmitError(err);
   }
 
-  const suggestedPublicName =
-    submissionIdentity.kind === 'platform'
-      ? (normalizeIssuePublicName(deps.getSubmitterName()) ?? undefined)
-      : undefined;
+  const suggestedPublicName = normalizeIssuePublicName(deps.getSubmitterName()) ?? undefined;
+  const preparedDraft = redactIssueDraft(req);
   const decision = await deps.confirm(
     req.sessionId,
-    { title: req.title, body: req.body, type: req.type },
+    preparedDraft.draft,
     env,
-    submissionIdentity,
+    submissionChoices,
     suggestedPublicName,
   );
 
@@ -144,6 +173,7 @@ export async function submitGithubIssueWithConfirm(
     };
   }
 
+  const submissionIdentity = decision.submissionIdentity ?? submissionChoices.platform;
   const confirmedPublicName =
     submissionIdentity.kind === 'platform' ? normalizeIssuePublicName(decision.publicName) : null;
   if (submissionIdentity.kind === 'platform' && !confirmedPublicName) {
@@ -157,18 +187,23 @@ export async function submitGithubIssueWithConfirm(
   // 用户确认版优先 —— agent 传入值在这里被丢弃,代码层保证。
   const finalTitle = decision.title.slice(0, SERVER_TITLE_MAX);
   const editedByUser =
-    decision.title !== req.title ||
-    decision.body !== req.body ||
-    decision.type !== req.type;
+    decision.title !== preparedDraft.draft.title ||
+    decision.body !== preparedDraft.draft.body ||
+    decision.type !== preparedDraft.draft.type;
 
   const uiLanguage = decision.uiLanguage ?? deps.getFallbackLocale();
   const regionCode = CINDY_REGION_CODE[env.region];
   const envBlock = [
     '',
     '---',
+    '## 提交时的任务环境',
+    '',
+    '仅代表提交时快照,不一定是故障环境。OS 来自提交客户端本机,不含 SSH 远端主机;Harness / 模型来自当前任务。与运行环境无关的反馈可忽略本段。',
     // global 不写这一行 —— 缺失即默认区域,理由见 CINDY_REGION_CODE(与确认卡片同源)。
     ...(regionCode ? [`**版本区域**: ${regionCode}`] : []),
     `**OS**: ${env.platform} ${env.arch} (${env.osVersion})`,
+    `**Harness**: ${env.harness}`,
+    `**Model ID**: ${markdownCodeSpan(env.modelId)}`,
     `**界面语言**: ${uiLanguage}`,
   ].join('\n');
   // env 块必须完整保留,clamp 只裁用户正文部分。
@@ -195,10 +230,31 @@ export async function submitGithubIssueWithConfirm(
       issueUrl: result.githubIssue.url,
       finalTitle,
       editedByUser,
+      privacyRedacted: preparedDraft.privacyRedacted,
     };
   } catch (err) {
     return mapSubmitError(err);
   }
+}
+
+/**
+ * Agent 可能把用户粘贴的日志、错误和路径直接带进初稿。先过高置信度脱敏，再交给
+ * 用户确认；用户在确认卡里主动编辑的内容视为明确确认，不在这里静默改写。
+ */
+function redactIssueDraft(req: SubmitIssueRequest): {
+  draft: Pick<SubmitIssueRequest, 'title' | 'body' | 'type'>;
+  privacyRedacted: boolean;
+} {
+  const title = redactSensitive(req.title);
+  const body = redactSensitive(req.body);
+  return {
+    draft: {
+      title: title.text.trim(),
+      body: body.text.trim(),
+      type: req.type,
+    },
+    privacyRedacted: title.hitCount > 0 || body.hitCount > 0,
+  };
 }
 
 /** 记账是 best-effort:任何异常只吞掉,不影响已经成功的提交结果。 */

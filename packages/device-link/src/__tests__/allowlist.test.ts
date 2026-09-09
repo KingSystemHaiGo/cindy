@@ -5,6 +5,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   REMOTE_INVOKE_ALLOWLIST,
+  REMOTE_REVIEW_EXTERNAL_INPUT_CHANNELS,
   PUSH_FORWARD_ALLOWLIST,
   INVOKE_TIMEOUT_OVERRIDES_MS,
   computeAllowlistHash,
@@ -18,9 +19,42 @@ import {
   DL_TELEGRAM_STATUS_CHANNEL,
   DL_TELEGRAM_SET_ONLINE_CHANNEL,
 } from '../allowlist.js';
-import { SESSION_ACTIVITY_CHANNEL } from '../topics.js';
+import { SESSION_ACTIVITY_CHANNEL, topicForPush } from '../topics.js';
+import {
+  REMOTE_RESOURCE_CHANGED_CHANNEL,
+  REMOTE_RESOURCE_CHANNELS,
+} from '../remoteResources.js';
 
 describe('REMOTE_INVOKE_ALLOWLIST', () => {
+  it('allows the reduced teammate directory while keeping native configuration local', () => {
+    for (const channel of ['local-db:bots:list', 'local-db:bots:get']) {
+      expect(REMOTE_INVOKE_ALLOWLIST.has(channel)).toBe(true);
+    }
+    for (const channel of [
+      'local-db:bots:choose-avatar', 'local-db:bots:create', 'local-db:bots:update',
+      'local-db:bots:model-chain-settings-set', 'maker:bot-lifecycle:action',
+    ]) {
+      expect(REMOTE_INVOKE_ALLOWLIST.has(channel)).toBe(false);
+    }
+  });
+
+  it('keeps every Review external-input classification inside the remote allowlist', () => {
+    for (const channel of REMOTE_REVIEW_EXTERNAL_INPUT_CHANNELS) {
+      expect(REMOTE_INVOKE_ALLOWLIST.has(channel)).toBe(true);
+    }
+    expect(REMOTE_REVIEW_EXTERNAL_INPUT_CHANNELS.has('maker:input:get-projection')).toBe(false);
+  });
+
+  it('放行模块中立的远程资源 API，而不是逐功能扩张 channel', () => {
+    for (const channel of REMOTE_RESOURCE_CHANNELS) {
+      expect(REMOTE_INVOKE_ALLOWLIST.has(channel)).toBe(true);
+    }
+    expect(PUSH_FORWARD_ALLOWLIST.has(REMOTE_RESOURCE_CHANGED_CHANNEL)).toBe(true);
+    expect(topicForPush(REMOTE_RESOURCE_CHANGED_CHANNEL, {
+      collectionId: 'teammates',
+    })).toBe('sessions');
+  });
+
   it('放行核心会话链路', () => {
     for (const ch of [
       'maker:create-session',
@@ -29,6 +63,7 @@ describe('REMOTE_INVOKE_ALLOWLIST', () => {
       'maker:resolve-interaction',
       'maker:get-pending-interactions',
       'maker:input:compact',
+      'maker:compact-session',
       'maker:set-model',
       'maker:switch-session-agent',
       'maker:get-session-agent-switch-intent',
@@ -74,6 +109,7 @@ describe('REMOTE_INVOKE_ALLOWLIST', () => {
       'maker:schedule:create',
       'maker:schedule:get-runtime-state',
       'maker:worker:create',
+      'maker:worker:dispatch-ui-assignment',
       'maker:session:enable-orca',
       'maker:rewind:commit',
       'maker:fork',
@@ -91,6 +127,18 @@ describe('REMOTE_INVOKE_ALLOWLIST', () => {
 
   it('放行会话后台任务快照只读(任务真身在被控端,后台任务面板挂载水合用)', () => {
     expect(REMOTE_INVOKE_ALLOWLIST.has('maker:session-background-tasks:list')).toBe(true);
+  });
+
+  it('routes durable PI Subagent reads and controls to the data-owning device', () => {
+    for (const channel of [
+      'local-db:subagent-runs:list',
+      'local-db:subagent-runs:detail',
+      'local-db:subagent-runs:transcript',
+      'maker:pi-subagent:control',
+    ]) {
+      expect(REMOTE_INVOKE_ALLOWLIST.has(channel)).toBe(true);
+    }
+    expect(REMOTE_INVOKE_ALLOWLIST.has('maker:agent-task:stop')).toBe(false);
   });
 
   it('放行会话级完整对等补充(fork-strip / context-usage / 窄口径 patch-meta / Magic 重命名)', () => {
@@ -123,6 +171,12 @@ describe('REMOTE_INVOKE_ALLOWLIST', () => {
   it('放行 Codex 官方额度读取与 desktop 绑定的人工 reset offer', () => {
     expect(REMOTE_INVOKE_ALLOWLIST.has('maker:usage:codex-rate-limits')).toBe(true);
     expect(REMOTE_INVOKE_ALLOWLIST.has('maker:usage:codex-rate-limit-reset')).toBe(true);
+  });
+
+  it('放行被控端项目顺序读写(显示偏好,真相在被控端)', () => {
+    expect(REMOTE_INVOKE_ALLOWLIST.has('sidebar-settings:get-project-order')).toBe(true);
+    expect(REMOTE_INVOKE_ALLOWLIST.has('sidebar-settings:apply-project-order')).toBe(true);
+    expect(REMOTE_INVOKE_ALLOWLIST.has('sidebar-settings:set-project-order')).toBe(false);
   });
 
   it('放行 Git safety 只读查询(远程 Codex Rewind 按被控端 snapshot 设置 gate)', () => {
@@ -318,6 +372,7 @@ describe('PUSH_FORWARD_ALLOWLIST', () => {
       'maker:interaction-dismissed',
       'maker:auto-permission:fallback',
       'maker:provider:changed',
+      'maker:agents:changed',
       'maker:schedule:event',
       'maker:orca:worker-changed',
       'usage:message-turn-cost',
@@ -326,6 +381,7 @@ describe('PUSH_FORWARD_ALLOWLIST', () => {
       'local-db:messages:created',
       'local-db:messages:deleted',
       'local-db:session:error-persisted',
+      'sidebar-settings:project-order-changed',
       SESSION_ACTIVITY_CHANNEL,
     ]) {
       expect(PUSH_FORWARD_ALLOWLIST.has(ch)).toBe(true);
@@ -368,6 +424,19 @@ describe('INVOKE_TIMEOUT_OVERRIDES_MS', () => {
 
   it('worktree:discard-precreated 可等待同 session 创建锁且不沿用默认 30s', () => {
     expect(INVOKE_TIMEOUT_OVERRIDES_MS['worktree:discard-precreated']).toBeGreaterThan(30_000);
+  });
+
+  it('maker:compact-session 隧道超时必须大于 pi 压缩执行预算(10min + 回程余量,不 30s 截断)', () => {
+    // 被控端在请求穿过 relay 后才开始跑 PI_COMPACT_TIMEOUT_MS(10min);控制端若只给
+    // 相同预算,压缩恰好到上限时会先 INVOKE_TIMEOUT 并被误判为设备无响应(codex P2)。
+    // 严格大于 10min,锁住「带余量」的语义,防止回退成无余量的同值。
+    expect(INVOKE_TIMEOUT_OVERRIDES_MS['maker:compact-session']).toBeGreaterThan(10 * 60_000);
+  });
+
+  it('UI Worker 派单超时必须大于 Lead history gate 的 30s 执行预算', () => {
+    expect(
+      INVOKE_TIMEOUT_OVERRIDES_MS['maker:worker:dispatch-ui-assignment'],
+    ).toBeGreaterThan(30_000);
   });
 });
 

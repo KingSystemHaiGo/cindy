@@ -1,5 +1,6 @@
 import type {
   AndroidMcpDeps,
+  IOSSimulatorMcpDeps,
   BrowserMcpDeps,
   ComputerMcpDeps,
   FeishuBotMcpHostDeps,
@@ -22,11 +23,14 @@ import { createSshMcpServer } from './cindy_sshMcpServer.js';
 import { createCindyMemoryMcpServer } from './cindy_memoryMcpServer.js';
 import { createCindyContactsMcpServer } from './cindy_contactsMcpServer.js';
 import { createXdtHelperMcpServer, type XdtHelperMcpDeps } from './lizi_xdtHelperMcpServer.js';
+import { createCindyDocsMcpServer } from './cindy_docsMcpServer.js';
+import type { DocsMcpDeps } from './cindy-docs/types.js';
 import { createOrcaMcpServer, type OrcaMcpDeps } from './orca/index.js';
 import { createCindyLspMcpServer, detectTypeScriptProject } from './lsp/index.js';
 import { createBrowserMcpServer } from './browser/index.js';
 import { createComputerMcpServer } from './computer/index.js';
 import { createAndroidMcpServer } from './android/index.js';
+import { createIOSSimulatorMcpServer } from './ios-simulator/index.js';
 import { resolveLiziMcpSessionContext } from './session-context.js';
 
 export interface CreateLiziMcpProvidersOptions {
@@ -35,6 +39,8 @@ export interface CreateLiziMcpProvidersOptions {
    */
   enabled?: readonly LiziMcpId[];
   android?: AndroidMcpDeps;
+  /** Host-owned embedded iOS Simulator lifecycle and interaction tools. */
+  iosSimulator?: IOSSimulatorMcpDeps;
   /** Browser automation tools. Host injects the neutral runtime implementation. */
   browser?: BrowserMcpDeps;
   /** Local desktop computer-use tools backed by a host-managed external driver. */
@@ -84,6 +90,14 @@ export interface CreateLiziMcpProvidersOptions {
    * 对应"协同模式"可关插件。deps 注入即激活 9 个 team 工具。
    */
   orca?: OrcaMcpDeps;
+  /**
+   * cindy_docs(文档工坊): PDF / Word / Excel / PPT 的格式转换原语。
+   * 与 xdtHelper 同款 —— 无外部账号依赖,host 仍需显式传(即使 {})才启用。
+   * writeDocsOutput 缺省时生成工具不注册；renderHtmlToPdf 缺省时 render_pdf
+   * 不注册(本包不 import electron,这些边界能力由 desktop main 闭包注入)。
+   * 对应宿主内置能力开关 id 'docs'(不是需要安装的外置 .cindy 插件)。
+   */
+  docs?: DocsMcpDeps;
 }
 
 function selected(
@@ -168,6 +182,20 @@ export function createLiziMcpProviders(
         type: 'sdk',
         name: 'cindy_android',
         instance: createAndroidMcpServer(opts.android!, {
+          sessionId: ctx.sessionId,
+          getSessionContext: () => resolveLiziMcpSessionContext(ctx),
+        }),
+      }),
+    });
+  }
+
+  if (opts.iosSimulator && selected(enabled, 'ios_simulator')) {
+    providers.push({
+      name: 'cindy_ios_simulator',
+      toClaudeSdkConfig: (ctx) => ({
+        type: 'sdk',
+        name: 'cindy_ios_simulator',
+        instance: createIOSSimulatorMcpServer(opts.iosSimulator!, {
           sessionId: ctx.sessionId,
           getSessionContext: () => resolveLiziMcpSessionContext(ctx),
         }),
@@ -314,6 +342,7 @@ export function createLiziMcpProviders(
         instance: createSchedulerMcpServer(opts.scheduler!, {
           agentKind: ctx.agentKind === 'codex' ? 'codex' : ctx.agentKind === 'pi' ? 'pi' : 'claude-code',
           workingDir: ctx.workingDir,
+          ...(ctx.getSessionContext ? { getSessionContext: ctx.getSessionContext } : {}),
           sessionId: ctx.sessionId,
           vendorOptions: ctx.vendorOptions,
         }),
@@ -353,6 +382,29 @@ export function createLiziMcpProviders(
         instance: createXdtHelperMcpServer(opts.xdtHelper!, {
           agentKind: ctx.agentKind === 'codex' ? 'codex' : ctx.agentKind === 'pi' ? 'pi' : 'claude-code',
           workingDir: ctx.workingDir,
+          ...(ctx.getSessionContext ? { getSessionContext: ctx.getSessionContext } : {}),
+          sessionId: ctx.sessionId,
+          vendorOptions: ctx.vendorOptions,
+        }),
+      }),
+    });
+  }
+
+  if (opts.docs && selected(enabled, 'cindy_docs')) {
+    providers.push({
+      name: 'cindy_docs',
+      // 无 isEnabled 门控:plugin 系统已在 host 层(mcp-providers.ts wrap)按
+      // 宿主内置能力开关 id 'docs' 已包了 isEnabled 检查,这里再加就是双重门(同 cindy_ssh / cindy_orca)。
+      // ctx 闭包绑定 workingDir/sessionId —— 所有文件路径都以它为根做边界钳制;
+      // Codex / Pi 的 HTTP bridge 在 tool-call 阶段由 AsyncLocalStorage 恢复真实 ctx,
+      // 恢复不出来时 _paths.resolveSessionRoot 会 fail closed 返 NO_SESSION_CONTEXT。
+      toClaudeSdkConfig: (ctx) => ({
+        type: 'sdk',
+        name: 'cindy_docs',
+        instance: createCindyDocsMcpServer(opts.docs!, {
+          agentKind: ctx.agentKind === 'codex' ? 'codex' : ctx.agentKind === 'pi' ? 'pi' : 'claude-code',
+          workingDir: ctx.workingDir,
+          ...(ctx.getSessionContext ? { getSessionContext: ctx.getSessionContext } : {}),
           sessionId: ctx.sessionId,
           vendorOptions: ctx.vendorOptions,
         }),
@@ -375,6 +427,7 @@ export function createLiziMcpProviders(
         instance: createOrcaMcpServer(opts.orca!, {
           agentKind: ctx.agentKind === 'codex' ? 'codex' : ctx.agentKind === 'pi' ? 'pi' : 'claude-code',
           workingDir: ctx.workingDir,
+          ...(ctx.getSessionContext ? { getSessionContext: ctx.getSessionContext } : {}),
           sessionId: ctx.sessionId,
           vendorOptions: ctx.vendorOptions,
         }),
@@ -393,7 +446,13 @@ export function createLiziMcpProviders(
       // Codex 端: 第一次 host spawn 时 prepareCodexExtraSpawnConfig 调本函数, host
       //   长生命周期下后续 disable 不影响已 spawn 的 host (老 thread 仍看到 server,
       //   但 withStore 会用 MAKER_MEMORY_NOT_READY 兜底)。
-      isEnabled: () => opts.memory!.getManager().isEnabled(),
+      isEnabled: (ctx) =>
+        ctx.memoryScopeKey?.startsWith('bot:') === true
+        // Shared Codex/Pi bridges are assembled before a concrete Session
+        // exists. Keep the factory structurally present there; each Session
+        // descriptor still removes it when neither global nor Bot Memory applies.
+        || ((ctx.agentKind === 'codex' || ctx.agentKind === 'pi') && !ctx.workingDir)
+        || opts.memory!.getManager().isEnabled(),
       toClaudeSdkConfig: (ctx) => ({
         type: 'sdk',
         name: 'cindy_memory',

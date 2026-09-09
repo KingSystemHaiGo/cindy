@@ -9,6 +9,7 @@ import {
 } from '@cindy/maker-shared/agent-input-projection';
 import type { InputProjection, QueuedRemoteMessage, RemoteImageRef, RemoteSession } from '@/session/types';
 import type { RemoteSerializedAttachment } from '@/session/types';
+import { parseMobileToolLoopErrorDetails } from '@/session/toolLoopErrorI18n';
 import { permissionModeOrAsk } from '@cindy/maker-shared/permission-mode';
 import {
   composerDocumentsEqual,
@@ -21,17 +22,41 @@ import {
   readSentPastedTextRanges,
   readSentSlashCommandRanges,
 } from '@/session/sentMessageAtoms';
+import {
+  buildQueuePanelSummary as buildQueuePanelSummaryShared,
+  buildQueueRowPresentation as buildQueueRowPresentationShared,
+  type QueuePanelSummary,
+  type QueueRowPresentation,
+} from '@cindy/maker-shared/queue';
+import { mobilePresentationLocalizer } from '@/i18n/presentationLocalizer';
 export {
-  buildQueuePanelSummary,
-  buildQueueRowPresentation,
   isOrcaQueueItem,
   queueMoveTargetIndex,
   stopOptionsForProjection,
-  type QueuePanelSummary,
   type QueueRowActionId,
   type QueueRowActionPresentation,
-  type QueueRowPresentation,
 } from '@cindy/maker-shared/queue';
+
+export type { QueuePanelSummary, QueueRowPresentation };
+
+export function buildQueuePanelSummary(
+  projection: Parameters<typeof buildQueuePanelSummaryShared>[0],
+  readOnlyReason?: Parameters<typeof buildQueuePanelSummaryShared>[1],
+  collapsedVisibleRows?: Parameters<typeof buildQueuePanelSummaryShared>[2],
+): QueuePanelSummary {
+  return buildQueuePanelSummaryShared(
+    projection,
+    readOnlyReason,
+    collapsedVisibleRows,
+    mobilePresentationLocalizer,
+  );
+}
+
+export function buildQueueRowPresentation(
+  input: Parameters<typeof buildQueueRowPresentationShared>[0],
+): QueueRowPresentation {
+  return buildQueueRowPresentationShared(input, mobilePresentationLocalizer);
+}
 
 export const EMPTY_INPUT_PROJECTION: InputProjection = Object.freeze({
   sessionId: '',
@@ -43,14 +68,23 @@ export const EMPTY_INPUT_PROJECTION: InputProjection = Object.freeze({
   queueEditLocks: [],
   queueAbortPending: false,
   error: null,
+  errorReason: null,
+  toolLoop: null,
   recovery: null,
   errorRetryText: null,
   credentialSwitchWait: null,
+  continuationTurnClientId: null,
+  continuationInFlightProjectionCapability: 'unknown',
 });
 
 export function normalizeInputProjection(value: unknown, fallbackSessionId = ''): InputProjection {
   const record = readRecord(value);
   const pendingQueue = readQueuedMessages(record?.pendingQueue);
+  const continuationInFlightProjectionCapability = record === null
+    ? 'unknown'
+    : Object.prototype.hasOwnProperty.call(record, 'continuationTurnClientId')
+      ? 'supported'
+      : 'legacy';
   return {
     sessionId: readString(record?.sessionId) ?? fallbackSessionId,
     pendingQueue,
@@ -61,9 +95,13 @@ export function normalizeInputProjection(value: unknown, fallbackSessionId = '')
     queueEditLocks: readStringArray(record?.queueEditLocks),
     queueAbortPending: record?.queueAbortPending === true,
     error: readString(record?.error),
+    errorReason: readString(record?.errorReason),
+    toolLoop: parseMobileToolLoopErrorDetails(record?.toolLoop),
     recovery: record?.recovery,
     errorRetryText: readString(record?.errorRetryText),
     autoResumePending: readRecord(record?.autoResumePending),
+    continuationTurnClientId: readString(record?.continuationTurnClientId),
+    continuationInFlightProjectionCapability,
     credentialSwitchWait: readCredentialSwitchWait(record?.credentialSwitchWait),
   };
 }

@@ -10,7 +10,10 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { Logger, McpProvider, McpProviderContext } from '@cindy/maker-core';
 import { getLiziMcpSessionContext, type LiziMcpSessionContext } from '@cindy/mcps';
 import { pluginIdForKnownProviderName } from '../maker-host/plugins/builtin-plugins.js';
-import { CODEX_DISABLED_BUILTIN_PLUGIN_IDS_KEY } from './codexBuiltinToolPolicy.js';
+import {
+  CODEX_ALLOWED_BUILTIN_PLUGIN_IDS_KEY,
+  CODEX_DISABLED_BUILTIN_PLUGIN_IDS_KEY,
+} from './codexBuiltinToolPolicy.js';
 
 import {
   startCodexHttpBridge,
@@ -57,7 +60,15 @@ let activeBridge: CodexHttpBridge | null = null;
 let activeBridgeServerNames: string[] | null = null;
 const disabledPluginPolicyByThread = new Map<
   string,
-  { sessionInstanceId?: string; policy: unknown }
+  { sessionInstanceId?: string; disabledPolicy: unknown; allowedPolicy: unknown }
+>();
+const callerProvenanceByThread = new Map<
+  string,
+  {
+    sessionInstanceId: string;
+    mcpCallerKind?: LiziMcpSessionContext['mcpCallerKind'];
+    mcpCallerAttested?: boolean;
+  }
 >();
 
 /**
@@ -149,19 +160,55 @@ export function registerCodexMcpThreadContext(
   ctx: LiziMcpSessionContext,
 ): void {
   const requestedPolicy = ctx.vendorOptions?.[CODEX_DISABLED_BUILTIN_PLUGIN_IDS_KEY];
+  const requestedAllowedPolicy = ctx.vendorOptions?.[CODEX_ALLOWED_BUILTIN_PLUGIN_IDS_KEY];
   const frozen = disabledPluginPolicyByThread.get(threadId);
   if (!frozen || frozen.sessionInstanceId !== ctx.sessionInstanceId) {
     disabledPluginPolicyByThread.set(threadId, {
       ...(ctx.sessionInstanceId ? { sessionInstanceId: ctx.sessionInstanceId } : {}),
-      policy: requestedPolicy,
+      disabledPolicy: requestedPolicy,
+      allowedPolicy: requestedAllowedPolicy,
     });
   }
-  const effectivePolicy = disabledPluginPolicyByThread.get(threadId)?.policy;
+  const effectivePolicy = disabledPluginPolicyByThread.get(threadId)?.disabledPolicy;
+  const effectiveAllowedPolicy = disabledPluginPolicyByThread.get(threadId)?.allowedPolicy;
+  const previousProvenance = callerProvenanceByThread.get(threadId);
+  const sameSessionInstance =
+    ctx.sessionInstanceId !== undefined &&
+    previousProvenance?.sessionInstanceId === ctx.sessionInstanceId;
+  if (ctx.sessionInstanceId !== undefined) {
+    callerProvenanceByThread.set(threadId, {
+      sessionInstanceId: ctx.sessionInstanceId,
+      ...(sameSessionInstance && ctx.mcpCallerKind === undefined
+        ? previousProvenance?.mcpCallerKind !== undefined
+          ? { mcpCallerKind: previousProvenance.mcpCallerKind }
+          : {}
+        : ctx.mcpCallerKind !== undefined
+          ? { mcpCallerKind: ctx.mcpCallerKind }
+          : {}),
+      ...(sameSessionInstance && ctx.mcpCallerAttested === undefined
+        ? previousProvenance?.mcpCallerAttested !== undefined
+          ? { mcpCallerAttested: previousProvenance.mcpCallerAttested }
+          : {}
+        : ctx.mcpCallerAttested !== undefined
+          ? { mcpCallerAttested: ctx.mcpCallerAttested }
+          : {}),
+    });
+  } else {
+    callerProvenanceByThread.delete(threadId);
+  }
+  const effectiveProvenance = callerProvenanceByThread.get(threadId);
   activeBridge?.registerThreadContext(threadId, {
     ...ctx,
+    ...(effectiveProvenance?.mcpCallerKind !== undefined
+      ? { mcpCallerKind: effectiveProvenance.mcpCallerKind }
+      : { mcpCallerKind: undefined }),
+    ...(effectiveProvenance?.mcpCallerAttested !== undefined
+      ? { mcpCallerAttested: effectiveProvenance.mcpCallerAttested }
+      : { mcpCallerAttested: undefined }),
     vendorOptions: {
       ...ctx.vendorOptions,
       [CODEX_DISABLED_BUILTIN_PLUGIN_IDS_KEY]: effectivePolicy,
+      [CODEX_ALLOWED_BUILTIN_PLUGIN_IDS_KEY]: effectiveAllowedPolicy,
     },
   });
 }
@@ -171,14 +218,16 @@ export function unregisterCodexMcpThreadContext(
   expectedSessionInstanceId?: string,
 ): void {
   const frozen = disabledPluginPolicyByThread.get(threadId);
+  const provenance = callerProvenanceByThread.get(threadId);
   if (
     expectedSessionInstanceId !== undefined &&
-    frozen !== undefined &&
-    frozen.sessionInstanceId !== expectedSessionInstanceId
+    ((frozen !== undefined && frozen.sessionInstanceId !== expectedSessionInstanceId) ||
+      (provenance !== undefined && provenance.sessionInstanceId !== expectedSessionInstanceId))
   ) {
     return;
   }
   disabledPluginPolicyByThread.delete(threadId);
+  callerProvenanceByThread.delete(threadId);
   activeBridge?.unregisterThreadContext(threadId, expectedSessionInstanceId);
 }
 
@@ -206,12 +255,15 @@ async function doStart(
       return {
         agentKind: active.agentKind,
         workingDir: active.workingDir,
+        ...(active.memoryScopeKey ? { memoryScopeKey: active.memoryScopeKey } : {}),
         // SSH remote 会话的 ctx 字段必须透传 — cindy_memory 用它算 scope key
         // (buildMemoryScopeKey);丢掉的话远端工具会落到本地路径 key 的 store,
         // 与 agent prompt 注入读的 ssh:<hostId>:<path> store 分家 (review R4 P1)。
         ...(active.remoteHostId ? { remoteHostId: active.remoteHostId } : {}),
         vendorOptions: active.vendorOptions,
         sessionId: active.sessionId,
+        ...(active.mcpCallerKind ? { mcpCallerKind: active.mcpCallerKind } : {}),
+        ...(active.mcpCallerAttested ? { mcpCallerAttested: true } : {}),
         ...(active.sessionInstanceId
           ? { sessionInstanceId: active.sessionInstanceId }
           : {}),
@@ -373,4 +425,12 @@ async function doStart(
         }
       : {}),
   };
+}
+
+/** Native startup discovery is earlier than the thread registration callback. */
+export function withCodexMcpDiscoveryContext<T>(
+  ctx: LiziMcpSessionContext,
+  run: () => Promise<T>,
+): Promise<T> {
+  return activeBridge ? activeBridge.withDiscoveryContext(ctx, run) : run();
 }

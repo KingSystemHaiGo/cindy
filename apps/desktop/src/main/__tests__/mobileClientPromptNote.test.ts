@@ -25,6 +25,7 @@ import {
 import {
   attachMainOwnedInputBoundary,
   buildMobileClientPromptNote,
+  shouldPrependMobileClientPromptNote,
   stampMobileClientOrigin,
   stripMainOnlySendOpts,
 } from '../maker-ipc/mobileClientPromptNote';
@@ -189,6 +190,39 @@ describe('prependNoteToWireUserMessage(wire 注入形态)', () => {
   });
 });
 
+describe('shouldPrependMobileClientPromptNote(内置命令旁路)', () => {
+  it('Claude Code /compact 保持在消息开头，含可选指令也旁路', () => {
+    expect(shouldPrependMobileClientPromptNote('/compact', 'claude-code')).toBe(false);
+    expect(shouldPrependMobileClientPromptNote('/compact focus on decisions', 'claude-code'))
+      .toBe(false);
+    expect(shouldPrependMobileClientPromptNote(
+      { type: 'user', content: '/compact\nkeep the API contract' },
+      'claude-code',
+    )).toBe(false);
+    expect(shouldPrependMobileClientPromptNote(
+      { type: 'user', content: [{ type: 'text', text: '/compact' }] },
+      'claude-code',
+    )).toBe(false);
+  });
+
+  it('不把相似文本、带附件消息或其他 Agent 的输入误判成 Claude 命令', () => {
+    expect(shouldPrependMobileClientPromptNote('/compactness', 'claude-code')).toBe(true);
+    expect(shouldPrependMobileClientPromptNote(' /compact', 'claude-code')).toBe(true);
+    expect(shouldPrependMobileClientPromptNote(
+      {
+        type: 'user',
+        content: [
+          { type: 'text', text: '/compact' },
+          { type: 'image', url: 'x' },
+        ],
+      },
+      'claude-code',
+    )).toBe(true);
+    expect(shouldPrependMobileClientPromptNote('/compact', 'pi')).toBe(false);
+    expect(shouldPrependMobileClientPromptNote('/compact', 'codex')).toBe(true);
+  });
+});
+
 describe('注入接线(源码级守卫)', () => {
   const source = readFileSync(
     resolve(process.cwd(), 'src/main/maker-ipc/makerSendTransaction.ts'),
@@ -196,10 +230,12 @@ describe('注入接线(源码级守卫)', () => {
   );
 
   it('说明只进 wire payload,落库走 persistUserMessage.content', () => {
-    expect(source).toMatch(
-      /const mobileClientNote =\s*deps\.isMobileClientInvoke\?\.\(\) === true/,
+    expect(source).toContain(
+      'deps.isMobileClientInvoke?.() === true || so.fromMobileClient === true',
     );
-    expect(source).toContain('prependNoteToWireUserMessage(withHandoff as HandoffWireMessage, mobileClientNote)');
+    // 注入链:normalized → withHandoff → withPlanReconcile → mobile note(最外层)。
+    expect(source).toContain('prependNoteToWireUserMessage(withPlanReconcile as HandoffWireMessage, mobileClientNote)');
+    expect(source).toContain('shouldPrependMobileClientPromptNote(normalized, sess.agentKind)');
     // 落库内容必须仍取 persistUserMessage.content —— 若改成 outgoing,提示语会写进
     // 用户消息、污染界面显示的原话。
     expect(source).toContain('content: persistUserMessage.content');
@@ -265,11 +301,18 @@ describe('stripMainOnlySendOpts(直连路径消毒)', () => {
       .toEqual({ messageUuid: 'u' });
   });
 
-  it('剥掉客户端伪造的 generation,但保留待 IPC 校验的 clear token', () => {
+  it('剥掉客户端自报的 fromDeviceLinkClient', () => {
+    expect(stripMainOnlySendOpts({ messageUuid: 'u', fromDeviceLinkClient: true }))
+      .toEqual({ messageUuid: 'u' });
+  });
+
+  it('剥掉客户端伪造的 generation 与 turn 身份,但保留待 IPC 校验的 clear token', () => {
     expect(
       stripMainOnlySendOpts({
         expectedClearBoundaryMs: 123,
         expectedInputGeneration: 77,
+        expectedTurnSession: { forged: true },
+        expectedTurnGeneration: 88,
         messageUuid: 'u',
       }),
     ).toEqual({ expectedClearBoundaryMs: 123, messageUuid: 'u' });
@@ -303,6 +346,16 @@ describe('stripMainOnlySendOpts(直连路径消毒)', () => {
     expect(stripMainOnlySendOpts({ messageUuid: 'u', signal: 'forged' })).toEqual({
       messageUuid: 'u',
     });
+  });
+
+  it('剥掉 Renderer/device-link 自报的 IM permission policy', () => {
+    expect(stripMainOnlySendOpts({
+      messageUuid: 'u',
+      turnPermissionPolicy: {
+        origin: { kind: 'im', channel: 'telegram' },
+        confirmationSurface: 'channel',
+      },
+    })).toEqual({ messageUuid: 'u' });
   });
 
   it('其它字段原样保留', () => {
@@ -339,9 +392,20 @@ describe('排队 / 插入两条路径的接线(源码级守卫)', () => {
     expect(register).toContain('isMobileControllerInvoke(),');
   });
 
+  it('device-link provenance is stamped at both queue input boundaries', () => {
+    const stamps = register.match(/stampTrustedDeviceLinkQueuedOrigin\(/g) ?? [];
+    expect(stamps.length).toBe(2);
+    expect(register).toContain('deviceLinkInvoke,');
+  });
+
   it('coordinator 在 drain 与 steer 两处都透传', () => {
     const passes = coordinator.match(/fromMobileClient: true \} : \{\}\)/g) ?? [];
     expect(passes.length).toBe(2);
+  });
+
+  it('coordinator drain carries device-link provenance into the send transaction', () => {
+    expect(coordinator).toContain('fromDeviceLinkClient: true } : {})');
+    expect(transaction).toContain('requestedSendOpts.fromDeviceLinkClient === true');
   });
 
   it('send 事务认 async context 与透传值两个来源', () => {
@@ -352,6 +416,7 @@ describe('排队 / 插入两条路径的接线(源码级守卫)', () => {
 
   it('steer 投递也注入说明,且只进 wire payload', () => {
     expect(register).toContain("isMobileControllerInvoke() || so.fromMobileClient === true");
+    expect(register).toContain('shouldPrependMobileClientPromptNote(normalized, sess.agentKind)');
     expect(register).toContain('prependNoteToWireUserMessage(normalized as HandoffWireMessage, steerNote)');
     expect(register).toContain('await sess.steer(steerPayload as never');
   });
@@ -367,12 +432,11 @@ describe('排队 / 插入两条路径的接线(源码级守卫)', () => {
     // 不剥的话传 `{ fromMobileClient: true }` 就能让非手机轮次收到伪造的手机说明
     // (review P1/P2 各报一次)。契约与 maker:send 一致:该字段只由 main 盖章。
     expect(register).toContain(
-      'attachMainOwnedInputBoundary(stripMainOnlySendOpts(sendOpts), boundaryStamp)',
+      'const sanitizedSendOpts = attachMainOwnedInputBoundary(',
     );
+    expect(register).toContain('stripMainOnlySendOpts(sendOpts)');
     // coordinator 的内部调用**不得**被消毒 —— 那条路的 sendOpts 是 main 构造的透传值。
-    expect(register).toContain('steerToAgent: (sessionId, message, sendOpts) =>');
-    expect(register).toMatch(
-      /steerToAgent: \(sessionId, message, sendOpts\) =>\s*\n\s*steerToAgentAccepted\(sessionId, message, sendOpts\),/,
-    );
+    expect(register).toContain('steerToAgent: (sessionId, message, sendOpts) => {');
+    expect(register).toContain('const expectedText = trustedDesktopSteerText.getStore();');
   });
 });

@@ -5,7 +5,7 @@
  *  - 探测与显式分支选择都绑定 device/cwd,切目标后的同步 render 不暴露旧仓库状态;
  *  - 探测抛错归并:CHANNEL_NOT_ALLOWED→ unsupported，瞬时断连→ recovering，其余 detect-failed;
  *  - 播种归并:只接受工作端明确 boolean,缺字段/异常形状保留当前镜像;
- *  - 两步流第一步入参:suggest-name 结果归一(空/非法走 auto- 兜底,过工作端名字白名单);
+ *  - 两步流第一步入参:suggest-name 结果归一(空/非法走兼容 auto-* 兜底);
  *  - 失败展示:message + hint 拼装。
  */
 import { describe, expect, it, vi } from 'vitest';
@@ -16,6 +16,7 @@ import {
   classifyWorktreePreferenceSeed,
   fallbackWorktreeName,
   formatWorktreeCreateFailure,
+  initialWorktreeProbeEligibility,
   isExactRemoteSessionClaimed,
   isValidWorktreeBranchPreferenceSnapshot,
   isWorktreeChannelNotAllowedError,
@@ -94,7 +95,7 @@ describe('resolveWorktreeEligibility', () => {
 
 describe('worktreeEligibilityForTarget', () => {
   const snapshot = {
-    target: { deviceId: 'dev-a', workingDir: '/repo/a' },
+    target: { deviceId: 'dev-a', workingDir: '/repo/a', probeGeneration: '1\u00002' },
     eligibility: {
       status: 'eligible' as const,
       baseRepo: '/repo/a',
@@ -102,10 +103,11 @@ describe('worktreeEligibilityForTarget', () => {
     },
   };
 
-  it('只向同设备 + 同 cwd 暴露探测结果', () => {
+  it('只向同设备 + 同 cwd + 同探测代次暴露探测结果', () => {
     expect(worktreeEligibilityForTarget(snapshot, {
       deviceId: 'dev-a',
       workingDir: ' /repo/a ',
+      probeGeneration: '1\u00002',
     })).toEqual(snapshot.eligibility);
   });
 
@@ -113,10 +115,25 @@ describe('worktreeEligibilityForTarget', () => {
     expect(worktreeEligibilityForTarget(snapshot, {
       deviceId: 'dev-a',
       workingDir: '/repo/b',
+      probeGeneration: '1\u00002',
     })).toEqual({ status: 'probing' });
     expect(worktreeEligibilityForTarget(snapshot, {
       deviceId: 'dev-b',
       workingDir: '/repo/a',
+      probeGeneration: '1\u00002',
+    })).toEqual({ status: 'probing' });
+  });
+
+  it('同设备和目录重连重探时首帧同步回落 probing', () => {
+    expect(worktreeEligibilityForTarget(snapshot, {
+      deviceId: 'dev-a',
+      workingDir: '/repo/a',
+      probeGeneration: '2\u00002',
+    })).toEqual({ status: 'probing' });
+    expect(worktreeEligibilityForTarget(snapshot, {
+      deviceId: 'dev-a',
+      workingDir: '/repo/a',
+      probeGeneration: '1\u00003',
     })).toEqual({ status: 'probing' });
   });
 });
@@ -341,6 +358,38 @@ describe('worktreeEligibilityFromError', () => {
   });
 });
 
+describe('initialWorktreeProbeEligibility(#4046 完全断网时探测起始态)', () => {
+  it('设备 + 目录都已选但链路不在 online → recovering(自动重试文案,不停在检测中)', () => {
+    expect(initialWorktreeProbeEligibility({ hasDevice: true, hasWorkingDir: true, online: false }))
+      .toEqual({ status: 'recovering' });
+  });
+
+  it('设备或目录未选全 → probing(探测尚未开始,不把输入未完整误报成网络错误)', () => {
+    expect(initialWorktreeProbeEligibility({ hasDevice: false, hasWorkingDir: true, online: false }))
+      .toEqual({ status: 'probing' });
+    expect(initialWorktreeProbeEligibility({ hasDevice: true, hasWorkingDir: false, online: false }))
+      .toEqual({ status: 'probing' });
+    expect(initialWorktreeProbeEligibility({ hasDevice: false, hasWorkingDir: false, online: true }))
+      .toEqual({ status: 'probing' });
+  });
+
+  it('三者齐备 → probing,由后续请求结果 / 抛错归并覆盖', () => {
+    expect(initialWorktreeProbeEligibility({ hasDevice: true, hasWorkingDir: true, online: true }))
+      .toEqual({ status: 'probing' });
+  });
+
+  it('recovering 起始态与探测抛错的 recovering 走同一文案,且创建门禁保持 fail-closed', () => {
+    const offline = initialWorktreeProbeEligibility({ hasDevice: true, hasWorkingDir: true, online: false });
+    expect(worktreeEligibilityCaptionKey(offline)).toBe('session.new.worktreeRecovering');
+    expect(shouldBlockNewSessionCreateForWorktree({
+      applicable: true,
+      enabled: true,
+      eligibility: offline,
+      preferenceSaving: false,
+    })).toBe(true);
+  });
+});
+
 describe('seedWorktreeEnabled', () => {
   it('只接受工作端明确 boolean;缺字段/异常形状不覆盖当前镜像', () => {
     expect(seedWorktreeEnabled({ worktreeEnabled: true })).toBe(true);
@@ -440,6 +489,30 @@ describe('shouldShowWorktreeToggle / caption key', () => {
     expect(shouldShowWorktreeToggle({ workspaceKind: 'project', workingDir: '/repo', eligibility: { status: 'probing' }, enabled: false })).toBe(true);
   });
 
+  it('确认不合格(ineligible)时开关行隐藏,即使记忆为 ON(2026-08-07 裁决)', () => {
+    for (const reason of ['gitMissing', 'notGitRepo', 'alreadyInWorktree'] as const) {
+      expect(shouldShowWorktreeToggle({
+        workspaceKind: 'project',
+        workingDir: '/repo',
+        eligibility: { status: 'ineligible', reason },
+        enabled: true,
+      })).toBe(false);
+      expect(shouldShowWorktreeToggle({
+        workspaceKind: 'project',
+        workingDir: '/repo',
+        eligibility: { status: 'ineligible', reason },
+        enabled: false,
+      })).toBe(false);
+    }
+    // 探测失败 ≠ 确认不合格:已 ON 时保持显示(fail closed 需要可见入口)。
+    expect(shouldShowWorktreeToggle({
+      workspaceKind: 'project',
+      workingDir: '/repo',
+      eligibility: { status: 'detect-failed' },
+      enabled: true,
+    })).toBe(true);
+  });
+
   it('caption key 覆盖探测中 / 三种不合格原因 / 探测失败;eligible 无 caption', () => {
     expect(worktreeEligibilityCaptionKey({ status: 'probing' })).toBe('session.new.worktreeDetecting');
     expect(worktreeEligibilityCaptionKey({ status: 'recovering' })).toBe('session.new.worktreeRecovering');
@@ -481,15 +554,12 @@ describe('shouldBlockNewSessionCreateForWorktree', () => {
     })).toBe(false);
   });
 
-  it('ON 时必须等当前目标 eligible，unsupported 也不能把显式选择静默降级成普通创建', () => {
+  it('ON 时探测未定必须拦截，unsupported 也不能把显式选择静默降级成普通创建', () => {
     expect(shouldBlockNewSessionCreateForWorktree({
       applicable: true, enabled: true, eligibility: { status: 'probing' }, preferenceSaving: false,
     })).toBe(true);
     expect(shouldBlockNewSessionCreateForWorktree({
-      applicable: true,
-      enabled: true,
-      eligibility: { status: 'ineligible', reason: 'notGitRepo' },
-      preferenceSaving: false,
+      applicable: true, enabled: true, eligibility: { status: 'detect-failed' }, preferenceSaving: false,
     })).toBe(true);
     expect(shouldBlockNewSessionCreateForWorktree({
       applicable: true, enabled: true, eligibility: eligible, preferenceSaving: false,
@@ -501,11 +571,31 @@ describe('shouldBlockNewSessionCreateForWorktree', () => {
       applicable: true, enabled: true, eligibility: { status: 'unsupported' }, preferenceSaving: false,
     })).toBe(true);
   });
+
+  it('确认不合格(ineligible)+ ON 放行普通会话——记忆只对合格目录生效(2026-08-07 裁决)', () => {
+    for (const reason of ['gitMissing', 'notGitRepo', 'alreadyInWorktree'] as const) {
+      expect(shouldBlockNewSessionCreateForWorktree({
+        applicable: true,
+        enabled: true,
+        eligibility: { status: 'ineligible', reason },
+        preferenceSaving: false,
+      })).toBe(false);
+    }
+    // 偏好写入在途也不应拦截 ineligible——确认不合格目录不创建 worktree,
+    // preference 写入在途不该卡住普通会话创建。
+    expect(shouldBlockNewSessionCreateForWorktree({
+      applicable: true,
+      enabled: true,
+      eligibility: { status: 'ineligible', reason: 'notGitRepo' },
+      preferenceSaving: true,
+    })).toBe(false);
+  });
 });
 
 describe('worktree 名与 create 入参', () => {
-  it('suggest-name 非空取 trim;空/非字符串走 auto- 兜底(过工作端 [a-z0-9-]、≤20 白名单)', () => {
+  it('suggest-name 非空取 trim;空/非字符串走合法 auto-* 兜底', () => {
     expect(normalizeSuggestedWorktreeName('  fix-login  ')).toBe('fix-login');
+    expect(normalizeSuggestedWorktreeName('  auto-abc123  ')).toBe('auto-abc123');
     for (const value of ['', '   ', null, undefined, 42]) {
       const name = normalizeSuggestedWorktreeName(value, 1_750_000_000_000);
       expect(name).toMatch(/^auto-[a-z0-9]{1,6}$/);
@@ -513,7 +603,7 @@ describe('worktree 名与 create 入参', () => {
     }
   });
 
-  it('fallbackWorktreeName 稳定可复现(时间戳 base36 后 6 位)', () => {
+  it('fallbackWorktreeName 使用时间戳 base36 后 6 位，可稳定复现', () => {
     const now = 1_750_000_000_000;
     expect(fallbackWorktreeName(now)).toBe(`auto-${now.toString(36).slice(-6)}`);
   });
@@ -543,7 +633,7 @@ describe('worktree 名与 create 入参', () => {
     }).sourceBranch).toBe('feature/mobile');
   });
 
-  it('suggest-name 失败(null)时 create 入参用 auto- 兜底名', () => {
+  it('suggest-name 失败(null)时 create 入参使用旧 host 可接受的 auto-* 兜底名', () => {
     const request = buildWorktreeCreateRequest({
       sessionId: 's-1',
       eligibility: { status: 'eligible', baseRepo: '/repo/root', sourceBranch: 'main' },
@@ -551,7 +641,7 @@ describe('worktree 名与 create 入参', () => {
       recoveryKey: 'recovery-key-1234567890',
       now: 1_750_000_000_000,
     });
-    expect(request.name).toMatch(/^auto-[a-z0-9]{1,6}$/);
+    expect(request.name).toBe(fallbackWorktreeName(1_750_000_000_000));
   });
 
   it('only accepts complete request-matching worktree:create responses', () => {

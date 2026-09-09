@@ -14,10 +14,15 @@
  */
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { useTranslation } from 'react-i18next';
+import { ArrowUpRight } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { Tip } from '@/components/ui/tooltip';
 
 import { cn } from '@/lib/utils';
 import {
   filterSlashCommands,
+  isSlashCommandUnavailable,
   type UnifiedCommand,
 } from '@/lib/slashCommands';
 
@@ -43,6 +48,10 @@ interface SlashCommandPaletteProps {
   onSelect: (command: UnifiedCommand) => void;
   /** Called when user presses Esc or clicks outside. ChatInput owns close. */
   onClose: () => void;
+  /** Opens the backing local Skill from the hover information panel. */
+  onOpenSkillDetails?: (command: UnifiedCommand) => void;
+  /** Draft projects are not yet in SkillHub's Main-owned project scan. */
+  allowProjectSkillDetails?: boolean;
   /** Reports hover state for the portaled tooltip so ChatInput's blur guard treats it as part of the palette. */
   onTooltipHoverChange?: (hovered: boolean) => void;
   /** Panel max-height in px. Defaults to 400 (chat view); NewMaker passes a smaller value so the popover doesn't cover the logo. */
@@ -64,9 +73,12 @@ export function SlashCommandPalette({
   onFocusedIndexChange,
   onSelect,
   onClose,
+  onOpenSkillDetails,
+  allowProjectSkillDetails = true,
   onTooltipHoverChange,
   maxHeight = 400,
 }: SlashCommandPaletteProps) {
+  const { t } = useTranslation();
   const filtered = useMemo(() => filterSlashCommands(commands, query), [commands, query]);
   const rootRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -218,7 +230,7 @@ export function SlashCommandPalette({
           <div
             className={cn(
               'flex items-center justify-center',
-              'h-[40px] text-[13px]',
+              'h-[40px] text-13',
               'text-[var(--cmd-palette-empty)]',
             )}
           >
@@ -227,30 +239,36 @@ export function SlashCommandPalette({
         ) : (
           filtered.map((cmd, idx) => {
             const focused = idx === focusedIndex;
+            const unavailable = isSlashCommandUnavailable(cmd);
             return (
               <button
                 key={cmd.name}
                 ref={focused ? focusedRef : undefined}
                 type="button"
+                aria-disabled={unavailable}
+                aria-label={unavailable ? `${cmd.name}: ${t('commandPalette.projectSkillNotLoaded')}` : cmd.name}
+                title={unavailable ? t('commandPalette.projectSkillNotLoaded') : undefined}
                 // `onMouseDown` instead of `onClick` so the textarea
                 // keeps focus — click would fire after blur.
                 onMouseDown={(e) => {
                   e.preventDefault();
+                  if (unavailable) return;
                   onSelect(cmd);
                 }}
                 onMouseEnter={() => onFocusedIndexChange(idx)}
                 className={cn(
                   'flex w-full items-center justify-between',
                   'h-[36px] px-[10px] rounded-[6px]',
-                  'text-left text-[14px] font-medium',
+                  'text-left text-14 font-medium',
                   'text-[var(--cmd-palette-item-text)]',
                   'outline-none transition-colors',
                   focused && 'bg-[var(--cmd-palette-item-hover)]',
+                  unavailable && 'cursor-not-allowed opacity-50',
                 )}
               >
                 <span className="truncate">{cmd.name}</span>
                 {metaLabel(cmd) && (
-                  <span className="shrink-0 text-[12px] font-normal text-[var(--cmd-palette-item-meta)]">
+                  <span className="shrink-0 text-12 font-normal text-[var(--cmd-palette-item-meta)]">
                     {metaLabel(cmd)}
                   </span>
                 )}
@@ -281,11 +299,30 @@ export function SlashCommandPalette({
             maxHeight: tooltipPos.maxHeight,
           }}
         >
-          <div className="text-[14px] font-medium text-[var(--cmd-palette-item-text)]">
-            {focusedCmd.name}
+          <div className="flex items-center gap-1 text-14 font-medium text-[var(--cmd-palette-item-text)]">
+            <span className="min-w-0 truncate">{focusedCmd.name}</span>
+            {onOpenSkillDetails && focusedCmd.kind === 'agent-skill'
+              && focusedCmd.source === 'skill' && focusedCmd.path && focusedCmd.origin !== 'package'
+              && (allowProjectSkillDetails || focusedCmd.scope === 'global' || focusedCmd.scope === 'user') && (
+              <Tip text={t('commandPalette.viewSkillDetails')}>
+                <Button variant="secondary"
+                  className="w-8 border-transparent bg-transparent p-0 text-[var(--cmd-palette-item-meta)]"
+                  aria-label={t('commandPalette.viewSkillDetails')}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onOpenSkillDetails(focusedCmd);
+                    onClose();
+                  }}>
+                  <ArrowUpRight size={14} aria-hidden />
+                </Button>
+              </Tip>
+            )}
           </div>
-          <div className="mt-[8px] text-[13px] leading-[1.5] text-[var(--cmd-palette-tooltip-body)]">
-            {focusedCmd.description}
+          <div className="mt-[8px] text-13 leading-[1.5] text-[var(--cmd-palette-tooltip-body)]">
+            {isSlashCommandUnavailable(focusedCmd)
+              ? t('commandPalette.projectSkillNotLoaded')
+              : focusedCmd.description}
           </div>
         </div>,
         document.body,

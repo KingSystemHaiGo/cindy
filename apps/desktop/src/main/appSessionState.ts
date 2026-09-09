@@ -80,6 +80,16 @@ const store = createOverrideSettingsFile<PersistedAppSessionSettings>({
 
 let active: ActiveAppSession | null = null;
 let boundaryDepth = 0;
+let appSessionCommitBoundaryHook: (() => void) | null = null;
+
+/**
+ * Register synchronous owner-scoped runtime invalidation at the exact commit edge.
+ * The hook runs after the commit has been accepted but before the new owner is
+ * visible, so stale async work cannot resume into the next owner's process state.
+ */
+export function setAppSessionCommitBoundaryHook(hook: (() => void) | null): void {
+  appSessionCommitBoundaryHook = hook;
+}
 
 function ensureLoaded(): ActiveAppSession {
   if (active) return active;
@@ -145,11 +155,52 @@ export function isAppSessionBoundaryPending(): boolean {
   return boundaryDepth > 0;
 }
 
+/** Backward-compatible alias for the process-local application transition. */
+export function isAppSessionBoundaryLocallyPending(): boolean {
+  return boundaryDepth > 0;
+}
+
 /**
  * Commit a stable session after its required runtime is ready.
  * Cloud commits require a verified membership id; local uses the reserved id.
  */
 export function commitActiveAppSession(
+  mode: AppSessionMode,
+  cloudOwnerId?: string | null,
+  forceBumpGeneration = false,
+): ActiveAppSession {
+  const previous = ensureLoaded();
+  let dataOwnerId: string | null = null;
+  if (mode === 'local') {
+    dataOwnerId = LOCAL_DATA_OWNER_ID;
+  } else if (mode === 'cloud') {
+    const normalized = cloudOwnerId?.trim();
+    if (!normalized) throw new Error('cloud app session requires a verified data owner');
+    dataOwnerId = normalized;
+  }
+  const ownerChanged = previous.mode !== mode || previous.dataOwnerId !== dataOwnerId;
+
+  if (!ownerChanged && !forceBumpGeneration) {
+    return { ...previous };
+  }
+
+  store.writePatch({ activeMode: mode });
+  if (ownerChanged) appSessionCommitBoundaryHook?.();
+  active = {
+    mode,
+    dataOwnerId,
+    generation: previous.generation + 1,
+  };
+  log.info('stable app session committed', {
+    mode,
+    dataOwnerId,
+    generation: active.generation,
+  });
+  return { ...active };
+}
+
+/** Update only this process after a passive instance signs out or is quarantined. */
+export function commitVolatileAppSession(
   mode: AppSessionMode,
   cloudOwnerId?: string | null,
 ): ActiveAppSession {
@@ -162,18 +213,16 @@ export function commitActiveAppSession(
     if (!normalized) throw new Error('cloud app session requires a verified data owner');
     dataOwnerId = normalized;
   }
-
   if (previous.mode === mode && previous.dataOwnerId === dataOwnerId) {
     return { ...previous };
   }
-
-  store.writePatch({ activeMode: mode });
+  appSessionCommitBoundaryHook?.();
   active = {
     mode,
     dataOwnerId,
     generation: previous.generation + 1,
   };
-  log.info('stable app session committed', {
+  log.info('volatile app session committed', {
     mode,
     dataOwnerId,
     generation: active.generation,

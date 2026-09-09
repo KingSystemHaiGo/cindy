@@ -15,6 +15,16 @@ export * from './interfaces/index.js';
 
 // agents
 export * from './agents/index.js';
+export { evaluatePiProjectTrust, piProjectKey } from './agents/pi/project-trust.js';
+export {
+  assertReviewMessageContentPaths,
+  buildReviewReadGrants,
+  pathIsWithinReviewGrant,
+  reviewFileLinkLayoutIsSafe,
+  resolveReviewReadPath,
+  type ReviewReadGrant,
+} from './agents/shared/review-read-scope.js';
+export { isReviewSensitiveCredentialPath } from './agents/shared/sensitive-credential-paths.js';
 
 // codex app-server transport interface — host 实现自定义 transport (e.g. SSH-bridged
 // for remote codex) 时需要这个接口形状。
@@ -25,7 +35,20 @@ export type {
   CloseHandler as CodexAppServerCloseHandler,
   TransportCloseInfo as CodexAppServerCloseInfo,
 } from './agents/codex/app-server/transport.js';
-export type { CodexModelListItem } from './agents/codex/app-server/protocol.js';
+export type {
+  CodexModelListItem,
+  DynamicToolCallResponse,
+} from './agents/codex/app-server/protocol.js';
+
+// pi transport interface — host 实现自定义 transport (SSH-bridged remote pi) 时需要。
+export type {
+  PiTransport,
+  PiTransportCloseInfo,
+  PiLineHandler,
+  PiCloseHandler,
+} from './agents/pi/transport.js';
+// pi 远端 agentHome 文件操作原语(host 经 SSH 实现)。
+export type { PiRemoteFileOps } from './agents/base-agent.js';
 
 // core
 export * from './session.js';
@@ -39,6 +62,8 @@ export {
   MemoryStorage,
   sanitizeWorkdir,
   buildMemoryScopeKey,
+  buildBotMemoryScopeKey,
+  parseBotMemoryScopeKey,
   memoryScopeDirName,
   buildFilename,
   parseFilename,
@@ -59,6 +84,7 @@ export {
   type SetEnabledResult,
   type SqliteFactory,
 } from './memory/manager.js';
+export { isBotMcpServerAllowed } from './agents/shared/bot-runtime-policy.js';
 export {
   MemoryFlushController,
   DEFAULT_FLUSH_THRESHOLDS,
