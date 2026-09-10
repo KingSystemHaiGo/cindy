@@ -290,29 +290,43 @@ export async function planLegacyShardMigration(
       continue;
     }
 
-    let meta: ShardMeta | null = null;
+    let metaRaw: string;
     try {
-      const parsed: unknown = JSON.parse(
-        await fs.readFile(path.join(dir, 'meta.json'), 'utf8'),
-      );
-      // JSON.parse("null") / 数组 / 非对象通过 try, 但 meta.absPath 会抛掉整份计划
-      // (Codex review on #2519 第十七轮)。{}、缺 absPath 也当无效 meta。
-      if (
-        parsed === null ||
-        typeof parsed !== 'object' ||
-        Array.isArray(parsed) ||
-        typeof (parsed as ShardMeta).absPath !== 'string' ||
-        (parsed as ShardMeta).absPath.trim() === ''
-      ) {
-        plan.skipped.push(await buildSkippedInfo(dir, entry, 'invalid-meta'));
+      metaRaw = await fs.readFile(path.join(dir, 'meta.json'), 'utf8');
+    } catch (e) {
+      // ENOENT = 无 meta, 不猜不删. EACCES/EIO 等不得当 no-meta —
+      // summarizeApplyMigration 忽略 plan.skipped, --apply 会 ok:true
+      // 并把该分片的 legacy 记忆当孤儿 (Codex #2519 3976576804)。
+      if (isEnoentError(e)) {
+        plan.skipped.push(await buildSkippedInfo(dir, entry, 'no-meta'));
         continue;
       }
-      meta = parsed as ShardMeta;
-    } catch {
-      // 无 meta.json / 非 JSON → 不猜不删, 跳过并报告
-      plan.skipped.push(await buildSkippedInfo(dir, entry, 'no-meta'));
+      plan.failed.push(
+        await buildSkippedInfo(dir, entry, `meta-read-failure:${errnoCode(e)}`),
+      );
       continue;
     }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(metaRaw);
+    } catch {
+      // 非 JSON → 不猜不删, 跳过并报告
+      plan.skipped.push(await buildSkippedInfo(dir, entry, 'invalid-meta'));
+      continue;
+    }
+    // JSON.parse("null") / 数组 / 非对象通过 try, 但 meta.absPath 会抛掉整份计划
+    // (Codex review on #2519 第十七轮)。{}、缺 absPath 也当无效 meta。
+    if (
+      parsed === null ||
+      typeof parsed !== 'object' ||
+      Array.isArray(parsed) ||
+      typeof (parsed as ShardMeta).absPath !== 'string' ||
+      (parsed as ShardMeta).absPath.trim() === ''
+    ) {
+      plan.skipped.push(await buildSkippedInfo(dir, entry, 'invalid-meta'));
+      continue;
+    }
+    const meta = parsed as ShardMeta;
 
     // SSH 分片不迁移 (#2379 约束 3)。判定依据是 scope key 形态 (meta.absPath
     // 以 `ssh:` 开头 — storage 层只对远端会话生成 ssh: 复合键), 而不是目录名

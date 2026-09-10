@@ -449,8 +449,54 @@ describe('planLegacyShardMigration — 计划生成', () => {
     const plan = await planLegacyShardMigration(memoryRoot);
     expect(plan.skipped).toHaveLength(1);
     expect(plan.skipped[0].dir).toBe(orphan);
+    expect(plan.skipped[0].skipReason).toBe('no-meta');
+    expect(plan.failed).toHaveLength(0);
     expect(plan.mergeCandidates).toHaveLength(0);
     expect(plan.all.length + plan.skipped.length).toBe(1);
+  });
+
+  it('meta.json 读 EACCES → plan.failed meta-read-failure, --apply 不得 ok (Codex 3976576804)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const worktree = path.join(tmpRoot, 'repo-wt');
+    const wtDir = sanitizeWorkdir(worktree);
+    const dir = await makeShard(wtDir, { absPath: worktree, files: { 'feedback_a.md': 'keep' } });
+    const metaPath = path.join(dir, 'meta.json');
+    const origRead = fs.readFile.bind(fs);
+    // @ts-expect-error 测试注入
+    fs.readFile = async (p: string, ...rest: unknown[]) => {
+      if (typeof p === 'string' && p === metaPath) {
+        throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+      }
+      return origRead(p, ...rest);
+    };
+    try {
+      const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+      expect(plan.skipped.find((s) => s.dir === dir)).toBeUndefined();
+      expect(plan.mergeCandidates).toHaveLength(0);
+      expect(plan.emptyToDelete).toHaveLength(0);
+      expect(plan.failed).toHaveLength(1);
+      expect(plan.failed[0].dir).toBe(dir);
+      expect(plan.failed[0].skipReason).toBe('meta-read-failure:EACCES');
+      const apply = summarizeApplyMigration(plan, { results: [], conflicts: [] });
+      expect(apply.ok).toBe(false);
+      expect(apply.failed).toEqual([{ dir, reason: 'meta-read-failure:EACCES' }]);
+      expect(await fs.readFile(path.join(dir, 'feedback_a.md'), 'utf8')).toContain('keep');
+    } finally {
+      fs.readFile = origRead;
+    }
+  });
+
+  it('meta.json 非 JSON → skipped invalid-meta, 不当 I/O failed (Codex 3976576804)', async () => {
+    const bad = path.join(memoryRoot, 'bad-json-meta');
+    await fs.mkdir(bad, { recursive: true });
+    await fs.writeFile(path.join(bad, 'meta.json'), '{not-json', 'utf8');
+    await fs.writeFile(path.join(bad, 'feedback_a.md'), 'x', 'utf8');
+
+    const plan = await planLegacyShardMigration(memoryRoot);
+    expect(plan.failed).toHaveLength(0);
+    expect(plan.skipped).toHaveLength(1);
+    expect(plan.skipped[0].dir).toBe(bad);
+    expect(plan.skipped[0].skipReason).toBe('invalid-meta');
   });
 
   it('SSH + 无 meta 同时存在时, 扫描总数 = all + skipped (Codex 第十六轮: totalShards)', async () => {
