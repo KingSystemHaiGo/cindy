@@ -9,7 +9,7 @@
 本区块由 `scripts/design-inventory.mjs` 生成，请勿手改。
 重新生成：`pnpm design:inventory`；校验：`pnpm check:design-inventory`。
 
-计数快照日期：2026-09-09。生成命令：`pnpm design:inventory`。裸颜色匹配与 `scripts/hardcoded-color-audit.mjs` 共用 `scripts/shared/hardcoded-color-match.mjs`（HEX / rgb() / rgba() / hsl() / hsla()），台账统计层额外剔除 `var()` 包装与注释（TS/TSX 剥块注释与整行注释）——语义 token 消费与注释引用不是迁移债务；裸圆角为粗粒度（`rounded*` class、`border-radius:` 与 React style 对象的 `borderRadius:`）。Token 计数为样式源里 `var(--token)` / `hsl(var(--token)` 的去重 ID 数。
+计数快照日期：2026-09-10。生成命令：`pnpm design:inventory`。裸颜色匹配与 `scripts/hardcoded-color-audit.mjs` 共用 `scripts/shared/hardcoded-color-match.mjs`（HEX / rgb() / rgba() / hsl() / hsla()），台账统计层额外剔除 `var()` 包装与注释（TS/TSX 剥块注释与整行注释）——语义 token 消费与注释引用不是迁移债务；裸圆角为粗粒度（`rounded*` class、`border-radius:` 与 React style 对象的 `borderRadius:`）。Token 计数为样式源里 `var(--token)` / `hsl(var(--token)` 的去重 ID 数。
 
 登记 surface 数：35。平台本轮仅 Desktop。
 
