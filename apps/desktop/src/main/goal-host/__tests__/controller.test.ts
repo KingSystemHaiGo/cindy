@@ -470,6 +470,26 @@ describe('GoalController', () => {
     expect(local.session.sends).toHaveLength(0);
   });
 
+  it('records paused→blocked when editing a paused Goal cannot restore the session', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    await local.storage.set(seededGoal({ status: 'paused', objective: 'old objective' }));
+    local.setHydratable(false);
+
+    await expect(local.controller.setGoal({
+      sessionId: 's1',
+      objective: 'new objective',
+    })).rejects.toBeInstanceOf(GoalSessionRestoreError);
+
+    expect(await local.storage.get('s1')).toMatchObject({
+      status: 'blocked',
+      objective: 'old objective',
+    });
+    const blocked = events.filter((e) => e.type === 'state-transition' && e.to === 'blocked');
+    expect(blocked).toHaveLength(1);
+    expect(blocked[0]).toMatchObject({ from: 'paused', to: 'blocked' });
+  });
+
   it('blocks a Goal edit when session restoration throws and preserves the old objective', async () => {
     const local = makeController({
       ensureSession: async () => {
@@ -2970,6 +2990,66 @@ describe('GoalController', () => {
     await h.controller.resumeGoal('s1');
     expect((await h.storage.get('s1'))?.status).toBe('active');
     expect(h.session.sends).toHaveLength(sendsBeforeResume + 1);
+  });
+
+  it('records paused→blocked when manual Resume cannot restore the session', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    await startGoal(local);
+    await local.controller.pauseGoal('s1');
+    events.length = 0;
+    local.setHydratable(false);
+
+    await expect(local.controller.resumeGoal('s1')).rejects.toBeInstanceOf(
+      GoalSessionRestoreError,
+    );
+
+    expect(await local.storage.get('s1')).toMatchObject({ status: 'blocked' });
+    const blocked = events.filter((e) => e.type === 'state-transition' && e.to === 'blocked');
+    expect(blocked).toHaveLength(1);
+    expect(blocked[0]).toMatchObject({
+      from: 'paused',
+      to: 'blocked',
+      reason: expect.stringContaining('unable to restore the agent session'),
+    });
+    expect(events.some((e) => e.type === 'state-transition' && e.from === 'active' && e.to === 'blocked')).toBe(false);
+  });
+
+  it('records usageLimited→blocked when manual Resume cannot restore the session', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    await local.storage.set(seededGoal({
+      status: 'usageLimited',
+      lastReason: 'usage limit',
+      usageResetAt: 9_999,
+    }));
+    local.setHydratable(false);
+
+    await expect(local.controller.resumeGoal('s1')).rejects.toBeInstanceOf(
+      GoalSessionRestoreError,
+    );
+
+    expect(await local.storage.get('s1')).toMatchObject({ status: 'blocked' });
+    const blocked = events.filter((e) => e.type === 'state-transition' && e.to === 'blocked');
+    expect(blocked).toHaveLength(1);
+    expect(blocked[0]).toMatchObject({ from: 'usageLimited', to: 'blocked' });
+  });
+
+  it('omits a no-op blocked→blocked transition when Resume restore fails again', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    await local.storage.set(seededGoal({
+      status: 'blocked',
+      lastReason: 'previous dispatch failed',
+    }));
+    local.setHydratable(false);
+
+    await expect(local.controller.resumeGoal('s1')).rejects.toBeInstanceOf(
+      GoalSessionRestoreError,
+    );
+
+    expect(await local.storage.get('s1')).toMatchObject({ status: 'blocked' });
+    expect(events.filter((e) => e.type === 'state-transition')).toHaveLength(0);
   });
 
   it('does not reattach or emit stale active when Stop cancels resume during ensureSession', async () => {

@@ -461,7 +461,7 @@ export class GoalController {
   /** blocked 落盘失败时保留同一 fail-closed owner，GET_STATUS 可重试而不是回报旧 active。 */
   private readonly unpersistedDispatchFailures = new Map<
     string,
-    { boundary: TurnAccumulator; lastReason: string }
+    { boundary: TurnAccumulator; lastReason: string; from?: GoalStatus }
   >();
   /** 正在派发的 fire 及其 owner；旧代 finally 只能清理自己，不能删掉 Resume 新代。 */
   private readonly firing = new Map<string, object>();
@@ -1039,6 +1039,7 @@ export class GoalController {
           failureBoundary,
           'turn dispatch failed: unable to restore the agent session',
           () => this.turns.get(sessionId) === failureBoundary,
+          existing.status,
         );
         throw new GoalSessionRestoreError(error);
       }
@@ -1050,6 +1051,7 @@ export class GoalController {
           failureBoundary,
           'turn dispatch failed: unable to restore the agent session',
           () => this.turns.get(sessionId) === failureBoundary,
+          existing.status,
         );
         throw new GoalSessionRestoreError();
       }
@@ -1818,6 +1820,7 @@ export class GoalController {
           lookupBoundary,
           'turn dispatch failed: unable to restore the agent session',
           () => this.turns.get(sessionId) === lookupBoundary,
+          state.status,
         );
         throw new GoalSessionRestoreError();
       }
@@ -1968,6 +1971,7 @@ export class GoalController {
         pendingFailure.boundary,
         pendingFailure.lastReason,
         () => this.turns.get(sessionId) === pendingFailure.boundary,
+        pendingFailure.from,
       );
       if (this.disposed) return;
       if (!persisted) throw new GoalSessionRestoreError();
@@ -2030,6 +2034,7 @@ export class GoalController {
         lifecycleBoundary,
         'turn dispatch failed: unable to restore the agent session',
         () => this.turns.get(sessionId) === lifecycleBoundary,
+        state.status,
       );
       if (this.disposed) return;
       if (!persisted) throw new GoalSessionRestoreError(restoreError);
@@ -2041,6 +2046,7 @@ export class GoalController {
         lifecycleBoundary,
         'turn dispatch failed: unable to restore the agent session',
         () => this.turns.get(sessionId) === lifecycleBoundary,
+        state.status,
       );
       if (this.disposed) return;
       if (!persisted) throw new GoalSessionRestoreError();
@@ -2703,8 +2709,10 @@ export class GoalController {
     boundary: TurnAccumulator,
     lastReason: string,
     isCurrent: () => boolean,
+    from?: GoalStatus,
   ): Promise<boolean> {
     if (!isCurrent()) return true;
+    const fromStatus = from ?? 'active';
     try {
       const blocked = await this.trackPersistence(
         boundary,
@@ -2717,15 +2725,18 @@ export class GoalController {
       if (!isCurrent()) return true;
       if (blocked) {
         this.emit(blocked);
-        // 派发失败落盘 blocked 后补发 active→blocked,否则审计流仍显示 active
-        // (Codex #2107 P2)。
-        this.recordRunEvent('state-transition', sessionId, blocked, {
-          from: 'active',
-          to: 'blocked',
-          reason: lastReason,
-          lifecycleId: boundary.lifecycleId,
-          generation: boundary.generation,
-        });
+        // 记录真实来源状态:resume/edit 可能从 paused/blocked/usageLimited
+        // 失败,不能一律写成 active→blocked。同源 blocked 省略迁移
+        // (Codex #2107 P1)。
+        if (fromStatus !== 'blocked') {
+          this.recordRunEvent('state-transition', sessionId, blocked, {
+            from: fromStatus,
+            to: 'blocked',
+            reason: lastReason,
+            lifecycleId: boundary.lifecycleId,
+            generation: boundary.generation,
+          });
+        }
       }
     } catch (persistError) {
       this.deps.logger.error('[goal] failed to persist dispatch failure', {
@@ -2743,6 +2754,7 @@ export class GoalController {
         this.unpersistedDispatchFailures.set(sessionId, {
           boundary: failClosedBoundary,
           lastReason,
+          from: fromStatus,
         });
       }
       return false;
