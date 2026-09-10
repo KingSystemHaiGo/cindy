@@ -1512,7 +1512,7 @@ describe('runLegacyShardMigration — 执行', () => {
     expect(apply.failed).toHaveLength(0);
   });
 
-  it('stale fts.db rm 失败 → rename-incomplete, 不报 renamed (Codex 3971991067)', async () => {
+  it('stale fts.db rm 失败 → 滚回 legacy 路径, 不报 renamed (Codex 3971991067 / 3975785141)', async () => {
     const mainRepo = path.join(tmpRoot, 'repo');
     const worktree = path.join(tmpRoot, 'repo-wt');
     const wtDir = sanitizeWorkdir(worktree);
@@ -1526,15 +1526,68 @@ describe('runLegacyShardMigration — 执行', () => {
         if (String(filePath).includes('fts.db')) throw new Error('EBUSY fts.db');
       },
     });
-    expect(result.results[0].action).toBe('rename-incomplete');
+    expect(result.results[0].action).toBe('skipped');
     expect(result.results[0].action).not.toBe('renamed');
-    expect(result.results[0].error).toMatch(/stale fts.db remove failed/);
+    expect(result.results[0].error).toMatch(/post-rename failed, rolled back/);
+    expect(result.results[0].error).toMatch(/EBUSY fts.db/);
     const apply = summarizeApplyMigration(plan, result);
     expect(apply.ok).toBe(false);
     expect(apply.executionErrors).toHaveLength(1);
-    // 目录已搬到 canonical, 但不得按成功 renamed 汇报
-    await expect(fs.stat(path.join(memoryRoot, wtDir))).rejects.toThrow();
-    expect(await fs.readFile(path.join(memoryRoot, mainDir, 'feedback_a.md'), 'utf8')).toContain('X');
+    // 滚回后 planner 仍能把该分片当 legacy 重跑
+    await expect(fs.stat(path.join(memoryRoot, mainDir))).rejects.toThrow();
+    expect(await fs.readFile(path.join(wtPath, 'feedback_a.md'), 'utf8')).toContain('X');
+    const meta = JSON.parse(await fs.readFile(path.join(wtPath, 'meta.json'), 'utf8')) as {
+      absPath: string;
+    };
+    expect(meta.absPath).toBe(worktree);
+    const retry = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+    expect(retry.mergeCandidates).toHaveLength(1);
+    expect(retry.mergeCandidates[0].dir).toBe(wtPath);
+    expect(retry.failed).toHaveLength(0);
+  });
+
+  it('快路径 updateMetaAbsPath 失败 → 滚回 shard.dir, 可重跑 (Codex 3975785141)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const worktree = path.join(tmpRoot, 'repo-wt');
+    const wtDir = sanitizeWorkdir(worktree);
+    const mainDir = sanitizeWorkdir(mainRepo);
+    const wtPath = await makeShard(wtDir, { absPath: worktree, files: { 'feedback_a.md': 'keep' } });
+    const origWrite = fs.writeFile.bind(fs);
+    let blockedCanonicalMeta = false;
+    // @ts-expect-error 测试注入: 第一次写 canonical meta.json 失败, 回滚写出放行
+    fs.writeFile = async (p: string, data: string | Buffer, encoding?: BufferEncoding) => {
+      if (
+        !blockedCanonicalMeta &&
+        typeof p === 'string' &&
+        p.endsWith(`${path.sep}meta.json`) &&
+        p.includes(mainDir)
+      ) {
+        blockedCanonicalMeta = true;
+        throw Object.assign(new Error('EROFS meta.json'), { code: 'EROFS' });
+      }
+      return origWrite(p, data, encoding);
+    };
+    try {
+      const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+      const result = await runLegacyShardMigration(plan);
+      expect(result.results).toHaveLength(1);
+      expect(result.results[0].action).toBe('skipped');
+      expect(result.results[0].error).toMatch(/post-rename failed, rolled back/);
+      expect(result.results[0].error).toMatch(/EROFS meta.json/);
+      expect(summarizeApplyMigration(plan, result).ok).toBe(false);
+      await expect(fs.stat(path.join(memoryRoot, mainDir))).rejects.toThrow();
+      expect(await fs.readFile(path.join(wtPath, 'feedback_a.md'), 'utf8')).toContain('keep');
+      const meta = JSON.parse(await fs.readFile(path.join(wtPath, 'meta.json'), 'utf8')) as {
+        absPath: string;
+      };
+      expect(meta.absPath).toBe(worktree);
+      const retry = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+      expect(retry.mergeCandidates).toHaveLength(1);
+      expect(retry.mergeCandidates[0].dir).toBe(wtPath);
+      expect(retry.failed.find((s) => s.skipReason === 'dir-name-mismatch')).toBeUndefined();
+    } finally {
+      fs.writeFile = origWrite;
+    }
   });
 
   it('慢路径合并: plan 后写入的合法分片被一并合并, 数据不丢 (Codex 第四轮: 快照后写入)', async () => {

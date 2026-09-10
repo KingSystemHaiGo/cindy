@@ -858,6 +858,15 @@ export async function runLegacyShardMigration(
       if (!targetExists) {
         // 快路径: canonical 分片不存在 → rename 整个目录
         if (backupRoot) await backupDir(shard.dir, backupRoot);
+        // 先快照源 meta / 索引, rename 后 finalize 失败时一并还原,
+        // 避免滚回路径后 meta.absPath 已是 canonical → dir-name-mismatch
+        // 或看起来不再是 legacy (Codex #2519 3975785141)。
+        const originalMeta = await fs
+          .readFile(path.join(shard.dir, 'meta.json'))
+          .catch(() => null);
+        const originalIndex = await fs
+          .readFile(path.join(shard.dir, 'MEMORY.md'))
+          .catch(() => null);
         try {
           await renameFn(shard.dir, targetDir);
         } catch (e) {
@@ -870,25 +879,48 @@ export async function runLegacyShardMigration(
           }
           throw e;
         }
-        createdThisRun.add(createdKey);
-        // meta.absPath 更新为 canonical scope key (原值 = 旧 worktree 路径)
-        await updateMetaAbsPath(targetDir, shard.canonicalScopeKey, now());
-        // 重建 MEMORY.md — legacy 分片索引可能缺失/过期 (写入与重建之间崩溃
-        // 或人工修复), 不重建的话 canonical 会话 getIndex() 读到 stale 索引,
-        // 记忆进不了 prompt (Codex review on #2519 第十一轮, 与合并路径一致)
-        await rebuildIndexFile(targetDir);
-        // 丢弃 legacy 的 fts.db 与 sidecar — FTS 曾有更新失败时文件新但行数
-        // 碰巧匹配, sanityCheck() 只对比行数 → memory_search 一直返回 stale
-        // 行。删除后下次打开由 sanity check 以文件为 source of truth 重建
-        // (Codex review on #2519 第十六轮)。rm 失败不得报 renamed
-        // (Codex #2519 3971991067): 旧 fts.db 残留会让新 store 撞 stale FTS。
+        const rollbackFastPathRename = async (): Promise<string | null> => {
+          try {
+            if (originalMeta) {
+              await fs.writeFile(path.join(targetDir, 'meta.json'), originalMeta);
+            }
+            if (originalIndex) {
+              await fs.writeFile(path.join(targetDir, 'MEMORY.md'), originalIndex);
+            }
+            await fs.rename(targetDir, shard.dir);
+            return null;
+          } catch (rb) {
+            return String(rb);
+          }
+        };
         try {
+          // meta.absPath 更新为 canonical scope key (原值 = 旧 worktree 路径)
+          await updateMetaAbsPath(targetDir, shard.canonicalScopeKey, now());
+          // 重建 MEMORY.md — legacy 分片索引可能缺失/过期 (写入与重建之间崩溃
+          // 或人工修复), 不重建的话 canonical 会话 getIndex() 读到 stale 索引,
+          // 记忆进不了 prompt (Codex review on #2519 第十一轮, 与合并路径一致)
+          await rebuildIndexFile(targetDir);
+          // 丢弃 legacy 的 fts.db 与 sidecar — FTS 曾有更新失败时文件新但行数
+          // 碰巧匹配, sanityCheck() 只对比行数 → memory_search 一直返回 stale
+          // 行。删除后下次打开由 sanity check 以文件为 source of truth 重建
+          // (Codex review on #2519 第十六轮)。rm 失败不得报 renamed
+          // (Codex #2519 3971991067): 旧 fts.db 残留会让新 store 撞 stale FTS。
           await dropFtsFn(targetDir);
-          r.action = 'renamed';
         } catch (e) {
-          r.action = 'rename-incomplete';
-          r.error = `stale fts.db remove failed: ${String(e)}`;
+          const rollbackError = await rollbackFastPathRename();
+          if (rollbackError) {
+            r.action = 'rename-incomplete';
+            r.error = `post-rename failed (${String(e)}); rollback failed: ${rollbackError}`;
+            result.results.push(r);
+            continue;
+          }
+          r.action = 'skipped';
+          r.error = `post-rename failed, rolled back: ${String(e)}`;
+          result.results.push(r);
+          continue;
         }
+        createdThisRun.add(createdKey);
+        r.action = 'renamed';
       } else {
         // 慢路径: 逐文件合并
         if (backupRoot) {
