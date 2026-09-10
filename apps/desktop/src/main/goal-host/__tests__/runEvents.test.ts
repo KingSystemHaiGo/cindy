@@ -331,4 +331,58 @@ describe('createRunEventRecorder', () => {
       'g3:turn-finalized',
     ]);
   });
+
+  it('moves an old pause closeout before a later same-timestamp resume transition', () => {
+    const rec = createRunEventRecorder();
+    rec.record(evt({
+      type: 'turn-dispatched',
+      lifecycleId: 'g1',
+      generation: 1,
+      turnIndex: 1,
+      at: 1000,
+    }));
+    rec.record(evt({
+      type: 'state-transition',
+      lifecycleId: 'g2',
+      generation: 2,
+      turnIndex: 1,
+      from: 'paused',
+      to: 'active',
+      reason: 'manual-resume',
+      at: 1000,
+    }));
+    rec.record(evt({
+      type: 'resumed',
+      lifecycleId: 'g2',
+      generation: 2,
+      turnIndex: 1,
+      from: 'paused',
+      to: 'active',
+      at: 1000,
+    }));
+    rec.record(evt({
+      type: 'turn-dispatched',
+      lifecycleId: 'g2',
+      generation: 2,
+      turnIndex: 1,
+      at: 1000,
+    }));
+    rec.record(evt({
+      type: 'state-transition',
+      lifecycleId: 'g1',
+      generation: 1,
+      turnIndex: 1,
+      from: 'active',
+      to: 'paused',
+      reason: 'paused by user',
+      at: 1000,
+    }));
+    expect(rec.snapshot().map((e) => `${e.lifecycleId}:${e.type}:${e.to ?? ''}`)).toEqual([
+      'g1:turn-dispatched:',
+      'g1:state-transition:paused',
+      'g2:state-transition:active',
+      'g2:resumed:active',
+      'g2:turn-dispatched:',
+    ]);
+  });
 });

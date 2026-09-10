@@ -106,6 +106,9 @@ export function createRunEventRecorder(limit = 200, sink?: RunEventSink): GoalRu
       //     把该 closeout 提到那次 dispatch 前(不要按 session 首事件整段提前);
       //  5. 其余按显式插入序号(不依赖引擎 sort 稳定性,插入序 = 落环序)。
       const dispatchGroup = new Set(['resumed', 'turn-dispatched']);
+      // 新 lifecycle 入口:派发类 + resume 迁移(to:'active')。后者不能当 closeout
+      // (同 lifecycle 要排在 resumed 前),但跨 lifecycle 必须把旧 closeout 提到它前面,
+      // 否则同毫秒 delayed pause 会排到 paused→active 之后 (Codex #2107 P2)。
       // 收口类:所有派发后的终态/迁移/停滞事件都排在派发类之后(同毫秒全序,
       // state-transition/budget-consumed/stall-detected 也必须 phase 后置)。
       const closeoutGroup = new Set([
@@ -131,6 +134,8 @@ export function createRunEventRecorder(limit = 200, sink?: RunEventSink): GoalRu
       // 才算收口类(Codex P1)。
       const isCloseout = (evt: GoalRunEvent): boolean =>
         evt.type === 'state-transition' ? evt.to !== 'active' : closeoutGroup.has(evt.type);
+      const isLifecycleEntry = (evt: GoalRunEvent): boolean =>
+        dispatchGroup.has(evt.type) || (evt.type === 'state-transition' && evt.to === 'active');
       const indexed = ring.map((evt, idx) => ({
         _seq: idx,
         _key: idx,
@@ -160,11 +165,11 @@ export function createRunEventRecorder(limit = 200, sink?: RunEventSink): GoalRu
       const applyCrossLifecycleKeys = (): boolean => {
         let changed = false;
         for (const group of groups.values()) {
-          const dispatches = group.filter((e) => dispatchGroup.has(e.type));
+          const entries = group.filter((e) => isLifecycleEntry(e));
           for (const closeout of group) {
             if (!isCloseout(closeout)) continue;
             const closeLife = lifecycleSeqOf(closeout.lifecycleId);
-            for (const dispatch of dispatches) {
+            for (const dispatch of entries) {
               if (lifecycleSeqOf(dispatch.lifecycleId) <= closeLife) continue;
               // equal _key 不能当已有序:sort 会回落到 _seq,
               // 把后插入的新 dispatch 排到旧 closeout 前 (Codex #2107 P1)。
