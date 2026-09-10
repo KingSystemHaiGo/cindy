@@ -397,6 +397,12 @@ export interface CleanupRunResult {
    * 成功时为 undefined; 调用方 (CLI) 应告警并非零退出。
    */
   indexRebuildError?: string;
+  /**
+   * parked 恢复失败且规范 src 缺失时跳过 rebuildIndex,
+   * 避免 MEMORY.md 把仍在 `.cleanup-parked-*` 的分片踢出索引
+   * (Codex P1 on #2561: Preserve the index when parked restoration fails)。
+   */
+  skipIndexRebuild?: boolean;
 }
 
 /**
@@ -564,6 +570,11 @@ export async function planMemoryCleanup(
   );
   const digestMeta: Array<{ rec: MemoryRecord; ts: number }> = [];
   for (const r of records) {
+    // filename type 与 frontmatter type 都必须是 digest。listWithRaw
+    // 只把 parseFilename 留给 slug, 人工把 `project_notes.md` 改成
+    // `type: digest` 不能进自动精简 (Codex P1 on #2561: Validate the
+    // filename type before pruning digests)。
+    if (parseFilename(r.filename)?.type !== 'digest') continue;
     if (r.frontmatter.type !== 'digest') continue;
     if (duplicateArchived.has(r.filename)) continue;
     const raw = rawByName.get(r.filename);
@@ -984,6 +995,9 @@ export async function runMemoryCleanup(
       }
     } catch (e) {
       result.failed.push({ filename: item.filename, error: String(e) });
+      if ((e as { skipIndexRebuild?: boolean }).skipIndexRebuild) {
+        result.skipIndexRebuild = true;
+      }
     }
   }
 
@@ -997,10 +1011,15 @@ export async function runMemoryCleanup(
   // 跳过重建, 重跑会 exit 0 但旧 MEMORY.md 仍引用已归档文件 (Codex P2 on
   // #2561: rebuild MEMORY.md on repair reruns)。rebuildIndex 幂等, 无新归档
   // 时执行也安全。
-  try {
-    await new MemoryStorage(plan.shardDir).rebuildIndex();
-  } catch (e) {
-    result.indexRebuildError = String(e);
+  // parked 恢复失败且规范 src 缺失时跳过重建: list() 看不见 `.cleanup-parked-*`,
+  // 会把仍有效的记忆从 MEMORY.md/FTS 踢掉 (Codex P1 on #2561: Preserve the
+  // index when parked restoration fails)。
+  if (!result.skipIndexRebuild) {
+    try {
+      await new MemoryStorage(plan.shardDir).rebuildIndex();
+    } catch (e) {
+      result.indexRebuildError = String(e);
+    }
   }
 
   return result;
@@ -1064,13 +1083,17 @@ async function reserveTrashTarget(
           // .cleanup-parked-* (Codex P1 on #2561: Stop retrying after restoring
           // parked data by copy)。copy 失败同样 fail/replan, parked 保留。
           await fs.unlink(candidate).catch(() => {});
+          const srcPresent = await pathExists(src);
           throw Object.assign(
             new Error(
               restored === 'copy'
                 ? 'parked restored by exclusive copy; replan required (open writer may still target parked inode)'
                 : 'unable to restore parked source without clobbering src; parked kept for recovery',
             ),
-            { code: 'CLEANUP_SOURCE_LOCKED' },
+            {
+              code: 'CLEANUP_SOURCE_LOCKED',
+              skipIndexRebuild: restored !== 'copy' && !srcPresent,
+            },
           );
         }
       }
@@ -1157,7 +1180,15 @@ async function detachReservedSource(
       try {
         await fs.copyFile(parked, src, fs.constants.COPYFILE_EXCL);
       } catch {
-        // copy also failed — leave parked reachable, do not clobber src.
+        // copy also failed — leave parked reachable, do not clobber src,
+        // and do not rebuild MEMORY.md while the canonical name is missing
+        // (Codex P1 on #2561: Preserve the index when parked restoration fails).
+        throw Object.assign(
+          new Error(
+            'source replaced after trash reservation; unable to restore canonical src; parked kept',
+          ),
+          { code: 'CLEANUP_SOURCE_REPLACED', skipIndexRebuild: true, parkedPath: parked },
+        );
       }
     }
   }

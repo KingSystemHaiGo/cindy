@@ -400,6 +400,33 @@ describe('planMemoryCleanup', () => {
     expect(plan.digests.archive).toEqual(['digest_lex.md']);
   });
 
+  it('does not prune a non-digest filename whose frontmatter type is digest', async () => {
+    await shard('digest_a.md', 'digest', 'A', 'hook', 'a', '2026-01-01T00:00:00.000Z');
+    await shard('digest_b.md', 'digest', 'B', 'hook', 'b', '2026-02-01T00:00:00.000Z');
+    await shard('digest_c.md', 'digest', 'C', 'hook', 'c', '2026-03-01T00:00:00.000Z');
+    await writeFile(
+      path.join(dir, 'project_notes.md'),
+      [
+        '---',
+        'title: Notes',
+        'description: hook',
+        'type: digest',
+        "updatedAt: '2026-04-01T00:00:00.000Z'",
+        '---',
+        'mismatched type',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+
+    const plan = await planMemoryCleanup(dir, { keepDigests: 2 });
+    expect(plan.digests.keep).toEqual(['digest_c.md', 'digest_b.md']);
+    expect(plan.digests.archive).toEqual(['digest_a.md']);
+    expect(plan.digests.keep).not.toContain('project_notes.md');
+    expect(plan.digests.archive).not.toContain('project_notes.md');
+    expect(plan.archiveItems.some((i) => i.filename === 'project_notes.md')).toBe(false);
+  });
+
   it('excludes digests whose updatedAt is only in the body or invalid', async () => {
     await shard('digest_old.md', 'digest', 'Digest 1', 'hook', 'old', '2026-01-01T00:00:00.000Z');
     await writeFile(
@@ -1414,6 +1441,62 @@ describe('runMemoryCleanup', () => {
     } finally {
       lstatSpy.mockRestore();
       linkSpy.mockRestore();
+    }
+  });
+
+  it('skips MEMORY.md rebuild when parked restore cannot recreate src', async () => {
+    await shard('feedback_a.md', 'feedback', 'Same', 'hook', 'same', '2026-01-01T00:00:00.000Z');
+    await shard('feedback_b.md', 'feedback', 'Same', 'hook', 'same', '2026-02-01T00:00:00.000Z');
+    const storage = new MemoryStorage(dir);
+    await storage.rebuildIndex();
+    const before = await readFile(path.join(dir, 'MEMORY.md'), 'utf8');
+    expect(before).toContain('feedback_a.md');
+
+    const plan = await planMemoryCleanup(dir);
+    const realLstat = fs.lstat.bind(fs);
+    const realLink = fs.link.bind(fs);
+    const realCopy = fs.copyFile.bind(fs);
+    let failedOnce = false;
+    const lstatSpy = vi.spyOn(fs, 'lstat').mockImplementation(async (p) => {
+      if (!failedOnce && String(p).includes('cleanup-parked')) {
+        failedOnce = true;
+        throw Object.assign(new Error('transient lock'), { code: 'EACCES' });
+      }
+      return realLstat(p as string);
+    });
+    const linkSpy = vi.spyOn(fs, 'link').mockImplementation(async (src, dst) => {
+      if (String(src).includes('cleanup-parked') && String(dst).endsWith('feedback_a.md')) {
+        throw Object.assign(new Error('hard links unsupported'), { code: 'ENOTSUP' });
+      }
+      return realLink(src as string, dst as string);
+    });
+    const copySpy = vi.spyOn(fs, 'copyFile').mockImplementation(async (src, dst, mode) => {
+      if (String(src).includes('cleanup-parked') && String(dst).endsWith('feedback_a.md')) {
+        throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+      }
+      return realCopy(src as string, dst as string, mode as number);
+    });
+    const rebuildSpy = vi.spyOn(MemoryStorage.prototype, 'rebuildIndex');
+
+    try {
+      const result = await runMemoryCleanup(plan);
+      expect(failedOnce).toBe(true);
+      expect(result.skipIndexRebuild).toBe(true);
+      expect(result.archived.some((a) => a.filename === 'feedback_a.md')).toBe(false);
+      expect(result.failed.some((f) => f.filename === 'feedback_a.md')).toBe(true);
+      await expect(readFile(path.join(dir, 'feedback_a.md'), 'utf8')).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+      const names = await readdir(dir);
+      const parked = names.filter((n) => n.includes('cleanup-parked'));
+      expect(parked.length).toBeGreaterThan(0);
+      expect(rebuildSpy).not.toHaveBeenCalled();
+      await expect(readFile(path.join(dir, 'MEMORY.md'), 'utf8')).resolves.toBe(before);
+    } finally {
+      lstatSpy.mockRestore();
+      linkSpy.mockRestore();
+      copySpy.mockRestore();
+      rebuildSpy.mockRestore();
     }
   });
 
