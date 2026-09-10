@@ -20,9 +20,15 @@
  *    SSH 直接委托 buildMemoryScopeKey (不在控制端解析远端 git); 本地先归一化。
  *
  * 回落 (一律返回 cwd 原样, 与既有行为完全一致): 非 git 目录 / git 不可用 /
- * 探测超时 / bare repo / 非 linked-worktree 布局 (普通 clone / submodule /
- * --separate-git-dir checkout, gitdir == common-dir) / 非常规 common-dir 布局 /
- * cwd 不在 toplevel 下。
+ * 探测超时 / bare repo / 非 linked-worktree 布局 (普通 clone /
+ * --separate-git-dir checkout, gitdir == common-dir 且无 superproject) /
+ * 非常规 common-dir 布局 / cwd 不在 toplevel 下。
+ * 特例: linked worktree 内初始化过的 submodule 的 gitdir == common-dir
+ * (都是 `<主仓>/.git/worktrees/<wt>/modules/<sub>`), 不能当普通 clone 回落;
+ * `--show-superproject-working-tree` 只给直接父仓库, 二级 submodule 的父是
+ * 另一层 submodule 而不是 worktree — 必须沿 superproject 链走到最外层
+ * (linked worktree 或主仓) 再归一, 否则 `git worktree list` 会把 `.git`
+ * 元数据目录报成唯一 worktree (Codex #2399 P1 / #2519 3974808633)。
  * 非仓库目录由 `.git` 标记上溯预检直接短路, 连 git 进程都不 spawn
  * (hasGitMarkerUpward, 与 rev-parse 上溯语义一致)。
  *
@@ -150,33 +156,55 @@ export async function resolveMemoryScopeKey(
  * linked worktree cwd → `主仓根 + cwd 相对 worktree 根的子路径`。
  * 探测方式与 desktop WorktreeManager 同模式: rev-parse + path.resolve
  * 解析相对输出 (兼容不支持 --path-format 的旧 git)。单次 rev-parse 拿
- * toplevel / git-dir / git-common-dir 三个值 (输出顺序与参数一致);
- * 确认是 linked worktree 后再用一次 `worktree list --porcelain` 取主仓根。
+ * toplevel / git-dir / git-common-dir / superproject 四个值 (输出顺序与
+ * 参数一致; 无 superproject 时第四行为空); 确认是 linked worktree 或
+ * worktree 内 submodule 后再用一次 `worktree list --porcelain` 取主仓根。
  * 失败抛错由调用方回落。
  */
 async function canonicalizeLocalWorkdir(workingDir: string, execGit: GitProbe): Promise<string> {
   const cwd = path.normalize(workingDir);
   const out = await execGit(
-    ['rev-parse', '--show-toplevel', '--git-dir', '--git-common-dir'],
+    [
+      'rev-parse',
+      '--show-toplevel',
+      '--git-dir',
+      '--git-common-dir',
+      '--show-superproject-working-tree',
+    ],
     cwd,
   );
-  const [toplevelRaw, gitDirRaw, commonDirRaw] = out.split('\n');
+  const [toplevelRaw, gitDirRaw, commonDirRaw, superRaw] = out.split('\n');
   const toplevel = resolveGitDirOutput(toplevelRaw ?? '', cwd);
   const gitDir = resolveGitDirOutput(gitDirRaw ?? '', cwd);
   const commonDir = resolveGitDirOutput(commonDirRaw ?? '', cwd);
+  const directSuper = resolveGitDirOutput(superRaw ?? '', cwd);
   if (!toplevel || !gitDir || !commonDir) return workingDir;
 
-  // 只在真正的 linked worktree 上归一化: gitdir ≠ common-dir
-  // (linked worktree 的 gitdir 是 `<主仓>/.git/worktrees/<name>`)。
-  // 普通 clone / submodule / `git clone --separate-git-dir` 的 gitdir 与
-  // common-dir 相同 — separate-git-dir 的 common-dir basename 恰好也是
-  // `.git`, 不先排除会把主仓根错误推导到 git 存储目录, 静默打开无关 Store
-  // (Codex review on #2399)。
-  if (samePath(gitDir, commonDir)) return workingDir;
+  // 判定链 (Codex #2399 P1 / #2519 3974808633, linked-worktree submodule):
+  //  1. gitdir ≠ common-dir → 真 linked worktree, 归一到主仓根 + 相对路径。
+  //  2. gitdir == common-dir 且有 superproject → cwd 是 submodule。
+  //     主仓内 submodule 的 superproject == 主仓根, 原样返回 (与 round-1 契约一致)。
+  //     linked worktree 内 submodule 的 gitdir == common-dir (都是
+  //     `<主仓>/.git/worktrees/<wt>/modules/<sub>`), 不能当普通 clone 回落;
+  //     把**最外层** superproject (walk 链, 不是直接父) 当 mapping 根再走
+  //     同一套主仓映射, 得到 `/main/<nested-rel>` 而不是 `.git` 元数据目录。
+  //  3. gitdir == common-dir 且无 superproject → 普通 clone /
+  //     --separate-git-dir checkout, 原样返回。separate-git-dir 的 common-dir
+  //     basename 恰好也是 `.git`, 不先排除会把主仓根错误推导到 git 存储目录
+  //     (Codex review on #2399)。
+  const outermostSuper = directSuper
+    ? await walkOutermostSuperproject(directSuper, execGit)
+    : null;
+  if (samePath(gitDir, commonDir)) {
+    if (!outermostSuper) return workingDir;
+  } else if (path.basename(commonDir) !== '.git') {
+    // bare repo 的 linked worktree (common-dir 是 `<name>.git`) 等非常规布局
+    // 无法可靠推断主仓根, 回落原样。submodule 走上面 superproject 分支,
+    // 不看这一条 (其 gitdir == common-dir)。
+    return workingDir;
+  }
 
-  // bare repo 的 linked worktree (common-dir 是 `<name>.git`) 等非常规布局
-  // 无法可靠推断主仓根, 回落原样。
-  if (path.basename(commonDir) !== '.git') return workingDir;
+  const mappingRoot = outermostSuper ?? toplevel;
 
   // 主仓根不能从 common-dir 推导: 主 checkout 本身用 --separate-git-dir 建
   // 时 common-dir 是 git 存储目录, dirname 不一定是工作树 (Codex review on
@@ -189,19 +217,19 @@ async function canonicalizeLocalWorkdir(workingDir: string, execGit: GitProbe): 
   // 跟随 git 的 canonical 答案; 主 checkout 会话按 round-1 契约不归一化,
   // 即该极端布局下主 checkout 与 worktree 的 memory 不共享 (与 PR 前行为
   // 一致, 不回归)。
-  const mainRoot = await resolveMainWorktreeRoot(cwd, execGit);
+  const mainRoot = await resolveMainWorktreeRoot(mappingRoot, execGit);
   if (!mainRoot) return workingDir;
 
-  // 防御: toplevel 即主仓根时无需归一化 (gitdir ≠ common-dir 的异常布局),
+  // 防御: 映射根即主仓根时无需归一化 (主仓内 cwd / 主仓内 submodule),
   // 原样返回, 保持「本地原样返回」契约。
-  if (samePath(toplevel, mainRoot)) return workingDir;
+  if (samePath(mappingRoot, mainRoot)) return workingDir;
 
-  // linked worktree: 子路径映射回主仓根下 (该路径在主仓可以不存在 —
-  // scope key 只是身份字符串, 落盘目录名经 memoryScopeDirName 派生)。
-  const rel = path.relative(toplevel, cwd);
+  // linked worktree (含其内 submodule): 子路径映射回主仓根下
+  // (该路径在主仓可以不存在 — scope key 只是身份字符串, 落盘目录名经
+  // memoryScopeDirName 派生)。
+  const rel = path.relative(mappingRoot, cwd);
   if (rel === '') return mainRoot;
-  // cwd 不在 toplevel 下 (symlink/大小写风格不一致等) — 不猜, 回落。
-  // 不额外 realpath: scope 跟 git toplevel, 与 inode/junction 目标解耦。
+  // cwd 不在映射根下 (symlink/大小写风格不一致等) — 不猜, 回落。
   if (rel.startsWith('..') || path.isAbsolute(rel)) return workingDir;
   return path.join(mainRoot, rel);
 }
@@ -303,5 +331,48 @@ async function resolveMainWorktreeRoot(cwd: string, execGit: GitProbe): Promise<
 }
 
 function samePath(a: string, b: string): boolean {
-  return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+  if (process.platform === 'win32') {
+    return (
+      normalizeWindowsLocalScopeKey(a).toLowerCase() ===
+      normalizeWindowsLocalScopeKey(b).toLowerCase()
+    );
+  }
+  return a === b;
+}
+
+/**
+ * `--show-superproject-working-tree` 只给直接父仓库。二级 submodule 的父是
+ * 另一层 submodule, 在那一层跑 `git worktree list` 会把
+ * `<main>/.git/worktrees/<wt>/modules/<parent>` 报成唯一 worktree, 把
+ * scope 映射进 .git 元数据目录 (Codex #2399 P1)。沿链走到没有 superproject
+ * 的最外层 (linked worktree 或主仓) 再交给 resolveMainWorktreeRoot。
+ */
+async function walkOutermostSuperproject(start: string, execGit: GitProbe): Promise<string> {
+  let current = start;
+  const seen = new Set<string>();
+  for (let i = 0; i < 16; i += 1) {
+    const key =
+      process.platform === 'win32'
+        ? normalizeWindowsLocalScopeKey(current).toLowerCase()
+        : current;
+    if (seen.has(key)) return current;
+    seen.add(key);
+    // 与 canonicalize 同一条 4 行 rev-parse, 让既有 cwd-agnostic fake probe
+    // 仍返回 superproject 在第四行; 单字段 --show-superproject-working-tree
+    // 会被 probeFor 的第一行 toplevel 误当成父仓。
+    const out = await execGit(
+      [
+        'rev-parse',
+        '--show-toplevel',
+        '--git-dir',
+        '--git-common-dir',
+        '--show-superproject-working-tree',
+      ],
+      current,
+    ).catch(() => '');
+    const parent = resolveGitDirOutput(out.split('\n')[3] ?? '', current);
+    if (!parent || samePath(parent, current)) return current;
+    current = parent;
+  }
+  return current;
 }

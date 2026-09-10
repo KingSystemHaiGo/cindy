@@ -31,7 +31,7 @@
  * runLegacyShardMigration() 执行计划 (幂等, 可重复跑)。
  */
 
-import { promises as fs } from 'node:fs';
+import { constants, promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
 import { MemoryStorage, SSH_SCOPE_KEY_PREFIX, memoryScopeDirName, parseFilename } from './storage.js';
@@ -70,6 +70,8 @@ export interface LegacyShardInfo {
   isLegacy: boolean;
   /** 合法 .md 分片数 (排除 MEMORY.md / meta.json / fts.db)。 */
   recordCount: number;
+  /** 规划时 canonical 分片目录是否已存在 (apply 检测并发创建)。 */
+  canonicalExistedAtPlan?: boolean;
   /** skipped / failed 原因 (relative-absPath / worktree-resolve-failure 等)。 */
   skipReason?: string;
 }
@@ -331,8 +333,9 @@ export async function planLegacyShardMigration(
         live &&
         ((await hasGitWorktreeRegistration(rawAbs)) || (await hasFileFormGitdir(rawAbs)))
       ) {
-        // 托管登记 或 祖先文件形态 `.git` (普通 linked worktree / submodule):
+        // 托管登记 或 祖先 linked-worktree 文件形态 `.git` (gitdir 含 worktrees/):
         // resolver 回落原路径不得当 non-legacy 静默吞掉 (Codex 3974674280)。
+        // 主仓 submodule 的 gitdir 指向 modules/, 回落原路径是正确结果。
         plan.failed.push(
           await buildSkippedInfo(dir, entry, 'worktree-resolve-failure', rawAbs),
         );
@@ -385,6 +388,7 @@ export async function planLegacyShardMigration(
       canonicalDirName,
       isLegacy,
       recordCount: 0,
+      canonicalExistedAtPlan: await dirExists(path.join(memoryRoot, canonicalDirName)),
     };
 
     // 统计合法分片数 + 未识别遗留内容 (数据保全: 只有遗留文件 (含非
@@ -718,11 +722,30 @@ export async function runLegacyShardMigration(
         continue;
       }
       const targetExists = await dirExists(targetDir);
+      if (!shard.canonicalExistedAtPlan && (targetExists || (await pathExists(targetDir)))) {
+        // 计划时不存在、apply 前被并发创建 → 不得 rename/merge 覆盖新分片
+        // (Codex #2519 3974808630)。
+        r.action = 'skipped';
+        r.error = 'concurrent-create';
+        result.results.push(r);
+        continue;
+      }
 
       if (!targetExists) {
         // 快路径: canonical 分片不存在 → rename 整个目录
         if (backupRoot) await backupDir(shard.dir, backupRoot);
-        await renameFn(shard.dir, targetDir);
+        try {
+          await renameFn(shard.dir, targetDir);
+        } catch (e) {
+          const code = errnoCode(e);
+          if (code === 'EEXIST' || code === 'ENOTEMPTY') {
+            r.action = 'skipped';
+            r.error = 'concurrent-create';
+            result.results.push(r);
+            continue;
+          }
+          throw e;
+        }
         // meta.absPath 更新为 canonical scope key (原值 = 旧 worktree 路径)
         await updateMetaAbsPath(targetDir, shard.canonicalScopeKey, now());
         // 重建 MEMORY.md — legacy 分片索引可能缺失/过期 (写入与重建之间崩溃
@@ -846,9 +869,14 @@ async function mergeFilesInto(
     const dstExists = await pathExists(dst);
 
     if (!dstExists) {
-      await fs.copyFile(src, dst);
-      out.push({ filename, outcome: 'copied' });
-      continue;
+      try {
+        await fs.copyFile(src, dst, constants.COPYFILE_EXCL);
+        out.push({ filename, outcome: 'copied' });
+        continue;
+      } catch (e) {
+        if (errnoCode(e) !== 'EEXIST') throw e;
+        // pathExists 后、copy 前被并发创建: 不得覆盖 (Codex #2519 3974808630)
+      }
     }
     const dstBuf = await fs.readFile(dst);
     if (srcBuf.equals(dstBuf)) {
@@ -1025,14 +1053,25 @@ async function hasManagedWorktreeEvidence(absPath: string): Promise<boolean> {
   return hasGitWorktreeRegistration(absPath);
 }
 
-/** 祖先是否有文件形态 `.git` (普通 linked worktree / submodule gitdir 指针)。 */
+/**
+ * 祖先是否是「普通 linked worktree」: 文件形态 `.git` 且 gitdir 指向
+ * `<main>/.git/worktrees/<name>`。主仓 / 独立仓的 `.git` 是目录;
+ * 主仓内 submodule 的 gitdir 指向 `.git/modules/` — 解析回落原路径是正确结果,
+ * 不得记 `worktree-resolve-failure` (Codex 3974808633 / 修 2 过宽回归)。
+ */
 async function hasFileFormGitdir(absPath: string): Promise<boolean> {
   let cur = absPath;
   for (;;) {
     try {
-      const s = await fs.lstat(path.join(cur, '.git'));
-      if (s.isFile()) return true;
-      if (s.isDirectory()) return false;
+      const gitPath = path.join(cur, '.git');
+      const s = await fs.lstat(gitPath);
+      if (s.isFile()) {
+        const body = await fs.readFile(gitPath, 'utf8').catch(() => '');
+        if (/[\\/]worktrees[\\/]/.test(body)) return true;
+        // submodule 或未知 gitdir 指针: 继续向上, 不在这一层判定 linked worktree
+      } else if (s.isDirectory()) {
+        return false;
+      }
     } catch {
       // 继续向上
     }

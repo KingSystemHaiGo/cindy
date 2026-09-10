@@ -168,7 +168,7 @@ describe.skipIf(!gitAvailable())('resolveMemoryScopeKey — 真实临时 git 仓
     }
   });
 
-  it('linked worktree 内初始化过的 submodule → 主仓 submodule 路径 (Codex #2399 P1)', async () => {
+  it('linked worktree 内初始化过的 submodule → 主仓 submodule 路径 (Codex 3974808633)', async () => {
     const tmpRoot = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'scope-resolver-sub-')));
     const subRepo = path.join(tmpRoot, 'sub');
     const repoRoot = path.join(tmpRoot, 'repo');
@@ -210,8 +210,10 @@ describe.skipIf(!gitAvailable())('resolveMemoryScopeKey — 真实临时 git 仓
     }
   });
 
-  it('linked worktree 内二级 submodule → 主仓嵌套路径 (Codex #2399 P1)', async () => {
-    const tmpRoot = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'scope-resolver-nested-sub-')));
+  it('linked worktree 内二级 submodule → 主仓嵌套路径 (Codex 3974808633)', async () => {
+    const tmpRoot = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), 'scope-resolver-nested-sub-')),
+    );
     const innerRepo = path.join(tmpRoot, 'inner');
     const midRepo = path.join(tmpRoot, 'mid');
     const repoRoot = path.join(tmpRoot, 'repo');

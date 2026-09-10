@@ -345,6 +345,60 @@ describe('runLegacyShardMigration — 执行', () => {
     await expect(fs.stat(wtPath)).rejects.toThrow();
   });
 
+  it('计划后并发创建 canonical 目录 → skipped concurrent-create, 不覆盖 (Codex 3974808630)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const worktree = path.join(tmpRoot, 'repo-wt');
+    const wtDir = sanitizeWorkdir(worktree);
+    const mainDir = sanitizeWorkdir(mainRepo);
+    const wtPath = await makeShard(wtDir, { absPath: worktree, files: { 'feedback_a.md': 'legacy' } });
+    const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+    expect(plan.mergeCandidates).toHaveLength(1);
+    expect(plan.mergeCandidates[0].canonicalExistedAtPlan).toBe(false);
+    const target = path.join(memoryRoot, mainDir);
+    await fs.mkdir(target, { recursive: true });
+    await fs.writeFile(path.join(target, 'feedback_new.md'), 'concurrent', 'utf8');
+    const result = await runLegacyShardMigration(plan);
+    expect(result.results).toHaveLength(1);
+    expect(result.results[0].action).toBe('skipped');
+    expect(result.results[0].error).toBe('concurrent-create');
+    await expect(fs.stat(wtPath)).resolves.toBeTruthy();
+    expect(await fs.readFile(path.join(target, 'feedback_new.md'), 'utf8')).toBe('concurrent');
+    await expect(fs.stat(path.join(target, 'feedback_a.md'))).rejects.toThrow();
+    expect(summarizeApplyMigration(plan, result).ok).toBe(false);
+  });
+
+  it('merge COPYFILE_EXCL 撞上并发创建的目标文件 → 不同内容 conflict-skipped 不覆盖 (Codex 3974808630)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const worktree = path.join(tmpRoot, 'repo-wt');
+    const wtDir = sanitizeWorkdir(worktree);
+    const mainDir = sanitizeWorkdir(mainRepo);
+    await makeShard(mainDir, { absPath: mainRepo, files: { 'feedback_keep.md': 'keep' } });
+    const wtPath = await makeShard(wtDir, {
+      absPath: worktree,
+      files: { 'feedback_a.md': 'from-legacy' },
+    });
+    const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+    expect(plan.mergeCandidates[0].canonicalExistedAtPlan).toBe(true);
+    const origCopy = fs.copyFile.bind(fs);
+    // @ts-expect-error 测试注入
+    fs.copyFile = async (_src: string, dst: string, _mode?: number) => {
+      await fs.writeFile(dst, 'raced', 'utf8');
+      throw Object.assign(new Error('EEXIST'), { code: 'EEXIST' });
+    };
+    try {
+      const result = await runLegacyShardMigration(plan);
+      expect(result.results[0].action).toBe('merged');
+      expect(result.conflicts).toHaveLength(1);
+      expect(result.conflicts[0].filename).toBe('feedback_a.md');
+      expect(await fs.readFile(path.join(memoryRoot, mainDir, 'feedback_a.md'), 'utf8')).toBe(
+        'raced',
+      );
+      await expect(fs.stat(wtPath)).resolves.toBeTruthy();
+    } finally {
+      fs.copyFile = origCopy;
+    }
+  });
+
   it('canonical 分片不存在 → rename 整个目录 + meta.absPath 更新 + MEMORY.md 重建 (Codex 第十一轮)', async () => {
     const mainRepo = path.join(tmpRoot, 'repo');
     const worktree = path.join(tmpRoot, 'repo-wt');
@@ -1020,6 +1074,22 @@ describe('runLegacyShardMigration — 执行', () => {
     expect(plan.all.some((s) => s.dir.endsWith(liveDir))).toBe(false);
   });
 
+  it('主仓 submodule 文件形态 .git (modules/) 解析回落 → 非 failed (Codex 3974808633)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const sub = path.join(mainRepo, 'mod');
+    await fs.mkdir(sub, { recursive: true });
+    await fs.writeFile(path.join(sub, '.git'), 'gitdir: ../.git/modules/mod\n', 'utf8');
+    const subDir = sanitizeWorkdir(sub);
+    await makeShard(subDir, { absPath: sub, files: { 'feedback_a.md': 'X' } });
+    const plan = await planLegacyShardMigration(memoryRoot, {
+      resolveScopeKey: async (wd: string) => wd,
+    });
+    expect(plan.failed).toHaveLength(0);
+    expect(plan.mergeCandidates).toHaveLength(0);
+    expect(plan.all.some((s) => s.dir.endsWith(subDir))).toBe(true);
+    expect(plan.all.find((s) => s.dir.endsWith(subDir))?.isLegacy).toBe(false);
+  });
+
   it('活托管 worktree 解析回落原路径 → failed, 计划不 abort (Codex 第十八轮)', async () => {
     const mainRepo = path.join(tmpRoot, 'repo');
     const liveWt = path.join(mainRepo, '.cindy-worktrees', 'feat-x');
@@ -1339,7 +1409,9 @@ describe('runLegacyShardMigration — 执行', () => {
     fs.readdir = async (p) => {
       if (typeof p === 'string' && p === wtPath) {
         dirReads += 1;
-        return dirReads === 1 ? ['feedback_a.md', 'meta.json'] : ['project_b.md', 'meta.json'];
+        // apply 先 lstat 扫描 symlink 分片文件 (readdir #1), mergeFilesInto
+        // 快照是 #2; 之后的复查才模拟同数替换, 否则 dest 读 ENOENT。
+        return dirReads <= 2 ? ['feedback_a.md', 'meta.json'] : ['project_b.md', 'meta.json'];
       }
       return origReaddir(p);
     };
