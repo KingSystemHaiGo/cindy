@@ -208,7 +208,8 @@ export interface CleanupRunResult {
 
 /**
  * 扫描单个分片目录, 生成清理计划。纯只读, 不修改任何文件 (dry-run 安全)。
- * 目录不存在 / 不可读 → 返回空计划 (records 空, 各列表空)。
+ * 目录不存在 → 返回空计划。分片 I/O 错误 (EACCES/EPERM/锁) 抛出,
+ * 不得吞成空计划再让 apply 用残缺 list 重写 MEMORY.md (Codex P1 on #2561)。
  */
 export async function planMemoryCleanup(
   shardDir: string,
@@ -229,15 +230,11 @@ export async function planMemoryCleanup(
   };
 
   const storage = new MemoryStorage(shardDir);
-  let listed: Array<{ rec: MemoryRecord; raw: string }>;
-  try {
-    // 分类与 raw 来自同一次读取 (listWithRaw), 避免 list() 后再读把
-    // expectedHash 绑到宿主刷新后的新字节 (Codex P1 on #2561: 将
-    // updatedAt 纳入候选版本校验 / 分类与原始字节同一读)。
-    listed = await storage.listWithRaw();
-  } catch {
-    return plan;
-  }
+  // 分类与 raw 来自同一次读取 (listWithRaw), 避免 list() 后再读把
+  // expectedHash 绑到宿主刷新后的新字节 (Codex P1 on #2561: 将
+  // updatedAt 纳入候选版本校验 / 分类与原始字节同一读)。
+  // 目录不存在: listWithRaw 对 readdir ENOENT 返 []; 其他 I/O 向上抛。
+  const listed = await storage.listWithRaw();
   const records = listed.map((x) => x.rec);
   const rawByName = new Map(listed.map((x) => [x.rec.filename, x.raw]));
   plan.records = records;
@@ -281,17 +278,21 @@ export async function planMemoryCleanup(
     }
   }
 
-  // ── 2. 近似重复: 同 title 但内容不同 → 只报告 ────────────────────────
-  const byTitle = new Map<string, string[]>();
+  // ── 2. 近似重复: 同 title 且至少两个不同内容 hash → 只报告 ─────────
+  // 完全重复组 (同 title + 同 content hash) 已在第 1 步; 不得再当成
+  // 「同 title 不同内容」报告, 否则 dry-run 既显示自动归档又要求人工复核
+  // (Codex P2 on #2561)。
+  const byTitle = new Map<string, MemoryRecord[]>();
   for (const rec of records) {
     const key = rec.frontmatter.title.trim();
     const arr = byTitle.get(key) ?? [];
-    arr.push(rec.filename);
+    arr.push(rec);
     byTitle.set(key, arr);
   }
-  for (const [title, filenames] of byTitle) {
-    if (filenames.length < 2) continue;
-    plan.nearDuplicates.push({ title, filenames });
+  for (const [title, group] of byTitle) {
+    const hashes = new Set(group.map((r) => contentHash(r)));
+    if (hashes.size < 2) continue;
+    plan.nearDuplicates.push({ title, filenames: group.map((r) => r.filename) });
   }
 
   // ── 3. 终态候选: 只报告, 不自动归档 ──────────────────────────────────

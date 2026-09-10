@@ -19,6 +19,7 @@ import {
   runMemoryCleanup,
 } from './cleanup.js';
 import { MemoryStorage } from './storage.js';
+import { MemoryError } from './types.js';
 
 let dir: string;
 
@@ -118,6 +119,35 @@ describe('planMemoryCleanup', () => {
     expect(plan.nearDuplicates).toHaveLength(1);
     expect(plan.nearDuplicates[0].filenames.sort()).toEqual(['project_x_1.md', 'project_x_2.md']);
     expect(plan.archiveItems).toHaveLength(0);
+  });
+
+  it('does not report exact duplicates as near-duplicates', async () => {
+    await shard('feedback_rule_a.md', 'feedback', 'PR polling rule', 'same hook', 'same body',
+      '2026-01-01T00:00:00.000Z');
+    await shard('feedback_rule_b.md', 'feedback', 'PR polling rule', 'same hook', 'same body',
+      '2026-03-01T00:00:00.000Z');
+
+    const plan = await planMemoryCleanup(dir);
+    expect(plan.duplicates).toHaveLength(1);
+    expect(plan.nearDuplicates).toHaveLength(0);
+  });
+
+  it('reports near-duplicates when same title has at least two content hashes', async () => {
+    await shard('project_a.md', 'project', 'Same title', 'hook', 'same body',
+      '2026-01-01T00:00:00.000Z');
+    await shard('project_b.md', 'project', 'Same title', 'hook', 'same body',
+      '2026-02-01T00:00:00.000Z');
+    await shard('project_c.md', 'project', 'Same title', 'hook', 'different body',
+      '2026-03-01T00:00:00.000Z');
+
+    const plan = await planMemoryCleanup(dir);
+    expect(plan.duplicates).toHaveLength(1);
+    expect(plan.nearDuplicates).toHaveLength(1);
+    expect(plan.nearDuplicates[0].filenames.sort()).toEqual([
+      'project_a.md',
+      'project_b.md',
+      'project_c.md',
+    ]);
   });
 
   it('lists stale candidates (signal/weak-signal/age) but does NOT auto-archive them', async () => {
@@ -1115,5 +1145,61 @@ describe('runMemoryCleanup', () => {
       linkSpy.mockRestore();
       statSpy.mockRestore();
     }
+  });
+});
+
+describe('storage list I/O vs corrupt shards (Codex P1 on #2561)', () => {
+  it('throws io-error from list/listWithRaw when a shard is unreadable', async () => {
+    await shard('project_ok.md', 'project', 'Ok', 'hook', 'body', '2026-01-01T00:00:00.000Z');
+    const storage = new MemoryStorage(dir);
+    const spy = vi
+      .spyOn(fs, 'readFile')
+      .mockRejectedValue(Object.assign(new Error('permission denied'), { code: 'EACCES' }));
+    try {
+      await expect(storage.list()).rejects.toMatchObject({ code: 'io-error' });
+      await expect(storage.listWithRaw()).rejects.toMatchObject({ code: 'io-error' });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('still skips determined frontmatter parse errors', async () => {
+    await shard('project_ok.md', 'project', 'Ok', 'hook', 'body', '2026-01-01T00:00:00.000Z');
+    await writeFile(path.join(dir, 'project_bad.md'), 'not a shard\n', 'utf8');
+    const storage = new MemoryStorage(dir);
+    const recs = await storage.list();
+    expect(recs.map((r) => r.filename)).toEqual(['project_ok.md']);
+    const withRaw = await storage.listWithRaw();
+    expect(withRaw.map((x) => x.rec.filename)).toEqual(['project_ok.md']);
+  });
+
+  it('does not swallow shard I/O errors in planMemoryCleanup', async () => {
+    await shard('project_ok.md', 'project', 'Ok', 'hook', 'body', '2026-01-01T00:00:00.000Z');
+    const spy = vi
+      .spyOn(fs, 'readFile')
+      .mockRejectedValue(Object.assign(new Error('locked'), { code: 'EPERM' }));
+    try {
+      await expect(planMemoryCleanup(dir)).rejects.toMatchObject({ code: 'io-error' });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('keeps the original MEMORY.md when rebuildIndex hits a shard I/O error', async () => {
+    await shard('project_ok.md', 'project', 'Ok', 'hook', 'body', '2026-01-01T00:00:00.000Z');
+    const storage = new MemoryStorage(dir);
+    await storage.rebuildIndex();
+    const before = await readFile(path.join(dir, 'MEMORY.md'), 'utf8');
+    expect(before).toContain('project_ok.md');
+
+    const spy = vi
+      .spyOn(fs, 'readFile')
+      .mockRejectedValue(Object.assign(new Error('permission denied'), { code: 'EACCES' }));
+    try {
+      await expect(storage.rebuildIndex()).rejects.toBeInstanceOf(MemoryError);
+    } finally {
+      spy.mockRestore();
+    }
+    await expect(readFile(path.join(dir, 'MEMORY.md'), 'utf8')).resolves.toBe(before);
   });
 });

@@ -18,7 +18,8 @@
  *     不是删除, 可手工找回
  *   - 终态候选默认只报告; --archive-stale 才一并归档 (用户已确认)
  *   - --backup-dir 可选真备份; 归档/备份目标循环递增后缀, 绝不覆盖
- *   - 执行前检测宿主进程 (Cindy 桌面应用) — 持有 Store/SQLite 句柄时拒绝
+ *   - 执行前检测宿主进程 (Cindy 桌面应用) — 持有 Store/SQLite 句柄时拒绝;
+    检测失败 (缺 tasklist/ps、权限拒绝) 同样拒绝, 须显式 --force
  *
  * 输出格式: 人类可读报告 + 末尾一行机器可读的 `RESULT <json>`。
  */
@@ -256,13 +257,26 @@ async function main() {
   if (opts.backupDir) {
     banner(`备份目录: ${path.resolve(opts.backupDir)}`);
   }
-  if (!opts.force && (await isHostRunning())) {
-    process.stderr.write(
-      '❌ 检测到宿主 (Cindy 桌面应用) 正在运行 — 归档会移动用户记忆文件, ' +
-        '宿主持有的 Store/SQLite 句柄会与归档冲突。\n' +
-        '请先退出 Cindy 再运行; 确认无活动会话时可用 --force 继续。\n',
-    );
-    process.exit(3);
+  if (!opts.force) {
+    const host = await detectHost();
+    if (host.status === 'unknown') {
+      process.stderr.write(
+        '❌ 无法确认宿主 (Cindy 桌面应用) 是否在运行: ' +
+          `${host.error}\n` +
+          '缺少 tasklist/ps、权限拒绝或进程查询失败时不得当作「未运行」继续 ' +
+          '(fail-open 会绕过排他检查并移动记忆文件)。\n' +
+          '请修复检测环境后重跑, 或确认无活动会话后显式加 --force。\n',
+      );
+      process.exit(3);
+    }
+    if (host.running) {
+      process.stderr.write(
+        '❌ 检测到宿主 (Cindy 桌面应用) 正在运行 — 归档会移动用户记忆文件, ' +
+          '宿主持有的 Store/SQLite 句柄会与归档冲突。\n' +
+          '请先退出 Cindy 再运行; 确认无活动会话时可用 --force 继续。\n',
+      );
+      process.exit(3);
+    }
   }
 
   const result = await runMemoryCleanup(plan, {
@@ -310,9 +324,11 @@ async function main() {
 /**
  * 宿主 (Cindy 桌面应用) 运行检测 — 与 migrate-maker-memory.mjs 同款逻辑
  * (#2529 行动项 2 排他契约)。归档会移动用户记忆文件, 宿主进程持有
- * MakerMemoryStore 与 SQLite 句柄时不应并发。检测工具缺失保守返回 false。
+ * MakerMemoryStore 与 SQLite 句柄时不应并发。
+ * 检测工具缺失 / 权限拒绝 / 查询失败 → status=unknown, 调用方必须拒绝执行
+ * 并要求 --force, 不得 fail-open (Codex P2 on #2561)。
  */
-async function isHostRunning() {
+async function detectHost() {
   try {
     const { execFile } = await import('node:child_process');
     const { promisify } = await import('node:util');
@@ -322,9 +338,10 @@ async function isHostRunning() {
       const r = await run('tasklist', ['/FO', 'CSV', '/NH']);
       out = r.stdout;
       const names = new Set(out.toLowerCase().match(/"?[a-z0-9_.\- ]+\.exe"?/g) ?? []);
-      return ['cindy.exe', 'cindydev.exe', 'desktop.exe', 'electron.exe'].some((p) =>
+      const running = ['cindy.exe', 'cindydev.exe', 'desktop.exe', 'electron.exe'].some((p) =>
         names.has(`"${p}"`),
       );
+      return { status: 'ok', running };
     }
     const r = await run('ps', ['-eo', 'comm']);
     out = r.stdout;
@@ -335,14 +352,16 @@ async function isHostRunning() {
         .map((s) => s.trim())
         .filter(Boolean),
     );
-    return (
+    const running =
       commNames.has('cindy') ||
       commNames.has('cindydev') ||
       commNames.has('desktop') ||
-      commNames.has('electron')
-    );
-  } catch {
-    return false;
+      commNames.has('electron');
+    return { status: 'ok', running };
+  } catch (e) {
+    const err = /** @type {NodeJS.ErrnoException} */ (e);
+    const detail = err?.code ? `${err.code}: ${err.message}` : String(err?.message ?? e);
+    return { status: 'unknown', error: detail };
   }
 }
 

@@ -69,7 +69,9 @@ export function sanitizeWorkdir(absPath: string): string {
  * 裸拼接时 ('/x:/repo','prod') 与 ('/repo','prod:/x') 会撞成同一个 key
  * (review R5 P2);常规 alias 编码前后相同,键仍可读。数据仍存控制端本机,
  * 目录名经 memoryScopeDirName 派生。所有 getStore 调用方 (agent 启动注入 /
- * MCP withStore) 必须统一经本函数取键,不得各自拼接。
+ * MCP withStore) 必须统一取键,不得各自拼接——**统一入口是 async 的
+ * resolveMemoryScopeKey (scope-resolver.ts)**: 它在本地会话上额外做 git
+ * linked-worktree 归一化 (#2379), 本函数保持同步原契约不变。
  */
 export function buildMemoryScopeKey(workingDir: string, remoteHostId?: string | null): string {
   return remoteHostId ? `ssh:${encodeURIComponent(remoteHostId)}:${workingDir}` : workingDir;
@@ -106,7 +108,7 @@ export function parseBotMemoryScopeKey(scopeKey: string): string | null {
 }
 
 /** buildMemoryScopeKey 的远端键前缀。本地键恒为绝对路径, 不会以它开头。 */
-const SSH_SCOPE_KEY_PREFIX = 'ssh:';
+export const SSH_SCOPE_KEY_PREFIX = 'ssh:';
 const BOT_SCOPE_KEY_PREFIX = 'bot:';
 
 /**
@@ -244,7 +246,10 @@ export class MemoryStorage {
 
   /**
    * 列出所有 memory 分片 (含 frontmatter + body)。MEMORY.md / meta.json 自动跳过。
-   * 损坏文件 (frontmatter 缺失 / type 非法) 跳过 + 不抛错 — 不让单个坏文件拖垮全量列表。
+   * 损坏文件 (frontmatter 缺失 / type 非法 / YAML 解析失败) 跳过 + 不抛错 —
+   * 不让单个坏文件拖垮全量列表。分片 I/O 错误 (EACCES/EPERM/锁) 必须抛出:
+   * 若当损坏跳过, rebuildIndex 会据此重写 MEMORY.md, 把仍存在的有效分片从
+   * 索引抹掉且锁解除后不会自动回来 (Codex P1 on #2561)。
    */
   async list(): Promise<MemoryRecord[]> {
     let entries: string[];
@@ -263,8 +268,9 @@ export class MemoryStorage {
       try {
         const rec = await this.readRecord(entry);
         if (rec) records.push(rec);
-      } catch {
-        // 单个坏文件跳过, 由 review 工具后续清理
+      } catch (e) {
+        if (isCorruptShardError(e)) continue;
+        throw e;
       }
     }
     // 按 type 分组, 同 type 内按 slug 升序 → MEMORY.md 索引可读性
@@ -281,7 +287,7 @@ export class MemoryStorage {
    * 列出所有合法分片, 同时返回同一读的原始字节 (record 与 hash 绑定同一读)。
    * 供清理工具校验「分类字节 = 归档字节」, 避免 list 后再读导致 hash 绑到
    * 宿主刷新后的新内容而分类仍是旧记录 (Codex P1 on #2561)。
-   * 损坏文件跳过, 与 list() 同口径。
+   * 损坏文件跳过, 与 list() 同口径; 分片 I/O 错误抛出, 不静默从计划中移除。
    */
   async listWithRaw(): Promise<Array<{ rec: MemoryRecord; raw: string }>> {
     let entries: string[];
@@ -302,7 +308,6 @@ export class MemoryStorage {
         const raw = await this.tryReadRaw(fullPath);
         if (!raw) continue;
         const shard = parseRawShard(raw, entry);
-        if (!shard) continue;
         out.push({
           rec: {
             filename: entry,
@@ -313,8 +318,9 @@ export class MemoryStorage {
           },
           raw,
         });
-      } catch {
-        // 单个坏文件跳过, 由 review 工具后续清理
+      } catch (e) {
+        if (isCorruptShardError(e)) continue;
+        throw e;
       }
     }
     out.sort((a, b) => {
@@ -683,7 +689,15 @@ interface ParsedShard {
 }
 
 function parseRawShard(raw: string, filenameForErr: string): ParsedShard {
-  const parsed = matter(raw);
+  let parsed: ReturnType<typeof matter>;
+  try {
+    parsed = matter(raw);
+  } catch (e) {
+    throw new MemoryError(
+      'invalid-frontmatter',
+      `${filenameForErr} frontmatter 解析失败: ${(e as Error).message}`,
+    );
+  }
   const data = parsed.data as Partial<MemoryFrontmatter>;
   if (!data.title || !data.description || !isMemoryType(data.type)) {
     throw new MemoryError(
@@ -704,4 +718,9 @@ function parseRawShard(raw: string, filenameForErr: string): ParsedShard {
 
 function isENOENT(e: unknown): boolean {
   return typeof e === 'object' && e !== null && (e as { code?: string }).code === 'ENOENT';
+}
+
+/** 仅 frontmatter/YAML 损坏可跳过; I/O 必须冒泡 (Codex P1 on #2561)。 */
+function isCorruptShardError(e: unknown): boolean {
+  return e instanceof MemoryError && e.code === 'invalid-frontmatter';
 }
