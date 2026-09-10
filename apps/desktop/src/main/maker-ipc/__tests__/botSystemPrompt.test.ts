@@ -103,8 +103,12 @@ describe('稳定层:能力必须写进提示词', () => {
     expect(all).toContain('不要在普通一轮里默认记');
     expect(all).toContain('流程已验证且明显可复用');
     expect(all).toContain('已验证且明显可复用');
-    expect(all).toContain('一次性确认的约定本身不触发写入');
-    expect(all).toContain('询问本身不能扩权');
+    expect(all).toContain('不要等他重复第二次');
+    expect(all).toContain('确认它足够具体且不是临时状态');
+    expect(all).toContain('拿不准是否长期有效时只问一句');
+    expect(all).not.toContain('同一条稳定偏好/纠正再次出现');
+    expect(all).not.toContain('一次性确认的约定本身不触发写入');
+    expect(all).not.toContain('询问本身不能扩权');
     expect(all).not.toContain('一条长期有效的约定已经在真实对话里被确认');
     expect(all).not.toContain('确认即可写');
     expect(all).toContain('重要的「时刻」也走同一道门槛');
@@ -114,7 +118,6 @@ describe('稳定层:能力必须写进提示词', () => {
     expect(all).toContain('用 memory_search 限定 type moment');
     expect(all).toContain('已有则 update/append 到原分片');
     expect(all).not.toContain('一起完成且以后还用得上的重大节点');
-    expect(all).not.toContain('不要等他重复第二次');
     expect(all).not.toContain('用户明确让你记住的时刻');
     expect(all).not.toContain('对话里已经确认过要记的重大事件');
     expect(all).toContain('不能拿来改 SOUL');
