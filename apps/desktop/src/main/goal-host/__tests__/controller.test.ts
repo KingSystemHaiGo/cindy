@@ -4962,6 +4962,94 @@ describe('GoalController', () => {
     expect(events.find((e) => e.type === 'terminal' && e.to === 'budgetLimited')).toMatchObject(owner);
   });
 
+  it('does not stamp a closeout onto a rejected dispatch lifecycle', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    vi.spyOn(local.session, 'send').mockImplementation(async (
+      message: Parameters<FakeSession['send']>[0],
+      opts: Parameters<FakeSession['send']>[1],
+    ): Promise<SessionSendResult> => {
+      const content = typeof message === 'string' ? message : message.content;
+      local.session.sends.push({ content, originKind: opts?.origin?.kind });
+      opts?.onDispatching?.();
+      return { accepted: false, reason: 'provider-rejected-before-dispatch' };
+    });
+
+    await local.controller.setGoal({ sessionId: 's1', objective: 'ship it' });
+    expect(events.some((e) => e.type === 'turn-dispatched')).toBe(false);
+
+    await local.controller.clearGoal('s1');
+    const cleared = events.filter((e) => e.type === 'cleared');
+    expect(cleared).toHaveLength(1);
+    expect(events.some((e) => e.type === 'turn-dispatched')).toBe(false);
+    expect(cleared[0]?.lifecycleId).not.toBeUndefined();
+    expect(
+      events.some((e) => e.type === 'turn-dispatched' && e.lifecycleId === cleared[0]?.lifecycleId),
+    ).toBe(false);
+  });
+
+  it('does not flush a parked dispatch when clear persistence fails', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    let markDispatchStarted!: () => void;
+    let releaseDispatch!: (result: SessionSendResult) => void;
+    const dispatchStarted = new Promise<void>((resolve) => {
+      markDispatchStarted = resolve;
+    });
+    const pendingDispatch = new Promise<SessionSendResult>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    vi.spyOn(local.session, 'send').mockImplementation(async (
+      message: Parameters<FakeSession['send']>[0],
+      opts: Parameters<FakeSession['send']>[1],
+    ): Promise<SessionSendResult> => {
+      const content = typeof message === 'string' ? message : message.content;
+      local.session.sends.push({ content, originKind: opts?.origin?.kind });
+      opts?.onDispatching?.();
+      markDispatchStarted();
+      return pendingDispatch;
+    });
+
+    const started = local.controller.setGoal({ sessionId: 's1', objective: 'ship it' });
+    await dispatchStarted;
+
+    const origGet = local.storage.get.bind(local.storage);
+    let releaseGet!: (state: GoalState | null) => void;
+    const blockedGet = new Promise<GoalState | null>((resolve) => {
+      releaseGet = resolve;
+    });
+    let blockedOnce = false;
+    vi.spyOn(local.storage, 'get').mockImplementation(async (sessionId: string) => {
+      if (!blockedOnce) {
+        blockedOnce = true;
+        return blockedGet;
+      }
+      return origGet(sessionId);
+    });
+
+    local.session.emitGoalTurn({
+      toolUse: true,
+      verdictJson: '```json\n{"goal_status":"continue","reason":"wip"}\n```',
+      tokens: 20,
+    });
+    await vi.waitFor(() => expect(blockedOnce).toBe(true));
+
+    releaseDispatch({ accepted: true });
+    await tick();
+    expect(events.some((e) => e.type === 'turn-dispatched')).toBe(false);
+
+    vi.spyOn(local.storage, 'clear').mockRejectedValueOnce(new Error('clear unavailable'));
+    const clearPromise = local.controller.clearGoal('s1');
+    releaseGet(await origGet('s1'));
+    await expect(clearPromise).rejects.toThrow('clear unavailable');
+    await started.catch(() => undefined);
+    await tick();
+
+    expect(events.some((e) => e.type === 'turn-dispatched')).toBe(false);
+    expect(events.some((e) => e.type === 'cleared')).toBe(false);
+    expect(await local.storage.get('s1')).not.toBeNull();
+  });
+
   it('records stall-detected when noProgressLimit is hit (no tool use)', async () => {
     const events: Array<import('../runEvents').GoalRunEvent> = [];
     const local = makeController({ recordRunEvent: (e) => void events.push(e) });
