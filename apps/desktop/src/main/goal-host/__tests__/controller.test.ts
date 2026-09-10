@@ -6033,6 +6033,347 @@ describe('GoalController', () => {
     expect(await local.storage.get('s1')).toBeNull();
   });
 
+  it('settles a SESSION_RUNNING attempt so pause closeout is not parked forever', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    let markDispatchStarted!: () => void;
+    let rejectDispatch!: (error: Error) => void;
+    const dispatchStarted = new Promise<void>((resolve) => {
+      markDispatchStarted = resolve;
+    });
+    const pendingDispatch = new Promise<SessionSendResult>((_resolve, reject) => {
+      rejectDispatch = reject;
+    });
+    let attempts = 0;
+    vi.spyOn(local.session, 'send').mockImplementation(async (
+      message: Parameters<FakeSession['send']>[0],
+      opts: Parameters<FakeSession['send']>[1],
+    ): Promise<SessionSendResult> => {
+      const content = typeof message === 'string' ? message : message.content;
+      local.session.sends.push({ content, originKind: opts?.origin?.kind });
+      attempts += 1;
+      if (attempts === 1) {
+        opts?.onDispatching?.();
+        markDispatchStarted();
+        return pendingDispatch;
+      }
+      return { accepted: false, reason: 'cancelled-before-dispatch' };
+    });
+
+    const started = local.controller.setGoal({ sessionId: 's1', objective: 'ship it' });
+    await dispatchStarted;
+    const err = Object.assign(new Error('session still running'), { code: 'SESSION_RUNNING' });
+    rejectDispatch(err);
+    await started.catch(() => undefined);
+    await tick();
+
+    await local.controller.pauseGoal('s1');
+    await tick();
+    expect(events.some((e) => e.type === 'turn-dispatched')).toBe(false);
+    const paused = events.filter((e) => e.type === 'state-transition' && e.to === 'paused');
+    expect(paused).toHaveLength(1);
+    expect(paused[0]?.from).toBe('active');
+    // unstamped closeout: turnsUsed=0, not the tentative dispatch turnIndex
+    expect(paused[0]?.turnIndex).toBe(0);
+  });
+
+  it('flushes a parked dispatch after a failed pause then a successful clear', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    let markDispatchStarted!: () => void;
+    let releaseDispatch!: (result: SessionSendResult) => void;
+    const dispatchStarted = new Promise<void>((resolve) => {
+      markDispatchStarted = resolve;
+    });
+    const pendingDispatch = new Promise<SessionSendResult>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    vi.spyOn(local.session, 'send').mockImplementation(async (
+      message: Parameters<FakeSession['send']>[0],
+      opts: Parameters<FakeSession['send']>[1],
+    ): Promise<SessionSendResult> => {
+      const content = typeof message === 'string' ? message : message.content;
+      local.session.sends.push({ content, originKind: opts?.origin?.kind });
+      opts?.onDispatching?.();
+      markDispatchStarted();
+      return pendingDispatch;
+    });
+
+    const started = local.controller.setGoal({ sessionId: 's1', objective: 'ship it' });
+    await dispatchStarted;
+
+    const origGet = local.storage.get.bind(local.storage);
+    let releaseFinalizeGet!: (state: GoalState | null) => void;
+    const blockedFinalizeGet = new Promise<GoalState | null>((resolve) => {
+      releaseFinalizeGet = resolve;
+    });
+    let blockedFinalizeOnce = false;
+    vi.spyOn(local.storage, 'get').mockImplementation(async (sessionId: string) => {
+      if (!blockedFinalizeOnce) {
+        blockedFinalizeOnce = true;
+        return blockedFinalizeGet;
+      }
+      return origGet(sessionId);
+    });
+
+    local.session.emitGoalTurn({
+      toolUse: true,
+      verdictJson: '```json\n{"goal_status":"continue","reason":"wip"}\n```',
+      tokens: 20,
+    });
+    await vi.waitFor(() => expect(blockedFinalizeOnce).toBe(true));
+    releaseDispatch({ accepted: true });
+    await tick();
+    expect(events.some((e) => e.type === 'turn-dispatched')).toBe(false);
+
+    vi.spyOn(local.storage, 'update').mockRejectedValueOnce(new Error('pause unavailable'));
+    const pausePromise = local.controller.pauseGoal('s1');
+    await expect(pausePromise).rejects.toThrow('pause unavailable');
+
+    await local.controller.clearGoal('s1');
+    releaseFinalizeGet(await origGet('s1'));
+    await started.catch(() => undefined);
+    await tick();
+
+    const dispatched = events.filter((e) => e.type === 'turn-dispatched');
+    expect(dispatched).toHaveLength(1);
+    const cleared = events.filter((e) => e.type === 'cleared');
+    expect(cleared).toHaveLength(1);
+    expect(cleared[0]).toMatchObject({
+      lifecycleId: dispatched[0]?.lifecycleId,
+      generation: dispatched[0]?.generation,
+      turnIndex: dispatched[0]?.turnIndex,
+      reason: 'cleared by user',
+    });
+    expect(await local.storage.get('s1')).toBeNull();
+  });
+
+  it('records a committed resume before a later pause supersedes the owner', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    await local.storage.upsert(seededGoal({ status: 'paused', objective: 'resume me' }));
+
+    const origUpdate = local.storage.update.bind(local.storage);
+    let releaseUpdate!: (state: GoalState | null) => void;
+    const blockedUpdate = new Promise<GoalState | null>((resolve) => {
+      releaseUpdate = resolve;
+    });
+    let blockedOnce = false;
+    vi.spyOn(local.storage, 'update').mockImplementation(async (sessionId, patch) => {
+      if (!blockedOnce && patch.status === 'active') {
+        blockedOnce = true;
+        return blockedUpdate;
+      }
+      return origUpdate(sessionId, patch);
+    });
+
+    const resumePromise = local.controller.resumeGoal('s1');
+    await vi.waitFor(() => expect(blockedOnce).toBe(true));
+    const pausePromise = local.controller.pauseGoal('s1');
+    const resumed = await origUpdate('s1', {
+      status: 'active',
+      noProgressStreak: 0,
+      usageResetAt: null,
+      lastReason: null,
+    });
+    releaseUpdate(resumed);
+    await resumePromise;
+    await pausePromise;
+    await tick();
+
+    const resumeTransition = events.filter(
+      (e) => e.type === 'state-transition' && e.from === 'paused' && e.to === 'active',
+    );
+    expect(resumeTransition).toHaveLength(1);
+    expect(resumeTransition[0]?.reason).toBe('manual-resume');
+    const paused = events.filter((e) => e.type === 'state-transition' && e.to === 'paused');
+    expect(paused.length).toBeGreaterThanOrEqual(1);
+    expect(await local.storage.get('s1')).toMatchObject({ status: 'paused' });
+  });
+
+  it('queues a committed preflight budget closeout when a later pause supersedes the owner', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    await local.storage.upsert(seededGoal({
+      status: 'active',
+      turnsUsed: 5,
+      maxTurns: 5,
+      objective: 'preflight',
+    }));
+
+    const origUpdate = local.storage.update.bind(local.storage);
+    let releaseUpdate!: (state: GoalState | null) => void;
+    const blockedUpdate = new Promise<GoalState | null>((resolve) => {
+      releaseUpdate = resolve;
+    });
+    let blockedOnce = false;
+    vi.spyOn(local.storage, 'update').mockImplementation(async (sessionId, patch) => {
+      if (!blockedOnce && patch.status === 'budgetLimited') {
+        blockedOnce = true;
+        return blockedUpdate;
+      }
+      return origUpdate(sessionId, patch);
+    });
+
+    const started = local.controller.resumeActiveGoals();
+    await vi.waitFor(() => expect(blockedOnce).toBe(true));
+    const pausePromise = local.controller.pauseGoal('s1');
+    const limited = await origUpdate('s1', {
+      status: 'budgetLimited',
+      lastReason: 'budget limit reached',
+    });
+    releaseUpdate(limited);
+    await started;
+    await pausePromise;
+    await tick();
+
+    expect(events.find((e) => e.type === 'state-transition' && e.to === 'budgetLimited')).toMatchObject({
+      from: 'active',
+      to: 'budgetLimited',
+    });
+    expect(events.some((e) => e.type === 'budget-consumed')).toBe(true);
+    expect(events.find((e) => e.type === 'terminal')).toMatchObject({ to: 'budgetLimited' });
+  });
+
+  it('records a committed budget recovery before a later pause supersedes the owner', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    await local.storage.upsert(seededGoal({
+      status: 'budgetLimited',
+      turnsUsed: 3,
+      maxTurns: 3,
+      objective: 'raise me',
+    }));
+
+    const origUpdate = local.storage.update.bind(local.storage);
+    let releaseUpdate!: (state: GoalState | null) => void;
+    const blockedUpdate = new Promise<GoalState | null>((resolve) => {
+      releaseUpdate = resolve;
+    });
+    let blockedOnce = false;
+    vi.spyOn(local.storage, 'update').mockImplementation(async (sessionId, patch) => {
+      if (!blockedOnce && patch.status === 'active') {
+        blockedOnce = true;
+        return blockedUpdate;
+      }
+      return origUpdate(sessionId, patch);
+    });
+
+    const updatePromise = local.controller.updateGoal('s1', { maxTurns: 10 });
+    await vi.waitFor(() => expect(blockedOnce).toBe(true));
+    const pausePromise = local.controller.pauseGoal('s1');
+    const resumed = await origUpdate('s1', {
+      status: 'active',
+      lastReason: null,
+    });
+    releaseUpdate(resumed);
+    await updatePromise;
+    await pausePromise;
+    await tick();
+
+    const recovered = events.filter(
+      (e) => e.type === 'state-transition' && e.from === 'budgetLimited' && e.to === 'active',
+    );
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0]?.reason).toBe('budget limit raised');
+    expect(await local.storage.get('s1')).toMatchObject({ status: 'paused' });
+  });
+
+  it('preserves accepted ownership through a live replacement into a later pause', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    await startGoal(local);
+    await tick();
+    const dispatched = events.filter((e) => e.type === 'turn-dispatched');
+    expect(dispatched.length).toBeGreaterThanOrEqual(1);
+    const owner = {
+      lifecycleId: dispatched[0]?.lifecycleId,
+      generation: dispatched[0]?.generation,
+      turnIndex: dispatched[0]?.turnIndex,
+    };
+
+    const origUpdate = local.storage.update.bind(local.storage);
+    let releaseUpdate!: (state: GoalState | null) => void;
+    const blockedUpdate = new Promise<GoalState | null>((resolve) => {
+      releaseUpdate = resolve;
+    });
+    let blockedOnce = false;
+    vi.spyOn(local.storage, 'update').mockImplementation(async (sessionId, patch) => {
+      if (!blockedOnce && patch.objective === 'replacement objective') {
+        blockedOnce = true;
+        return blockedUpdate;
+      }
+      return origUpdate(sessionId, patch);
+    });
+
+    const replacement = local.controller.setGoal({
+      sessionId: 's1',
+      objective: 'replacement objective',
+    });
+    await vi.waitFor(() => expect(blockedOnce).toBe(true));
+    const pausePromise = local.controller.pauseGoal('s1');
+    const replaced = await origUpdate('s1', {
+      objective: 'replacement objective',
+      status: 'active',
+    });
+    releaseUpdate(replaced);
+    await replacement.catch(() => undefined);
+    await pausePromise;
+    await tick();
+
+    const paused = events.filter((e) => e.type === 'state-transition' && e.to === 'paused');
+    expect(paused.length).toBeGreaterThanOrEqual(1);
+    expect(paused[0]).toMatchObject({
+      ...owner,
+      from: 'active',
+    });
+  });
+
+  it('records a committed turn finalization before a later pause supersedes the owner', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    await startGoal(local);
+    await tick();
+
+    const origUpdate = local.storage.update.bind(local.storage);
+    let releaseUpdate!: (state: GoalState | null) => void;
+    const blockedUpdate = new Promise<GoalState | null>((resolve) => {
+      releaseUpdate = resolve;
+    });
+    let blockedOnce = false;
+    vi.spyOn(local.storage, 'update').mockImplementation(async (sessionId, patch) => {
+      if (!blockedOnce && patch.turnsUsed === 1 && patch.status !== 'paused') {
+        blockedOnce = true;
+        return blockedUpdate;
+      }
+      return origUpdate(sessionId, patch);
+    });
+
+    local.session.emitGoalTurn({
+      toolUse: true,
+      verdictJson: '```json\n{"goal_status":"continue","reason":"wip"}\n```',
+      tokens: 20,
+    });
+    await vi.waitFor(() => expect(blockedOnce).toBe(true));
+    const pausePromise = local.controller.pauseGoal('s1');
+    const finalized = await origUpdate('s1', {
+      turnsUsed: 1,
+      tokensUsed: 20,
+    });
+    releaseUpdate(finalized);
+    await pausePromise;
+    await tick();
+
+    const turnFinalized = events.filter((e) => e.type === 'turn-finalized');
+    expect(turnFinalized).toHaveLength(1);
+    expect(turnFinalized[0]).toMatchObject({
+      from: 'active',
+      to: 'active',
+      turnIndex: 1,
+    });
+    expect(await local.storage.get('s1')).toMatchObject({ status: 'paused' });
+  });
+
   it('records stall-detected when noProgressLimit is hit (no tool use)', async () => {
     const events: Array<import('../runEvents').GoalRunEvent> = [];
     const local = makeController({ recordRunEvent: (e) => void events.push(e) });

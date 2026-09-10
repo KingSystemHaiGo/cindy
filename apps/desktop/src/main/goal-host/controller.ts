@@ -669,26 +669,34 @@ export class GoalController {
     }
     const inFlight = this.goalTurnsInFlight.has(sessionId);
     const dispatchedUnclosed = boundary.auditFinalized === false;
-    if (!inFlight && !dispatchedUnclosed) return null;
-    // pending 是 tentative,不绑 closeout;accepted 或已派发未收口才绑。
-    return {
-      lifecycleId: boundary.lifecycleId,
-      generation: boundary.generation,
-      // snapshot 失败时仍要保留被中断的派发序号,不能回退成 1
-      // (Codex #2107 P1)。
-      turnIndex: boundary.dispatchTurnIndex ?? 1,
-    };
+    if (inFlight || dispatchedUnclosed) {
+      // pending 是 tentative,不绑 closeout;accepted 或已派发未收口才绑。
+      return {
+        lifecycleId: boundary.lifecycleId,
+        generation: boundary.generation,
+        // snapshot 失败时仍要保留被中断的派发序号,不能回退成 1
+        // (Codex #2107 P1)。
+        turnIndex: boundary.dispatchTurnIndex ?? 1,
+      };
+    }
+    // live setGoal 替换边界不是 cancelled,但 inherit 带走的 accepted
+    // 身份要保留; 否则后来的 pause/clear 会丢已确认派发
+    // (Codex #2107 P1: preserve accepted ownership through live replacement).
+    return boundary.interruptedDispatch ?? null;
   }
 
-  /** tentative send owner：cancelled 与 live replacement 都要穿透到真正 pending 派发。 */
+  /** tentative / parked-dispatch owner：cancelled、失败接管与 live replacement
+   * 都要穿透到真正 pending 或已 park pendingDispatch 的派发对象。 */
   private tentativeDispatchOwner(boundary: TurnAccumulator | undefined): TurnAccumulator | undefined {
     if (!boundary) return undefined;
-    if (boundary.dispatchAcceptance === 'pending') return boundary;
+    if (boundary.dispatchAcceptance === 'pending' || boundary.pendingDispatch) return boundary;
     const inherited = boundary.tentativeDispatch;
     if (!inherited || inherited === boundary) return undefined;
     // live setGoal 替换边界不是 cancelled、也没有 own-pending,
     // 仍要跟着继承来的 owner, 否则 pause/clear 再接管会把
     // late accepted 钉在不可达的旧边界 (Codex #2107 P1)。
+    // 失败的 pause 只继承了 identity 时,重叠 clear 也必须拿到原 accumulator
+    // 才能 flush parked turn-dispatched (Codex #2107 P1)。
     return this.tentativeDispatchOwner(inherited) ?? inherited;
   }
 
@@ -1154,6 +1162,9 @@ export class GoalController {
           editBoundary,
           existing,
         );
+        // 旧派发 closeout 已入队/兑现,不能让后续 pause 再把新目标的
+        // 迁移钉到已收口的旧 accepted owner 上。
+        editBoundary.interruptedDispatch = undefined;
         this.resetTurn(sessionId);
         const activeBoundary = this.turns.get(sessionId);
         this.attachListener(sessionId);
@@ -1479,14 +1490,20 @@ export class GoalController {
             updatedAt: this.now(),
           }),
         );
-        if (this.turns.get(sessionId) !== resumeBoundary) return reconcileLifecycleChange();
         if (resumed) {
           next = resumed;
+          // persist 已提交就必须记恢复迁移,哪怕后来的 pause/clear 已换 owner
+          // (Codex #2107 P2: record committed budget recovery before stale-owner return)。
           this.recordRunEvent('state-transition', sessionId, resumed, {
             from: 'budgetLimited',
             to: 'active',
             reason: 'budget limit raised',
+            lifecycleId: resumeBoundary.lifecycleId,
+            generation: resumeBoundary.generation,
           });
+        }
+        if (this.turns.get(sessionId) !== resumeBoundary) return reconcileLifecycleChange();
+        if (resumed) {
           this.resetTurn(sessionId);
           await this.deps.ensureSession(sessionId);
           if (this.turns.get(sessionId) !== resumeBoundary) return reconcileLifecycleChange();
@@ -1883,7 +1900,6 @@ export class GoalController {
       }
       throw error;
     }
-    if (this.turns.get(sessionId) !== lookupBoundary) return;
     if (!updated) {
       if (!opts?.auto) {
         this.cancelDeferredManualResume(sessionId, { restoreUsageResume: true });
@@ -1893,6 +1909,19 @@ export class GoalController {
       }
       return;
     }
+    // persist 已提交就必须记 resume 迁移,哪怕后来的 pause/clear 已换 owner
+    // (Codex #2107 P1: record committed resumes before the stale-owner return)。
+    // 显式钉 lookup 身份,不能从 this.turns 读到后来的 pause/clear 边界。
+    if ((state.status as string) !== 'active') {
+      this.recordRunEvent('state-transition', sessionId, updated, {
+        from: state.status,
+        to: 'active',
+        reason: opts?.auto ? 'auto-resume' : 'manual-resume',
+        lifecycleId: lookupBoundary.lifecycleId,
+        generation: lookupBoundary.generation,
+      });
+    }
+    if (this.turns.get(sessionId) !== lookupBoundary) return;
     if (!opts?.auto) this.completeDeferredManualResume(sessionId);
     // usageLimited 的 reset timer 必须活到 active 写真正提交；否则 deferred Resume 在
     // close/replacement 或持久化失败前被取消时，会同时失去手动意图和唯一自动恢复机会。
@@ -1907,13 +1936,6 @@ export class GoalController {
     this.turns.set(sessionId, resumedBoundary);
     this.attachListener(sessionId);
     this.emit(updated);
-    if ((state.status as string) !== 'active') {
-      this.recordRunEvent('state-transition', sessionId, updated, {
-        from: state.status,
-        to: 'active',
-        reason: opts?.auto ? 'auto-resume' : 'manual-resume',
-      });
-    }
     if (!this.isBusy(sessionId)) {
       this.pendingResumeEvents.set(sessionId, {
         reason: opts?.auto ? 'auto-resume' : 'manual-resume',
@@ -2679,14 +2701,20 @@ export class GoalController {
         }
       },
     );
-    if (!isCurrentTurn()) return;
-    if (updated) this.emit(updated);
+    if (updated && isCurrentTurn()) this.emit(updated);
 
+    const finalizeIdentity = {
+      generation,
+      lifecycleId: turn.lifecycleId,
+    };
+    // persist 已提交就必须记收口,哪怕后来的 pause/clear 已换 owner
+    // (Codex #2107 P1: record committed turn finalization before stale-owner return)。
     if (origin === 'goal') {
       this.recordRunEvent('turn-finalized', sessionId, postDecisionCounts, {
         from: state.status,
         to: status,
         reason: lastReason,
+        ...finalizeIdentity,
       });
       turn.auditFinalized = true;
       this.flushPendingDispatch(sessionId, turn);
@@ -2696,6 +2724,7 @@ export class GoalController {
         from: state.status,
         to: status,
         reason: lastReason,
+        ...finalizeIdentity,
       });
     }
     if (
@@ -2709,6 +2738,7 @@ export class GoalController {
         from: state.status,
         to: 'paused',
         reason: lastReason,
+        ...finalizeIdentity,
       });
     }
     if (origin === 'goal' && status === 'budgetLimited') {
@@ -2716,14 +2746,18 @@ export class GoalController {
         from: state.status,
         to: 'budgetLimited',
         reason: lastReason,
+        ...finalizeIdentity,
       });
       this.recordRunEvent('terminal', sessionId, postDecisionCounts, {
         to: 'budgetLimited',
         reason: lastReason,
+        ...finalizeIdentity,
       });
       turn.auditFinalized = true;
       this.flushPendingDispatch(sessionId, turn);
     }
+
+    if (!isCurrentTurn()) return;
 
     this.resetTurn(sessionId);
 
@@ -3056,23 +3090,12 @@ export class GoalController {
           updatedAt: this.now(),
         }),
       );
-      if (!isCurrentLifecycle()) return;
       if (limited) {
-        this.recordRunEvent('state-transition', sessionId, limited, {
-          from: state.status,
-          to: 'budgetLimited',
-          reason: limited.lastReason,
-        });
-        this.recordRunEvent('budget-consumed', sessionId, limited, {
-          from: state.status,
-          to: 'budgetLimited',
-          reason: limited.lastReason,
-        });
-        this.recordRunEvent('terminal', sessionId, limited, {
-          to: 'budgetLimited',
-          reason: limited.lastReason,
-        });
+        // persist 已提交就必须入队,哪怕后来的 pause/clear 已换 owner
+        // (Codex #2107 P1: settle committed preflight limits before the owner check)。
+        this.settleBudgetLimitCloseout(sessionId, lifecycleBoundary, limited, state.status);
       }
+      if (!isCurrentLifecycle()) return;
       this.stopSession(sessionId);
       if (limited) this.emit(limited);
       return;
@@ -3379,12 +3402,13 @@ export class GoalController {
       }
       this.deps.logger.warn('[goal] fireTurn send failed', { sessionId, kind, error: String(e) });
       if ((e as { code?: unknown } | null)?.code === 'SESSION_RUNNING') {
-        // dispatch 前的窄 race；现有 turn 的终态会暂停 Goal，空闲检查则负责稍后重试。
+        // wrapper 可在 await handle.send 前调 onDispatching,这次派发已结束。
+        // 必须先清 tentative,否则 pause/clear 会把 closeout park 到永远等不到的 acceptance
+        // (Codex #2107 P1: settle SESSION_RUNNING attempts before scheduling retry)。
+        this.settleUnacceptedDispatch(sessionId, dispatchBoundary);
         if (isCurrentFailure()) {
           this.scheduleContinuation(sessionId);
-          return;
         }
-        this.settleUnacceptedDispatch(sessionId, dispatchBoundary);
         return;
       }
       // stale send 抛错时 owner 可能已被 pause/clear 换掉;仍必须清 tentative
