@@ -374,6 +374,13 @@ interface TurnAccumulator {
   /** onDispatching 时的 1-based 派发序号(turnsUsed+1)。clear/pause/replace
    * 的 closeout 用它,不依赖随后可能失败的 storage.get 快照。 */
   dispatchTurnIndex?: number;
+  /** 被中断派发的 owner。cancelled 边界继承它,重叠 Stop 仍能 closeout
+   * 原 dispatch 而不是新 lifecycle (Codex #2107 P1)。 */
+  interruptedDispatch?: {
+    lifecycleId: string;
+    generation: number;
+    turnIndex: number;
+  };
   /** 生命周期唯一 id(freshTurn 生成,跨换代不变;generation 重置为 0 时仍可
    * 区分生命周期——事件排序/配对以此为准)。 */
   lifecycleId: string;
@@ -613,7 +620,10 @@ export class GoalController {
     sessionId: string,
     boundary: TurnAccumulator | undefined,
   ): { lifecycleId: string; generation: number; turnIndex: number } | null {
-    if (!boundary || boundary.cancelled) return null;
+    if (!boundary) return null;
+    // 重叠 Stop:前一次 pause/clear 已换成 cancelled owner,二次 Stop 必须
+    // 继承原 dispatch,不能因 cancelled 直接丢 (Codex #2107 P1)。
+    if (boundary.cancelled) return boundary.interruptedDispatch ?? null;
     const inFlight = this.goalTurnsInFlight.has(sessionId);
     const dispatchedUnclosed = boundary.auditFinalized === false;
     if (!inFlight && !dispatchedUnclosed) return null;
@@ -1305,6 +1315,7 @@ export class GoalController {
       previousBoundary?.pendingPersistence ?? null,
       previousBoundary?.pendingCompletion ?? null,
     );
+    if (interruptedDispatch) clearBoundary.interruptedDispatch = interruptedDispatch;
     this.turns.set(sessionId, clearBoundary);
     if (hasActiveGoalTurn) {
       try {
@@ -1377,6 +1388,7 @@ export class GoalController {
       previousBoundary?.pendingPersistence ?? null,
       previousBoundary?.pendingCompletion ?? null,
     );
+    if (interruptedDispatch) pauseBoundary.interruptedDispatch = interruptedDispatch;
     this.turns.set(sessionId, pauseBoundary);
     await this.awaitPendingPersistence(pauseBoundary);
     if (this.turns.get(sessionId) !== pauseBoundary) return;
@@ -2965,7 +2977,15 @@ export class GoalController {
           currentOwner !== dispatchBoundary &&
           !currentOwner.cancelled;
         if (replacedByNewLiveOwner || this.disposed) return;
-        if (dispatchBoundary?.finalized === true && dispatchBoundary?.auditFinalized !== true) {
+        // 只有当前 owner 仍是本派发 boundary 时才挂起等 finalizeTurn flush。
+        // pause/clear 已换成 cancelled owner 后,finalizer 会 isCurrentTurn 失败,
+        // 挂在退休 boundary 上的 pendingDispatch 永远不会 flush
+        // (Codex #2107 P1: flush late accepted after cancellation)。
+        if (
+          currentOwner === dispatchBoundary &&
+          dispatchBoundary?.finalized === true &&
+          dispatchBoundary?.auditFinalized !== true
+        ) {
           dispatchBoundary.pendingDispatch = {
             generation: dispatchGeneration,
             lifecycleId: dispatchBoundary?.lifecycleId,

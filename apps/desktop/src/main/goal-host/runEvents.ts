@@ -104,7 +104,10 @@ export function createRunEventRecorder(limit = 200, sink?: RunEventSink): GoalRu
       //     同代不证明同生命周期;新 run 的 turnIndex 小于旧 run 的 terminal,
       //     不得把"新 run 开始"排到"旧 run 结束"之前);
       //  3. 同 at 且仍相等时,派发类(resumed/turn-dispatched)在收口类之前;
-      //  4. 其余按显式插入序号(不依赖引擎 sort 稳定性,插入序 = 落环序)。
+      //  4. 同 at 先按 session 组(该 timestamp 下该 session 最早插入序)全序,
+      //     组内再按 lifecycle 序号;禁止 pairwise 混用 lifecycle/插入序
+      //     (否则 A:g3,B,A:g1 会成环,V8 可能把新 A 排到旧 terminal 前)。
+      //  5. 其余按显式插入序号(不依赖引擎 sort 稳定性,插入序 = 落环序)。
       const dispatchGroup = new Set(['resumed', 'turn-dispatched']);
       // 收口类:所有派发后的终态/迁移/停滞事件都排在派发类之后(同毫秒全序,
       // state-transition/budget-consumed/stall-detected 也必须 phase 后置)。
@@ -131,15 +134,28 @@ export function createRunEventRecorder(limit = 200, sink?: RunEventSink): GoalRu
       // 才算收口类(Codex P1)。
       const isCloseout = (evt: GoalRunEvent): boolean =>
         evt.type === 'state-transition' ? evt.to !== 'active' : closeoutGroup.has(evt.type);
-      return ring
-        .map((evt, idx) => ({
-          _seq: idx,
-          ...evt,
-          budget: evt.budget ? { ...evt.budget } : undefined,
-        }))
+      const indexed = ring.map((evt, idx) => ({
+        _seq: idx,
+        ...evt,
+        budget: evt.budget ? { ...evt.budget } : undefined,
+      }));
+      // 每个 timestamp 一份全序:session 组秩 = 该 at 下该 session 最早 _seq。
+      // 先比组秩再比 lifecycle,传递、无环 (Codex #2107 P1)。
+      const sessionRankAt = new Map<string, number>();
+      for (const evt of indexed) {
+        const key = `${evt.at ?? 0}\0${evt.goalSessionId}`;
+        const prev = sessionRankAt.get(key);
+        if (prev === undefined || evt._seq < prev) sessionRankAt.set(key, evt._seq);
+      }
+      return indexed
         .sort((a, b) => {
           const byAt = (a.at ?? 0) - (b.at ?? 0);
           if (byAt !== 0) return byAt;
+          const aRank = sessionRankAt.get(`${a.at ?? 0}\0${a.goalSessionId}`) ?? a._seq;
+          const bRank = sessionRankAt.get(`${b.at ?? 0}\0${b.goalSessionId}`) ?? b._seq;
+          if (aRank !== bRank) return aRank - bRank;
+          const byLifecycle = lifecycleSeqOf(a.lifecycleId) - lifecycleSeqOf(b.lifecycleId);
+          if (byLifecycle !== 0) return byLifecycle;
           // 同 at 且同 lifecycleId(同生命周期)用 turnIndex 与派发/收口类型次序。
           if (a.lifecycleId && a.lifecycleId === b.lifecycleId) {
             const byTurn = a.turnIndex - b.turnIndex;
@@ -151,12 +167,6 @@ export function createRunEventRecorder(limit = 200, sink?: RunEventSink): GoalRu
             const bF = isCloseout(b);
             if (aD && bF) return -1;
             if (aF && bD) return 1;
-          }
-          // 同 at 且同 session 的跨生命周期:按生命周期序号先后(旧 run 先落)。
-          // 不同 session 保持插入序,不用全局 gN。
-          if (a.goalSessionId && a.goalSessionId === b.goalSessionId) {
-            const byLifecycle = lifecycleSeqOf(a.lifecycleId) - lifecycleSeqOf(b.lifecycleId);
-            if (byLifecycle !== 0) return byLifecycle;
           }
           // 显式插入序号作最终 tie-breaker(规范不保证 sort 稳定)。
           return a._seq - b._seq;

@@ -124,4 +124,32 @@ describe('createRunEventRecorder', () => {
     expect(rec.snapshot().map((e) => e.lifecycleId)).toEqual(['g1', 'g2']);
     expect(rec.snapshot().map((e) => e.type)).toEqual(['terminal', 'turn-dispatched']);
   });
+
+  it('keeps a transitive order when two A lifecycles interleave with session B at the same timestamp', () => {
+    const rec = createRunEventRecorder();
+    rec.record(evt({
+      type: 'turn-dispatched',
+      goalSessionId: 'a',
+      lifecycleId: 'g3',
+      turnIndex: 1,
+      at: 1000,
+    }));
+    rec.record(evt({
+      type: 'turn-dispatched',
+      goalSessionId: 'b',
+      lifecycleId: 'g2',
+      turnIndex: 1,
+      at: 1000,
+    }));
+    rec.record(evt({
+      type: 'terminal',
+      goalSessionId: 'a',
+      lifecycleId: 'g1',
+      turnIndex: 4,
+      to: 'complete',
+      at: 1000,
+    }));
+    expect(rec.snapshot().map((e) => e.lifecycleId)).toEqual(['g1', 'g3', 'g2']);
+    expect(rec.snapshot().map((e) => e.goalSessionId)).toEqual(['a', 'a', 'b']);
+  });
 });

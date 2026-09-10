@@ -3981,6 +3981,45 @@ describe('GoalController', () => {
     });
   });
 
+  it('keeps the interrupted dispatch owner when clear overlaps an in-flight pause', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    await startGoal(local);
+    await tick();
+    const dispatched = events.filter((e) => e.type === 'turn-dispatched');
+    expect(dispatched.length).toBeGreaterThanOrEqual(1);
+    const dispatch = dispatched[0]!;
+
+    const origGet = local.storage.get.bind(local.storage);
+    let releaseGet!: (state: GoalState | null) => void;
+    const blockedGet = new Promise<GoalState | null>((resolve) => {
+      releaseGet = resolve;
+    });
+    let blockedOnce = false;
+    vi.spyOn(local.storage, 'get').mockImplementation(async (sessionId: string) => {
+      if (!blockedOnce) {
+        blockedOnce = true;
+        return blockedGet;
+      }
+      return origGet(sessionId);
+    });
+
+    const pausePromise = local.controller.pauseGoal('s1');
+    await vi.waitFor(() => expect(blockedOnce).toBe(true));
+    await local.controller.clearGoal('s1');
+    releaseGet(await origGet('s1'));
+    await pausePromise;
+
+    const cleared = events.filter((e) => e.type === 'cleared');
+    expect(cleared).toHaveLength(1);
+    expect(cleared[0]).toMatchObject({
+      lifecycleId: dispatch.lifecycleId,
+      generation: dispatch.generation,
+      turnIndex: dispatch.turnIndex,
+      reason: 'cleared by user',
+    });
+  });
+
   it('emits a replacement closeout for an in-flight Goal when setGoal edits the objective', async () => {
     const events: Array<import('../runEvents').GoalRunEvent> = [];
     const local = makeController({ recordRunEvent: (e) => void events.push(e) });
@@ -4759,6 +4798,69 @@ describe('GoalController', () => {
     const oldLifecycle = closeout[0]?.lifecycleId;
     expect(oldLifecycle).toBeTruthy();
     expect(events.filter((e) => e.type === 'turn-dispatched' && e.lifecycleId === oldLifecycle)).toHaveLength(0);
+  });
+
+  it('records turn-dispatched when accepted returns after clear during finalize', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    let markDispatchStarted!: () => void;
+    let releaseDispatch!: (result: SessionSendResult) => void;
+    const dispatchStarted = new Promise<void>((resolve) => {
+      markDispatchStarted = resolve;
+    });
+    const pendingDispatch = new Promise<SessionSendResult>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    vi.spyOn(local.session, 'send').mockImplementation(async (
+      message: Parameters<FakeSession['send']>[0],
+      opts: Parameters<FakeSession['send']>[1],
+    ): Promise<SessionSendResult> => {
+      const content = typeof message === 'string' ? message : message.content;
+      local.session.sends.push({ content, originKind: opts?.origin?.kind });
+      opts?.onDispatching?.();
+      markDispatchStarted();
+      return pendingDispatch;
+    });
+
+    const started = local.controller.setGoal({ sessionId: 's1', objective: 'ship it' });
+    await dispatchStarted;
+
+    const origGet = local.storage.get.bind(local.storage);
+    let releaseGet!: (state: GoalState | null) => void;
+    const blockedGet = new Promise<GoalState | null>((resolve) => {
+      releaseGet = resolve;
+    });
+    let blockedOnce = false;
+    vi.spyOn(local.storage, 'get').mockImplementation(async (sessionId: string) => {
+      if (!blockedOnce) {
+        blockedOnce = true;
+        return blockedGet;
+      }
+      return origGet(sessionId);
+    });
+
+    local.session.emitGoalTurn({
+      toolUse: true,
+      verdictJson: '```json\n{"goal_status":"continue","reason":"wip"}\n```',
+      tokens: 20,
+    });
+    await vi.waitFor(() => expect(blockedOnce).toBe(true));
+
+    await local.controller.clearGoal('s1');
+    releaseGet(await origGet('s1'));
+    releaseDispatch({ accepted: true });
+    await started.catch(() => undefined);
+    await tick();
+
+    const dispatched = events.filter((e) => e.type === 'turn-dispatched');
+    const cleared = events.filter((e) => e.type === 'cleared');
+    expect(dispatched).toHaveLength(1);
+    expect(cleared).toHaveLength(1);
+    expect(dispatched[0]).toMatchObject({
+      lifecycleId: cleared[0]?.lifecycleId,
+      generation: cleared[0]?.generation,
+      turnIndex: cleared[0]?.turnIndex,
+    });
   });
 
   it('records stall-detected when noProgressLimit is hit (no tool use)', async () => {
