@@ -45,6 +45,25 @@ const META_FILENAME = 'meta.json';
 const SHARD_EXT = '.md';
 const SLUG_REGEX = /^[a-z0-9_-]+$/;
 
+/** MEMORY.md 落盘用的 MCP 检索工具名。索引跨 harness 共享,不能按会话写死 Pi 名。 */
+export const MEMORY_INDEX_SEARCH_HINT_MCP = 'memory_search';
+/** Pi Bot facade 实际暴露的检索调用。仅在 prompt 注入时替换,不写回磁盘。 */
+export const MEMORY_INDEX_SEARCH_HINT_PI = 'bot_memory(action:"search")';
+
+/**
+ * 把 MEMORY.md 里的 MCP 检索提示改成当前 harness 实际暴露的工具。
+ * 磁盘仍写 memory_search; Pi 会话注入时替换,避免模型去调被隐藏的 cindy_memory。
+ */
+export function adaptMemoryIndexForHarness(
+  index: string,
+  harness: 'pi' | 'mcp' | string | undefined,
+): string {
+  if (harness !== 'pi') return index;
+  const mcpHint = `更早的内容用 ${MEMORY_INDEX_SEARCH_HINT_MCP} 检索`;
+  const piHint = `更早的内容用 ${MEMORY_INDEX_SEARCH_HINT_PI} 检索`;
+  return index.split(mcpHint).join(piHint);
+}
+
 /**
  * 把 workdir 绝对路径转成 sanitize 后的目录名 (Claude Code 风格)。
  *  E:\AIWork\xdt-maker  → 'E--AIWork-xdt-maker'
@@ -500,7 +519,8 @@ export class MemoryStorage {
         lines.push('');
       }
       // moment 分区: 仅 bot scope 渲染 (indexOptions.momentMaxEntries 存在), 按
-      // occurredAt 降序取最近 N 条; 更早的仍可 memory_search 检索, 不丢历史。
+      // occurredAt 降序取最近 N 条; 更早的仍可检索, 不丢历史。磁盘提示写 MCP 工具名
+      // memory_search; Pi 注入时由 adaptMemoryIndexForHarness 改写成 bot_memory。
       // 全局 scope 永不渲染 moment —— 这是 Bot Memory 与全局 Maker Memory 的索引隔离
       // (cindy-bots-runtime.md 红线; #4124 maintainer 建议的「有限最近 + 检索提示」)。
       const momentMaxEntries = this.indexOptions?.momentMaxEntries;
@@ -517,7 +537,7 @@ export class MemoryStorage {
             lines.push(`- [${r.filename}] ${r.frontmatter.title} — ${r.frontmatter.description}（${day}）`);
           }
           if (sortedMoments.length > maxEntries) {
-            lines.push(`_(仅显示最近 ${maxEntries} 条时刻; 更早的内容用 memory_search 检索)_`);
+            lines.push(`_(仅显示最近 ${maxEntries} 条时刻; 更早的内容用 ${MEMORY_INDEX_SEARCH_HINT_MCP} 检索)_`);
           }
           lines.push('');
         }

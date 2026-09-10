@@ -160,7 +160,7 @@ export interface MemoryConfig {
   maxTitleLen: number;
   /** slug 最大长度, 默认 64 */
   maxSlugLen: number;
-  /** bot scope MEMORY.md 的 moment 分区最多展示条数 (更早的用 memory_search), 默认 10 */
+  /** bot scope MEMORY.md 的 moment 分区最多展示条数 (更早的走记忆检索), 默认 10 */
   maxMomentIndexEntries: number;
   /** sourceSession 长度上限, 默认 120 */
   maxSourceSessionLen: number;

@@ -1,5 +1,5 @@
 import { and, desc, eq, inArray } from 'drizzle-orm';
-import { buildBotMemoryScopeKey } from '@cindy/maker-core';
+import { adaptMemoryIndexForHarness, buildBotMemoryScopeKey } from '@cindy/maker-core';
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 
@@ -590,7 +590,7 @@ export async function hydrateBotProfileRuntime(
     botMemoryIndex = botMemory.status === 'fulfilled' ? botMemory.value : null;
     opts.makerMemoryIndexSnapshot = formatMemorySnapshot(
       'Bot Memory',
-      botMemoryIndex ?? '',
+      adaptMemoryIndexForHarness(botMemoryIndex ?? '', opts.agentKind),
       opts.agentKind === 'pi'
         ? 'This is the only durable memory for this Bot. Use the direct `bot_memory` tool.'
         : 'This is the only durable memory for this Bot. Memory tools operate only on this Bot Home.',

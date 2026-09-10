@@ -453,6 +453,15 @@ describe('settings changes preserve independently joined capabilities', () => {
   it('does not resend capability selections when only the name changes', () => {
     expect(botSettingsChanges(payload(), payload({ name: 'Updated' }))).toEqual({ name: 'Updated' });
   });
+  it('does not send style:null when an unset style is still unset', () => {
+    expect(botSettingsChanges(payload({ style: null }), payload({ name: 'Updated', style: null }), true)).toEqual({
+      name: 'Updated',
+    });
+    expect(botSettingsChanges(payload(), payload({ name: 'Updated', style: null }), true)).toEqual({ name: 'Updated' });
+    expect(botSettingsChanges(payload({ style: { tone: 'warm' } }), payload({ name: 'Updated', style: { tone: 'warm' } }), true)).toEqual({
+      name: 'Updated',
+    });
+  });
   it('updates only the selected capability group', () => {
     expect(botSettingsChanges(payload(), payload({ capabilities: capabilities({ mcpServers: ['docs'] }) }))).toEqual({ capabilities: { mcpServers: ['docs'] } });
   });

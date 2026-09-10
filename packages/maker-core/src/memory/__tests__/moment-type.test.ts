@@ -13,7 +13,12 @@ import path from 'node:path';
 import DatabaseCtor from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { MemoryStorage } from '../storage.js';
+import {
+  adaptMemoryIndexForHarness,
+  MEMORY_INDEX_SEARCH_HINT_MCP,
+  MEMORY_INDEX_SEARCH_HINT_PI,
+  MemoryStorage,
+} from '../storage.js';
 import { MakerMemoryStore } from '../store.js';
 import {
   BOT_ONLY_MEMORY_TYPES,
@@ -129,7 +134,7 @@ describe('bot scope 的 moment 写入', () => {
     }
   });
 
-  it('moment 分区有条数上限, 超出时提示用 memory_search 检索更早内容', async () => {
+  it('moment 分区有条数上限, 超出时提示用记忆检索更早内容', async () => {
     const { store, db } = createStore(true, { maxMomentIndexEntries: 2 });
     try {
       for (const [name, date] of [
@@ -143,7 +148,11 @@ describe('bot scope 的 moment 写入', () => {
       expect(index).toContain('moment_m3.md');
       expect(index).toContain('moment_m2.md');
       expect(index).not.toContain('moment_m1.md');
-      expect(index).toContain('memory_search');
+      expect(index).toContain(MEMORY_INDEX_SEARCH_HINT_MCP);
+      expect(index).not.toContain(MEMORY_INDEX_SEARCH_HINT_PI);
+      expect(adaptMemoryIndexForHarness(index, 'pi')).toContain(MEMORY_INDEX_SEARCH_HINT_PI);
+      expect(adaptMemoryIndexForHarness(index, 'pi')).not.toContain(MEMORY_INDEX_SEARCH_HINT_MCP);
+      expect(adaptMemoryIndexForHarness(index, 'claude')).toContain(MEMORY_INDEX_SEARCH_HINT_MCP);
     } finally {
       db.close();
     }
