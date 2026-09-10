@@ -121,6 +121,62 @@ describe('planLegacyShardMigration — 计划生成', () => {
     }
   });
 
+  it('分片目录 readdir EACCES → plan.failed dir-read-failure, 不进 emptyToDelete (Codex 3975030334)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const worktree = path.join(tmpRoot, 'repo-wt');
+    const wtDir = sanitizeWorkdir(worktree);
+    const dir = await makeShard(wtDir, { absPath: worktree, files: { 'feedback_a.md': 'keep' } });
+    const origReaddir = fs.readdir.bind(fs);
+    // @ts-expect-error 测试注入
+    fs.readdir = async (p: string, ...rest: unknown[]) => {
+      if (typeof p === 'string' && p === dir) {
+        throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+      }
+      return origReaddir(p, ...rest);
+    };
+    try {
+      const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+      expect(plan.emptyToDelete).toHaveLength(0);
+      expect(plan.mergeCandidates).toHaveLength(0);
+      expect(plan.all).toHaveLength(0);
+      expect(plan.failed).toHaveLength(1);
+      expect(plan.failed[0].dir).toBe(dir);
+      expect(plan.failed[0].skipReason).toBe('dir-read-failure:EACCES');
+      const apply = summarizeApplyMigration(plan, { results: [], conflicts: [] });
+      expect(apply.ok).toBe(false);
+      expect(await fs.readFile(path.join(dir, 'feedback_a.md'), 'utf8')).toContain('keep');
+    } finally {
+      fs.readdir = origReaddir;
+    }
+  });
+
+  it('过期 emptyToDelete 在 apply 时 readdir 失败 → 不 trash 分片 (Codex 3975030334)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const worktree = path.join(tmpRoot, 'repo-wt');
+    const wtDir = sanitizeWorkdir(worktree);
+    const dir = await makeShard(wtDir, { absPath: worktree });
+    const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+    expect(plan.emptyToDelete).toHaveLength(1);
+    const origReaddir = fs.readdir.bind(fs);
+    // @ts-expect-error 测试注入
+    fs.readdir = async (p: string, ...rest: unknown[]) => {
+      if (typeof p === 'string' && p === dir) {
+        throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+      }
+      return origReaddir(p, ...rest);
+    };
+    try {
+      const result = await runLegacyShardMigration(plan);
+      expect(result.results).toHaveLength(1);
+      expect(result.results[0].action).toBe('skipped');
+      expect(result.results[0].error).toMatch(/EACCES/);
+      await expect(fs.stat(path.join(dir, 'meta.json'))).resolves.toBeTruthy();
+      expect(summarizeApplyMigration(plan, result).ok).toBe(false);
+    } finally {
+      fs.readdir = origReaddir;
+    }
+  });
+
   it('worktree 分片 (目录名 ≠ canonical) 归入 merge/empty, 主仓分片跳过', async () => {
     const mainRepo = path.join(tmpRoot, 'repo');
     const worktree = path.join(tmpRoot, 'repo-wt');
@@ -260,6 +316,75 @@ describe('planLegacyShardMigration — 计划生成', () => {
     expect(result.results[0].error).toBe('symlink-shard-file');
     expect((await fs.lstat(path.join(dir, 'feedback_a.md'))).isSymbolicLink()).toBe(true);
     expect(summarizeApplyMigration(plan, result).ok).toBe(false);
+  });
+
+  it('meta.json 是 symlink → skipped, 规划不跟随、apply 不改根外 (Codex 3975030337)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const worktree = path.join(tmpRoot, 'repo-wt');
+    const wtDir = sanitizeWorkdir(worktree);
+    const dir = await makeShard(wtDir, { absPath: worktree, files: { 'feedback_a.md': 'keep' } });
+    const outside = path.join(tmpRoot, 'outside-meta.json');
+    const original = await fs.readFile(path.join(dir, 'meta.json'), 'utf8');
+    await fs.writeFile(outside, original, 'utf8');
+    await fs.rm(path.join(dir, 'meta.json'));
+    try {
+      await fs.symlink(outside, path.join(dir, 'meta.json'));
+    } catch {
+      return;
+    }
+    const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+    expect(plan.skipped.find((s) => s.dir === dir)?.skipReason).toBe('symlink-system-file');
+    expect(plan.mergeCandidates).toHaveLength(0);
+    expect(plan.emptyToDelete).toHaveLength(0);
+    expect(plan.all).toHaveLength(0);
+    expect(await fs.readFile(outside, 'utf8')).toBe(original);
+    expect((await fs.lstat(path.join(dir, 'meta.json'))).isSymbolicLink()).toBe(true);
+  });
+
+  it('过期 plan 的 meta.json 换成 symlink → apply 拒绝 updateMeta (Codex 3975030337)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const worktree = path.join(tmpRoot, 'repo-wt');
+    const wtDir = sanitizeWorkdir(worktree);
+    const dir = await makeShard(wtDir, { absPath: worktree, files: { 'feedback_a.md': 'keep' } });
+    const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+    expect(plan.mergeCandidates).toHaveLength(1);
+    const outside = path.join(tmpRoot, 'outside-stale-meta.json');
+    const original = await fs.readFile(path.join(dir, 'meta.json'), 'utf8');
+    await fs.writeFile(outside, original, 'utf8');
+    await fs.rm(path.join(dir, 'meta.json'));
+    try {
+      await fs.symlink(outside, path.join(dir, 'meta.json'));
+    } catch {
+      return;
+    }
+    const result = await runLegacyShardMigration(plan);
+    expect(result.results).toHaveLength(1);
+    expect(result.results[0].action).toBe('skipped');
+    expect(result.results[0].error).toBe('symlink-system-file');
+    expect(JSON.parse(await fs.readFile(outside, 'utf8')).absPath).toBe(worktree);
+    expect(summarizeApplyMigration(plan, result).ok).toBe(false);
+  });
+
+  it('canonical MEMORY.md 是 symlink → skipped, rebuildIndex 不跟随 (Codex 3975030337)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const worktree = path.join(tmpRoot, 'repo-wt');
+    const mainDir = sanitizeWorkdir(mainRepo);
+    const wtDir = sanitizeWorkdir(worktree);
+    await makeShard(mainDir, { absPath: mainRepo, files: { 'feedback_keep.md': 'keep' } });
+    await makeShard(wtDir, { absPath: worktree, files: { 'feedback_a.md': 'legacy' } });
+    const outside = path.join(tmpRoot, 'outside-MEMORY.md');
+    await fs.writeFile(outside, 'index-outside', 'utf8');
+    const memPath = path.join(memoryRoot, mainDir, 'MEMORY.md');
+    try {
+      await fs.rm(memPath, { force: true });
+      await fs.symlink(outside, memPath);
+    } catch {
+      return;
+    }
+    const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+    expect(plan.skipped.find((s) => s.dir.endsWith(wtDir))?.skipReason).toBe('symlink-system-file');
+    expect(plan.mergeCandidates).toHaveLength(0);
+    expect(await fs.readFile(outside, 'utf8')).toBe('index-outside');
   });
 
   it('过期 plan 把 symlink 当分片 → apply 仍拒绝 rename (Codex 3974113763)', async () => {
@@ -444,6 +569,58 @@ describe('runLegacyShardMigration — 执行', () => {
     await expect(fs.stat(path.join(target, 'fts.db-wal'))).rejects.toThrow();
     // 分片文件仍在
     expect(await fs.readFile(path.join(target, 'feedback_a.md'), 'utf8')).toContain('X');
+  });
+
+  it('慢路径合并后丢弃 canonical stale fts.db (Codex 3975030344)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const worktree = path.join(tmpRoot, 'repo-wt');
+    const mainDir = sanitizeWorkdir(mainRepo);
+    const wtDir = sanitizeWorkdir(worktree);
+    const mainPath = await makeShard(mainDir, {
+      absPath: mainRepo,
+      files: { 'feedback_a.md': 'keep' },
+    });
+    await makeShard(wtDir, { absPath: worktree, files: { 'project_b.md': 'new' } });
+    await fs.writeFile(path.join(mainPath, 'fts.db'), Buffer.from('stale-fts'));
+    await fs.writeFile(path.join(mainPath, 'fts.db-wal'), Buffer.from('wal'));
+    const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+    const result = await runLegacyShardMigration(plan);
+    expect(result.results[0].action).toBe('merged');
+    expect(result.results[0].error).toBeUndefined();
+    const target = path.join(memoryRoot, mainDir);
+    await expect(fs.stat(path.join(target, 'fts.db'))).rejects.toThrow();
+    await expect(fs.stat(path.join(target, 'fts.db-wal'))).rejects.toThrow();
+    expect(await fs.readFile(path.join(target, 'project_b.md'), 'utf8')).toContain('new');
+    await expect(fs.stat(path.join(memoryRoot, wtDir))).rejects.toThrow();
+    expect(summarizeApplyMigration(plan, result).ok).toBe(true);
+  });
+
+  it('慢路径 stale fts.db rm 失败 → merged 带 error, 不删源 (Codex 3975030344)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const worktree = path.join(tmpRoot, 'repo-wt');
+    const mainDir = sanitizeWorkdir(mainRepo);
+    const wtDir = sanitizeWorkdir(worktree);
+    const mainPath = await makeShard(mainDir, {
+      absPath: mainRepo,
+      files: { 'feedback_a.md': 'keep' },
+    });
+    const wtPath = await makeShard(wtDir, { absPath: worktree, files: { 'project_b.md': 'new' } });
+    await fs.writeFile(path.join(mainPath, 'fts.db'), Buffer.from('stale-fts'));
+    const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+    const result = await runLegacyShardMigration(plan, {
+      rmFile: async (filePath) => {
+        if (String(filePath).includes('fts.db')) throw new Error('EBUSY fts.db');
+      },
+    });
+    expect(result.results[0].action).toBe('merged');
+    expect(result.results[0].error).toMatch(/stale fts.db remove failed/);
+    await expect(fs.stat(wtPath)).resolves.toBeTruthy();
+    expect(await fs.readFile(path.join(memoryRoot, mainDir, 'project_b.md'), 'utf8')).toContain(
+      'new',
+    );
+    const apply = summarizeApplyMigration(plan, result);
+    expect(apply.ok).toBe(false);
+    expect(apply.executionErrors).toHaveLength(1);
   });
 
   it('canonical 已存在 → 同名同内容跳过, 新文件复制, MEMORY.md 重建', async () => {

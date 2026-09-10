@@ -137,6 +137,13 @@ export interface ApplyMigrationSummary {
   ok: boolean;
 }
 
+/** 分片系统文件: 迁移不得跟随 symlink 改写根外 (Codex 3975030337)。 */
+const SYSTEM_SHARD_FILES = ['MEMORY.md', 'meta.json', 'fts.db', 'fts.db-wal', 'fts.db-shm'] as const;
+
+function isSystemShardFile(name: string): boolean {
+  return (SYSTEM_SHARD_FILES as readonly string[]).includes(name);
+}
+
 async function isSymlinkPath(p: string): Promise<boolean> {
   try {
     return (await fs.lstat(p)).isSymbolicLink();
@@ -150,16 +157,30 @@ async function isSymlinkShardDir(dir: string): Promise<boolean> {
   return isSymlinkPath(dir);
 }
 
+/** ENOENT 当空目录; 其它 I/O 必须抛给调用方, 不得伪装成空 (Codex 3975030334)。 */
+async function readShardDir(dir: string): Promise<string[]> {
+  try {
+    return await fs.readdir(dir);
+  } catch (e) {
+    if (isEnoentError(e)) return [];
+    throw e;
+  }
+}
+
 /** 合法分片文件名是 symlink — 不跟随读/复制 (Codex #2519 3974674258)。 */
 async function shardHasSymlinkShardFile(dir: string): Promise<boolean> {
-  try {
-    const files = await fs.readdir(dir);
-    for (const f of files) {
-      if (!parseFilename(f)) continue;
-      if (await isSymlinkPath(path.join(dir, f))) return true;
-    }
-  } catch {
-    return false;
+  const files = await readShardDir(dir);
+  for (const f of files) {
+    if (!parseFilename(f)) continue;
+    if (await isSymlinkPath(path.join(dir, f))) return true;
+  }
+  return false;
+}
+
+/** meta.json / MEMORY.md / fts.db(+sidecar) 是 symlink → 拒绝跟随 (Codex 3975030337)。 */
+async function shardHasSymlinkSystemFile(dir: string): Promise<boolean> {
+  for (const name of SYSTEM_SHARD_FILES) {
+    if (await isSymlinkPath(path.join(dir, name))) return true;
   }
   return false;
 }
@@ -254,6 +275,13 @@ export async function planLegacyShardMigration(
       continue;
     }
     if (!lstat.isDirectory()) continue;
+
+    // 在读 meta.json 之前拒绝系统文件 symlink, 避免规划期跟随读到根外
+    // (Codex #2519 3975030337)。
+    if (await shardHasSymlinkSystemFile(dir)) {
+      plan.skipped.push(await buildSkippedInfo(dir, entry, 'symlink-system-file'));
+      continue;
+    }
 
     let meta: ShardMeta | null = null;
     try {
@@ -372,11 +400,20 @@ export async function planLegacyShardMigration(
     const windowsFs =
       windowsFsIdentity(rawAbs) || windowsFsIdentity(canonicalScopeKey);
     const isLegacy = !sameMigrationDirName(canonicalDirName, entry, windowsFs);
-    if (isLegacy && (await isSymlinkShardDir(path.join(memoryRoot, canonicalDirName)))) {
+    const canonicalAbs = path.join(memoryRoot, canonicalDirName);
+    if (isLegacy && (await isSymlinkShardDir(canonicalAbs))) {
       // 规划已把同名 symlink 条目跳过, 但 canonical 目标仍可能是链接;
       // 跟随写入会打到 memoryRoot 外 (Codex #2519 3974544925)。
       plan.skipped.push(
         await buildSkippedInfo(dir, entry, 'symlink-canonical', canonicalScopeKey),
+      );
+      continue;
+    }
+    if (isLegacy && (await shardHasSymlinkSystemFile(canonicalAbs))) {
+      // 既有 canonical 的 MEMORY.md / meta.json / fts.db 若是 symlink,
+      // rebuildIndex / updateMeta 会跟随覆盖根外 (Codex #2519 3975030337)。
+      plan.skipped.push(
+        await buildSkippedInfo(dir, entry, 'symlink-system-file', canonicalScopeKey),
       );
       continue;
     }
@@ -398,8 +435,23 @@ export async function planLegacyShardMigration(
     let files: string[];
     try {
       files = await fs.readdir(dir);
-    } catch {
-      files = [];
+    } catch (e) {
+      // ENOENT: 规划窗口内目录消失, 当空列表。EACCES/EIO 不得当空 — 否则
+      // 含记录的 legacy 会进 emptyToDelete, --no-backup 下 trash 掉原作用域
+      // (Codex #2519 3975030334 / Us6gqun4)。
+      if (isEnoentError(e)) {
+        files = [];
+      } else {
+        plan.failed.push(
+          await buildSkippedInfo(
+            dir,
+            entry,
+            `dir-read-failure:${errnoCode(e)}`,
+            canonicalScopeKey,
+          ),
+        );
+        continue;
+      }
     }
     let hasUnrecognizedContent = false;
     let hasSymlinkShardFile = false;
@@ -410,7 +462,7 @@ export async function planLegacyShardMigration(
           continue;
         }
         info.recordCount += 1;
-      } else if (f !== 'MEMORY.md' && f !== 'meta.json' && f !== 'fts.db') {
+      } else if (!isSystemShardFile(f)) {
         hasUnrecognizedContent = true;
       }
     }
@@ -624,6 +676,12 @@ export async function runLegacyShardMigration(
         result.results.push(r);
         continue;
       }
+      if (await shardHasSymlinkSystemFile(shard.dir)) {
+        r.action = 'skipped';
+        r.error = 'symlink-system-file';
+        result.results.push(r);
+        continue;
+      }
       if (
         sameMigrationDirName(
           path.basename(shard.dir),
@@ -693,6 +751,12 @@ export async function runLegacyShardMigration(
         result.results.push(r);
         continue;
       }
+      if (await shardHasSymlinkSystemFile(shard.dir)) {
+        r.action = 'skipped';
+        r.error = 'symlink-system-file';
+        result.results.push(r);
+        continue;
+      }
       if (
         hasParentDirTraversal(shard.canonicalScopeKey) ||
         isUnsafeMigrationTargetDirName(shard.canonicalDirName)
@@ -718,6 +782,12 @@ export async function runLegacyShardMigration(
       if (await isSymlinkShardDir(targetDir)) {
         r.action = 'skipped';
         r.error = 'symlink-canonical';
+        result.results.push(r);
+        continue;
+      }
+      if (await shardHasSymlinkSystemFile(targetDir)) {
+        r.action = 'skipped';
+        r.error = 'symlink-system-file';
         result.results.push(r);
         continue;
       }
@@ -771,6 +841,17 @@ export async function runLegacyShardMigration(
         r.mergedFiles = merged;
         // 合并后重建目标 MEMORY.md (从分片 frontmatter 派生)
         await rebuildIndexFile(targetDir);
+        // 慢路径不 rename 整个目录, canonical 上可能残留 stale fts.db;
+        // sanityCheck 只比行数, 合并后文件数碰巧相等会漏掉新记录
+        // (Codex #2519 3975030344)。rm 失败不得当成功 merged。
+        try {
+          await dropFtsFn(targetDir);
+        } catch (e) {
+          r.action = 'merged';
+          r.error = `stale fts.db remove failed: ${String(e)}`;
+          result.results.push(r);
+          continue;
+        }
         // 源目录此刻只剩 MEMORY.md / meta.json / fts.db → 整个删掉。
         // 保留源目录的情形 (数据保全, 人工处理前数据必须仍在磁盘上):
         //  1. 有冲突 — 同名不同内容绝不静默覆盖 (#2400)
@@ -964,14 +1045,10 @@ async function pathExists(p: string): Promise<boolean> {
   }
 }
 
-/** 目录中合法分片文件 (<type>_<slug>.md) 的数量。目录不存在返 0。 */
+/** 目录中合法分片文件 (<type>_<slug>.md) 的数量。目录不存在返 0; 其它 I/O 抛出。 */
 async function countShardFiles(dir: string): Promise<number> {
-  try {
-    const files = await fs.readdir(dir);
-    return files.filter((f) => parseFilename(f)).length;
-  } catch {
-    return 0;
-  }
+  const files = await readShardDir(dir);
+  return files.filter((f) => parseFilename(f)).length;
 }
 
 /**
@@ -1143,14 +1220,10 @@ async function diffShardFilenames(
   dir: string,
   snapshot: Set<string>,
 ): Promise<{ added: string[]; missing: string[] }> {
-  try {
-    const current = new Set((await fs.readdir(dir)).filter((f) => parseFilename(f)));
-    const added = [...current].filter((f) => !snapshot.has(f));
-    const missing = [...snapshot].filter((f) => !current.has(f));
-    return { added, missing };
-  } catch {
-    return { added: [], missing: [] };
-  }
+  const current = new Set((await readShardDir(dir)).filter((f) => parseFilename(f)));
+  const added = [...current].filter((f) => !snapshot.has(f));
+  const missing = [...snapshot].filter((f) => !current.has(f));
+  return { added, missing };
 }
 
 /**
@@ -1193,12 +1266,6 @@ async function findChangedAfterMerge(
  * (Greptile review on #2519)。
  */
 async function findUnrecognizedMdFiles(dir: string): Promise<string[]> {
-  try {
-    const files = await fs.readdir(dir);
-    return files.filter(
-      (f) => f !== 'MEMORY.md' && f !== 'meta.json' && f !== 'fts.db' && !parseFilename(f),
-    );
-  } catch {
-    return [];
-  }
+  const files = await readShardDir(dir);
+  return files.filter((f) => !isSystemShardFile(f) && !parseFilename(f));
 }
