@@ -292,12 +292,10 @@ export async function planMemoryCleanup(
   for (const group of byHash.values()) {
     if (group.length < 2) continue;
     // 保留 updatedAt 最新; 并列取 filename 字典序最小 (确定性)。
-    const keep = group.reduce((a, b) =>
-      b.frontmatter.updatedAt > a.frontmatter.updatedAt ||
-      (b.frontmatter.updatedAt === a.frontmatter.updatedAt && b.filename < a.filename)
-        ? b
-        : a,
-    );
+    // 用纪元时间而不是 ISO 字符串字典序: `...T09:00:00-08:00` 比
+    // `...T12:00:00Z` 更新, 但 `>` 会把 Z 排在前 (Codex P1 on #2561:
+    // compare duplicate timestamps chronologically)。无效时间戳视为最旧。
+    const keep = group.reduce((a, b) => (compareRecordsByUpdatedAt(b, a) < 0 ? b : a));
     const archive = group.filter((r) => r.filename !== keep.filename).map((r) => r.filename);
     plan.duplicates.push({
       hash: contentHash(keep),
@@ -541,6 +539,24 @@ export function parseReviewedStalePlan(raw: unknown): ReviewedStalePlanFile {
  * 从 YAML frontmatter 解析 updatedAt 纪元毫秒。只认分隔符 `---` 之间的
  * `updatedAt:` 字段; 正文里的同名字串忽略。无效 / 缺字段 → null。
  */
+function parseUpdatedAtMs(value: string | undefined): number | null {
+  if (!value) return null;
+  const ts = Date.parse(value);
+  return Number.isNaN(ts) ? null : ts;
+}
+
+/** 按绝对时间比较: 更新的在前; 无效时间戳视为最旧; 并列按 filename。 */
+function compareRecordsByUpdatedAt(a: MemoryRecord, b: MemoryRecord): number {
+  const ta = parseUpdatedAtMs(a.frontmatter.updatedAt);
+  const tb = parseUpdatedAtMs(b.frontmatter.updatedAt);
+  if (ta !== tb) {
+    if (ta === null) return 1;
+    if (tb === null) return -1;
+    return tb - ta;
+  }
+  return a.filename.localeCompare(b.filename);
+}
+
 function parseFrontmatterUpdatedAt(raw: string | undefined): number | null {
   if (raw === undefined) return null;
   const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
@@ -549,9 +565,7 @@ function parseFrontmatterUpdatedAt(raw: string | undefined): number | null {
   const line = fm.match(/^updatedAt\s*:\s*(?:['"]([^'"]+)['"]|(\S+))\s*$/m);
   if (!line) return null;
   const value = line[1] ?? line[2];
-  if (!value) return null;
-  const ts = Date.parse(value);
-  return Number.isNaN(ts) ? null : ts;
+  return parseUpdatedAtMs(value);
 }
 
 /**

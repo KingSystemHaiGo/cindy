@@ -79,6 +79,31 @@ describe('planMemoryCleanup', () => {
     expect(plan.archiveItems.map((i) => i.filename)).toEqual(['feedback_rule_a.md']);
   });
 
+  it('ranks duplicate keep by chronological updatedAt not lexicographic ISO', async () => {
+    // `...T12:00:00Z` 字典序晚于 `...T09:00:00-08:00`, 但后者实际更新 (17:00Z)。
+    await shard(
+      'feedback_lex.md',
+      'feedback',
+      'Same',
+      'same hook',
+      'same body',
+      '2026-01-01T12:00:00Z',
+    );
+    await shard(
+      'feedback_tz.md',
+      'feedback',
+      'Same',
+      'same hook',
+      'same body',
+      '2026-01-01T09:00:00-08:00',
+    );
+
+    const plan = await planMemoryCleanup(dir);
+    expect(plan.duplicates).toHaveLength(1);
+    expect(plan.duplicates[0].keep).toBe('feedback_tz.md');
+    expect(plan.duplicates[0].archive).toEqual(['feedback_lex.md']);
+  });
+
   it('binds expectedHash to the same classified bytes including updatedAt', async () => {
     await shard('feedback_rule_a.md', 'feedback', 'PR polling rule', 'same hook', 'same body',
       '2026-01-01T00:00:00.000Z');
