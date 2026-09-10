@@ -397,6 +397,9 @@ interface TurnAccumulator {
     generation: number;
     turnIndex: number;
   };
+  /** 重叠 Stop 期间保留 tentative send owner,直到 acceptance 落定。
+   * 不得写入 interruptedDispatch,否则会把 closeout 提前钉到未确认 dispatch。 */
+  tentativeDispatch?: TurnAccumulator;
   /** 生命周期唯一 id(freshTurn 生成,跨换代不变;generation 重置为 0 时仍可
    * 区分生命周期——事件排序/配对以此为准)。 */
   lifecycleId: string;
@@ -636,8 +639,9 @@ export class GoalController {
     sessionId: string,
     previous: TurnAccumulator | undefined,
   ): void {
-    if (!previous?.pendingDispatch) return;
-    this.flushPendingDispatch(sessionId, previous);
+    const target = this.takeoverDispatchTarget(previous);
+    if (!target?.pendingDispatch) return;
+    this.flushPendingDispatch(sessionId, target);
   }
 
   /**
@@ -670,6 +674,34 @@ export class GoalController {
       // (Codex #2107 P1)。
       turnIndex: boundary.dispatchTurnIndex ?? 1,
     };
+  }
+
+  /** cancelled 边界上的 tentative send owner(重叠 Stop 穿透)。 */
+  private tentativeDispatchOwner(boundary: TurnAccumulator | undefined): TurnAccumulator | undefined {
+    if (!boundary) return undefined;
+    if (boundary.cancelled) return boundary.tentativeDispatch;
+    if (boundary.dispatchAcceptance === 'pending') return boundary;
+    return undefined;
+  }
+
+  /** 重叠 pause/clear 换 cancelled owner 时带走 interrupted + tentative 前任。 */
+  private inheritTakeoverOwner(
+    sessionId: string,
+    next: TurnAccumulator,
+    previous: TurnAccumulator | undefined,
+  ): void {
+    if (!previous) return;
+    const interrupted = this.unfinishedDispatch(sessionId, previous);
+    if (interrupted) next.interruptedDispatch = interrupted;
+    const tentative = this.tentativeDispatchOwner(previous);
+    if (tentative) next.tentativeDispatch = tentative;
+  }
+
+  /** persist closeout 要钉回真实派发 owner,不能钉在中间 cancelled 边界上。 */
+  private takeoverDispatchTarget(previous: TurnAccumulator | undefined): TurnAccumulator | undefined {
+    if (!previous) return undefined;
+    if (previous.cancelled) return previous.tentativeDispatch ?? previous;
+    return previous;
   }
 
   private clearTentativeDispatchMarkers(boundary: TurnAccumulator | undefined): void {
@@ -713,19 +745,20 @@ export class GoalController {
     previous: TurnAccumulator | undefined,
     closeout: NonNullable<TurnAccumulator['pendingTakeoverCloseout']>,
   ): void {
-    this.flushRetiredPendingDispatch(sessionId, previous);
-    const owner = this.unfinishedDispatch(sessionId, previous);
+    const target = this.takeoverDispatchTarget(previous);
+    this.flushRetiredPendingDispatch(sessionId, target);
+    const owner = this.unfinishedDispatch(sessionId, target);
     if (owner) {
       this.emitTakeoverCloseout(sessionId, closeout, owner);
-      if (previous) previous.pendingTakeoverCloseout = undefined;
+      if (target) target.pendingTakeoverCloseout = undefined;
       return;
     }
-    if (previous?.dispatchAcceptance === 'rejected') {
+    if (target?.dispatchAcceptance === 'rejected') {
       this.emitUnboundTakeoverCloseout(sessionId, closeout);
       return;
     }
-    if (previous?.auditFinalized === false) {
-      previous.pendingTakeoverCloseout = closeout;
+    if (target?.auditFinalized === false) {
+      target.pendingTakeoverCloseout = closeout;
       return;
     }
     this.emitUnboundTakeoverCloseout(sessionId, closeout);
@@ -915,14 +948,13 @@ export class GoalController {
         // paused(用户编辑目标后 chip 误显"暂停")。detach 在前,abort 的终止事件就不再触达裁决。
       }
       const previousBoundary = this.turns.get(sessionId);
-      const interruptedDispatch = this.unfinishedDispatch(sessionId, previousBoundary);
       this.stopSession(sessionId);
       const editBoundary = freshTurn(
         false,
         previousBoundary?.pendingPersistence ?? null,
         previousBoundary?.pendingCompletion ?? null,
       );
-      if (interruptedDispatch) editBoundary.interruptedDispatch = interruptedDispatch;
+      this.inheritTakeoverOwner(sessionId, editBoundary, previousBoundary);
       this.turns.set(sessionId, editBoundary);
       let editObjectivePersisted = false;
       let updatedState: GoalState | null = null;
@@ -957,21 +989,23 @@ export class GoalController {
         );
         if (this.turns.get(sessionId) !== editBoundary) return null;
         if (!updated) {
-          if (previousBoundary) {
-            previousBoundary.takeoverAbandoned = true;
-            if (previousBoundary.dispatchAcceptance === 'accepted') {
-              this.closeAbandonedReplacement(sessionId, previousBoundary, existing);
+          const abandoned = this.takeoverDispatchTarget(previousBoundary);
+          if (abandoned) {
+            abandoned.takeoverAbandoned = true;
+            if (abandoned.dispatchAcceptance === 'accepted') {
+              this.closeAbandonedReplacement(sessionId, abandoned, existing);
             }
           }
           this.turns.delete(sessionId);
           return null;
         }
         updatedState = updated;
+        const takeoverTarget = this.takeoverDispatchTarget(previousBoundary);
         if (
-          interruptedDispatch ||
-          previousBoundary?.auditFinalized === false ||
-          previousBoundary?.pendingDispatch ||
-          previousBoundary?.dispatchAcceptance === 'pending'
+          editBoundary.interruptedDispatch ||
+          takeoverTarget?.auditFinalized === false ||
+          takeoverTarget?.pendingDispatch ||
+          takeoverTarget?.dispatchAcceptance === 'pending'
         ) {
           this.settleTakeoverCloseout(sessionId, previousBoundary, {
             type: 'cleared',
@@ -989,10 +1023,13 @@ export class GoalController {
         }
       } catch (error) {
         if (this.turns.get(sessionId) === editBoundary) {
-          if (!editObjectivePersisted && previousBoundary) {
-            previousBoundary.takeoverAbandoned = true;
-            if (previousBoundary.dispatchAcceptance === 'accepted') {
-              this.closeAbandonedReplacement(sessionId, previousBoundary, existing);
+          if (!editObjectivePersisted) {
+            const abandoned = this.takeoverDispatchTarget(previousBoundary);
+            if (abandoned) {
+              abandoned.takeoverAbandoned = true;
+              if (abandoned.dispatchAcceptance === 'accepted') {
+                this.closeAbandonedReplacement(sessionId, abandoned, existing);
+              }
             }
           }
           if (rejectionTakeover) {
@@ -1139,14 +1176,13 @@ export class GoalController {
       // 预算条件仍成立；必须用 settle 后的最新 counters 再判一次，不能返回超限 active。
       if (current.status === 'active' && exceedsGoalBudget(current)) {
         const previousBoundary = this.turns.get(sessionId);
-        const interruptedDispatch = this.unfinishedDispatch(sessionId, previousBoundary);
         this.stopSession(sessionId);
         const limitBoundary = freshTurn(
           true,
           previousBoundary?.pendingPersistence ?? null,
           previousBoundary?.pendingCompletion ?? null,
         );
-        if (interruptedDispatch) limitBoundary.interruptedDispatch = interruptedDispatch;
+        this.inheritTakeoverOwner(sessionId, limitBoundary, previousBoundary);
         this.turns.set(sessionId, limitBoundary);
         await this.awaitPendingLifecycle(limitBoundary);
         if (this.turns.get(sessionId) !== limitBoundary) return reconcileLifecycleChange();
@@ -1161,11 +1197,11 @@ export class GoalController {
         if (this.turns.get(sessionId) !== limitBoundary) return reconcileLifecycleChange();
         if (limited) {
           this.flushRetiredPendingDispatch(sessionId, previousBoundary);
-          const budgetOwner = interruptedDispatch
+          const budgetOwner = limitBoundary.interruptedDispatch
             ? {
-                lifecycleId: interruptedDispatch.lifecycleId,
-                generation: interruptedDispatch.generation,
-                turnIndex: interruptedDispatch.turnIndex,
+                lifecycleId: limitBoundary.interruptedDispatch.lifecycleId,
+                generation: limitBoundary.interruptedDispatch.generation,
+                turnIndex: limitBoundary.interruptedDispatch.turnIndex,
               }
             : {};
           this.recordRunEvent('state-transition', sessionId, limited, {
@@ -1250,14 +1286,13 @@ export class GoalController {
         // 降低上限是显式生命周期接管：同步摘掉旧 listener/timer，等旧 finalize 写完后，
         // 用同一条 UPDATE 同时提交新上限与 budgetLimited，避免暴露可被旧写覆盖的 active 中间态。
         previousBoundary = this.turns.get(sessionId);
-        const interruptedDispatch = this.unfinishedDispatch(sessionId, previousBoundary);
         this.stopSession(sessionId);
         limitBoundary = freshTurn(
           true,
           previousBoundary?.pendingPersistence ?? null,
           previousBoundary?.pendingCompletion ?? null,
         );
-        if (interruptedDispatch) limitBoundary.interruptedDispatch = interruptedDispatch;
+        this.inheritTakeoverOwner(sessionId, limitBoundary, previousBoundary);
         this.turns.set(sessionId, limitBoundary);
         await this.awaitPendingLifecycle(limitBoundary);
         if (this.turns.get(sessionId) !== limitBoundary) return reconcileLifecycleChange();
@@ -1489,14 +1524,13 @@ export class GoalController {
     // lifecycle/generation/turnIndex,不能绑到下面 freshTurn 的 clearBoundary
     // (Codex #2107 P2)。turn-dispatched 属于旧 boundary 且序号为 turnsUsed + 1。
     // done 已摘 in-flight 但 finalizeTurn 仍在 await 时,改看 auditFinalized。
-    const interruptedDispatch = this.unfinishedDispatch(sessionId, previousBoundary);
     this.stopSession(sessionId);
     const clearBoundary = freshTurn(
       true,
       previousBoundary?.pendingPersistence ?? null,
       previousBoundary?.pendingCompletion ?? null,
     );
-    if (interruptedDispatch) clearBoundary.interruptedDispatch = interruptedDispatch;
+    this.inheritTakeoverOwner(sessionId, clearBoundary, previousBoundary);
     this.turns.set(sessionId, clearBoundary);
     if (hasActiveGoalTurn) {
       try {
@@ -1554,7 +1588,6 @@ export class GoalController {
     this.cancelDeferredManualResume(sessionId);
     this.cancelUsageResume(sessionId);
     const previousBoundary = this.turns.get(sessionId);
-    const interruptedDispatch = this.unfinishedDispatch(sessionId, previousBoundary);
     this.stopSession(sessionId);
     // 每次 Stop 都换新对象身份：后来的 Stop 必须能超越已在 await 中的 Resume，
     // 不能复用旧 cancelled 对象形成 ABA。边界留到后续显式 Resume / setGoal / clearGoal，
@@ -1564,7 +1597,7 @@ export class GoalController {
       previousBoundary?.pendingPersistence ?? null,
       previousBoundary?.pendingCompletion ?? null,
     );
-    if (interruptedDispatch) pauseBoundary.interruptedDispatch = interruptedDispatch;
+    this.inheritTakeoverOwner(sessionId, pauseBoundary, previousBoundary);
     this.turns.set(sessionId, pauseBoundary);
     await this.awaitPendingPersistence(pauseBoundary);
     if (this.turns.get(sessionId) !== pauseBoundary) return;

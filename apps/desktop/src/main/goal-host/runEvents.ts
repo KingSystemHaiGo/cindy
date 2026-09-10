@@ -99,14 +99,11 @@ export function createRunEventRecorder(limit = 200, sink?: RunEventSink): GoalRu
       // 不会污染环内数据。
       // 排序不变量(可验证,与评审过程无关):
       //  1. 按 at 升序(快终态时 dispatch 的 at 早于收口,即使落环晚);
-      //  2. 同 at 且同 lifecycleId(同生命周期)按 turnIndex 升序;
-      //     跨生命周期换代时不用全局 turnIndex(freshTurn 重置 generation=0,
-      //     同代不证明同生命周期;新 run 的 turnIndex 小于旧 run 的 terminal,
-      //     不得把"新 run 开始"排到"旧 run 结束"之前);
-      //  3. 同 at 且仍相等时,派发类(resumed/turn-dispatched)在收口类之前;
-      //  4. 同 at 默认保持插入序;仅当同 session 的旧 lifecycle closeout 落在
-      //     新 lifecycle dispatch 之后时,把该 closeout 提到那次 dispatch 前
-      //     (Codex #2107 P1: 不要按 session 首事件把整段 session 提前)。
+      //  2. 同 at 默认保持插入序;约束只写进 _key,比较器不再 pairwise 绕过 _key
+      //     (否则 A finalized, B dispatched, A dispatched 会成环);
+      //  3. 同 lifecycle:迟到的派发类提到已落环的收口类之前;
+      //  4. 同 session 旧 lifecycle closeout 落在新 lifecycle dispatch 之后时,
+      //     把该 closeout 提到那次 dispatch 前(不要按 session 首事件整段提前);
       //  5. 其余按显式插入序号(不依赖引擎 sort 稳定性,插入序 = 落环序)。
       const dispatchGroup = new Set(['resumed', 'turn-dispatched']);
       // 收口类:所有派发后的终态/迁移/停滞事件都排在派发类之后(同毫秒全序,
@@ -162,20 +159,30 @@ export function createRunEventRecorder(limit = 200, sink?: RunEventSink): GoalRu
           }
         }
       }
+      // 同 lifecycle 的派发/收口约束写进 _key:迟到 dispatch 提到已落环 closeout 前。
+      // 比较器若 pairwise 绕过 _key,A finalized < B < A dispatched 会与
+      // A dispatched < A finalized 成环 (Codex #2107 P1)。
+      const byLifecycle = new Map<string, typeof indexed>();
+      for (const evt of indexed) {
+        const key = `${evt.at ?? 0}\0${evt.lifecycleId}`;
+        const group = byLifecycle.get(key);
+        if (group) group.push(evt);
+        else byLifecycle.set(key, [evt]);
+      }
+      for (const group of byLifecycle.values()) {
+        const dispatches = group.filter((e) => dispatchGroup.has(e.type));
+        const closeouts = group.filter((e) => isCloseout(e));
+        for (const dispatch of dispatches) {
+          for (const closeout of closeouts) {
+            if (dispatch._seq <= closeout._seq) continue;
+            dispatch._key = Math.min(dispatch._key, closeout._key - 0.5);
+          }
+        }
+      }
       return indexed
         .sort((a, b) => {
           const byAt = (a.at ?? 0) - (b.at ?? 0);
           if (byAt !== 0) return byAt;
-          if (a.lifecycleId && a.lifecycleId === b.lifecycleId) {
-            const byTurn = a.turnIndex - b.turnIndex;
-            if (byTurn !== 0) return byTurn;
-            const aD = dispatchGroup.has(a.type);
-            const bD = dispatchGroup.has(b.type);
-            const aF = isCloseout(a);
-            const bF = isCloseout(b);
-            if (aD && bF) return -1;
-            if (aF && bD) return 1;
-          }
           if (a._key !== b._key) return a._key - b._key;
           return a._seq - b._seq;
         })

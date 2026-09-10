@@ -182,4 +182,35 @@ describe('createRunEventRecorder', () => {
       'a:turn-finalized',
     ]);
   });
+
+  it('encodes same-lifecycle dispatch-before-closeout into keys without a comparator cycle',
+    () => {
+    const rec = createRunEventRecorder();
+    rec.record(evt({
+      type: 'turn-finalized',
+      goalSessionId: 'a',
+      lifecycleId: 'g1',
+      turnIndex: 1,
+      at: 1000,
+    }));
+    rec.record(evt({
+      type: 'turn-dispatched',
+      goalSessionId: 'b',
+      lifecycleId: 'g2',
+      turnIndex: 1,
+      at: 1000,
+    }));
+    rec.record(evt({
+      type: 'turn-dispatched',
+      goalSessionId: 'a',
+      lifecycleId: 'g1',
+      turnIndex: 1,
+      at: 1000,
+    }));
+    expect(rec.snapshot().map((e) => `${e.goalSessionId}:${e.type}`)).toEqual([
+      'a:turn-dispatched',
+      'a:turn-finalized',
+      'b:turn-dispatched',
+    ]);
+  });
 });
