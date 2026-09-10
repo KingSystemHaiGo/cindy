@@ -4867,8 +4867,11 @@ export class CodexAgent extends BaseAgent {
         if (opts.remoteHostId && transports.has('cindy_helper')) {
           botMcpConfig['mcp_servers.cindy_helper.enabled'] = true;
         }
-        if (!makerMemoryEnabled && transports.has('cindy_memory')) {
-          botMcpConfig['mcp_servers.cindy_memory.enabled'] = false;
+        if (
+          transports.has('cindy_memory')
+          && botMcpConfig['mcp_servers.cindy_memory.enabled'] !== false
+        ) {
+          botMcpConfig['mcp_servers.cindy_memory.enabled'] = makerMemoryEnabled;
         }
       } catch (error) {
         releaseHostBindingLeaseIfNeeded();
@@ -5696,8 +5699,8 @@ export class CodexAgent extends BaseAgent {
               'features.remote_plugin': false,
             }
           : {}),
-        ...(!makerMemoryEnabled && !opts.botRuntimeProfile
-          ? { 'mcp_servers.cindy_memory.enabled': false }
+        ...(!opts.botRuntimeProfile && opts.remoteHostId
+          ? { 'mcp_servers.cindy_memory.enabled': makerMemoryEnabled }
           : {}),
         // Configure the native window and its 90% compaction budget together.
         // Native effective_context_window_percent independently reserves input headroom.
