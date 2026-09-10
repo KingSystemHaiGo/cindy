@@ -18,7 +18,7 @@ export type GoalRunEventType =
   | 'budget-consumed' // 预算检查命中(超限转 budgetLimited,含 preflight 停止)
   | 'stall-detected' // 连续空轮撞 noProgressLimit
   | 'resumed' // 手动 resume / resumeActiveGoals 续跑
-  | 'cleared' // 用户清除目标(删行收口;accepted 后的 turn-dispatched 仍需显式 closeout)
+  | 'cleared' // 用户清除目标,或 in-flight 替换 objective 时给旧派发的 closeout
   | 'terminal'; // 终态落盘(仅 complete / budgetLimited;usageLimited 不是终态不发)
 
 export interface GoalRunEvent {

@@ -3891,6 +3891,97 @@ describe('GoalController', () => {
     });
   });
 
+  it('binds cleared to the dispatch owner when Clear races finalizeTurn after done', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    await startGoal(local);
+    await tick();
+    const dispatched = events.filter((e) => e.type === 'turn-dispatched');
+    expect(dispatched.length).toBeGreaterThanOrEqual(1);
+    const dispatch = dispatched[0]!;
+
+    const origGet = local.storage.get.bind(local.storage);
+    let releaseGet!: (state: GoalState | null) => void;
+    const blockedGet = new Promise<GoalState | null>((resolve) => {
+      releaseGet = resolve;
+    });
+    let blockedOnce = false;
+    vi.spyOn(local.storage, 'get').mockImplementation(async (sessionId: string) => {
+      if (!blockedOnce) {
+        blockedOnce = true;
+        return blockedGet;
+      }
+      return origGet(sessionId);
+    });
+
+    local.session.emitGoalTurn({
+      toolUse: true,
+      verdictJson: '```json\n{"goal_status":"continue","reason":"wip"}\n```',
+      tokens: 20,
+    });
+    await vi.waitFor(() => expect(blockedOnce).toBe(true));
+
+    const clearPromise = local.controller.clearGoal('s1');
+    releaseGet(await origGet('s1'));
+    await clearPromise;
+
+    const cleared = events.filter((e) => e.type === 'cleared');
+    expect(cleared).toHaveLength(1);
+    expect(cleared[0]).toMatchObject({
+      lifecycleId: dispatch.lifecycleId,
+      generation: dispatch.generation,
+      turnIndex: dispatch.turnIndex,
+      reason: 'cleared by user',
+    });
+  });
+
+  it('binds pause transitions to the interrupted dispatch lifecycle after onDispatching', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    await startGoal(local);
+    await tick();
+    const dispatched = events.filter((e) => e.type === 'turn-dispatched');
+    expect(dispatched.length).toBeGreaterThanOrEqual(1);
+    const dispatch = dispatched[0]!;
+
+    await local.controller.pauseGoal('s1');
+
+    const paused = events.filter(
+      (e) => e.type === 'state-transition' && e.from === 'active' && e.to === 'paused',
+    );
+    expect(paused).toHaveLength(1);
+    expect(paused[0]).toMatchObject({
+      lifecycleId: dispatch.lifecycleId,
+      generation: dispatch.generation,
+      turnIndex: dispatch.turnIndex,
+      reason: 'paused by user',
+    });
+  });
+
+  it('emits a replacement closeout for an in-flight Goal when setGoal edits the objective', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    await startGoal(local);
+    await tick();
+    const dispatched = events.filter((e) => e.type === 'turn-dispatched');
+    expect(dispatched.length).toBeGreaterThanOrEqual(1);
+    const dispatch = dispatched[0]!;
+
+    await local.controller.setGoal({ sessionId: 's1', objective: 'replacement objective' });
+
+    const closeout = events.filter(
+      (e) => e.type === 'cleared' && e.reason === 'replaced by new goal',
+    );
+    expect(closeout).toHaveLength(1);
+    expect(closeout[0]).toMatchObject({
+      lifecycleId: dispatch.lifecycleId,
+      generation: dispatch.generation,
+      turnIndex: dispatch.turnIndex,
+    });
+    const laterDispatch = events.filter((e) => e.type === 'turn-dispatched').at(-1);
+    expect(laterDispatch?.lifecycleId).not.toBe(dispatch.lifecycleId);
+  });
+
   it('records active→blocked state-transition when dispatch send fails', async () => {
     const events: Array<import('../runEvents').GoalRunEvent> = [];
     const local = makeController({ recordRunEvent: (e) => void events.push(e) });

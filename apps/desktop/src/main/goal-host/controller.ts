@@ -601,6 +601,22 @@ export class GoalController {
     this.clearPendingResumeForBoundary(sessionId, dispatchBoundary);
   }
 
+  /**
+   * 未收口的派发:onDispatching 之后、finalizeTurn 审计写完之前。
+   * done 会先摘掉 goalTurnsInFlight,不能只靠 in-flight 集合判断
+   * (Codex #2107 P2: preserve dispatch owner after done)。
+   */
+  private unfinishedDispatch(
+    sessionId: string,
+    boundary: TurnAccumulator | undefined,
+  ): { lifecycleId: string; generation: number } | null {
+    if (!boundary || boundary.cancelled) return null;
+    const inFlight = this.goalTurnsInFlight.has(sessionId);
+    const dispatchedUnclosed = boundary.auditFinalized === false;
+    if (!inFlight && !dispatchedUnclosed) return null;
+    return { lifecycleId: boundary.lifecycleId, generation: boundary.generation };
+  }
+
   /** finalizeTurn 写收口事件后补发挂起的派发(保证 dispatch 与收口配对)。 */
   private flushPendingDispatch(sessionId: string, turn: TurnAccumulator): void {
     const pd = turn.pendingDispatch;
@@ -743,6 +759,7 @@ export class GoalController {
         // paused(用户编辑目标后 chip 误显"暂停")。detach 在前,abort 的终止事件就不再触达裁决。
       }
       const previousBoundary = this.turns.get(sessionId);
+      const interruptedDispatch = this.unfinishedDispatch(sessionId, previousBoundary);
       this.stopSession(sessionId);
       const editBoundary = freshTurn(
         false,
@@ -787,6 +804,17 @@ export class GoalController {
           return null;
         }
         updatedState = updated;
+        if (interruptedDispatch) {
+          // in-flight 替换必须给旧派发显式 closeout,否则审计仍把旧 lifecycle
+          // 当成悬挂 turn (Codex #2107 P2)。
+          this.recordRunEvent('cleared', sessionId, existing, {
+            from: existing.status,
+            reason: 'replaced by new goal',
+            lifecycleId: interruptedDispatch.lifecycleId,
+            generation: interruptedDispatch.generation,
+            turnIndex: (existing.turnsUsed ?? 0) + 1,
+          });
+        }
         this.resetTurn(sessionId);
         const activeBoundary = this.turns.get(sessionId);
         this.attachListener(sessionId);
@@ -1260,12 +1288,8 @@ export class GoalController {
     // 越过 onDispatching 后清目标:cleared 必须沿用被中断派发的
     // lifecycle/generation/turnIndex,不能绑到下面 freshTurn 的 clearBoundary
     // (Codex #2107 P2)。turn-dispatched 属于旧 boundary 且序号为 turnsUsed + 1。
-    const interruptedDispatch = hasActiveGoalTurn && previousBoundary
-      ? {
-          lifecycleId: previousBoundary.lifecycleId,
-          generation: previousBoundary.generation,
-        }
-      : null;
+    // done 已摘 in-flight 但 finalizeTurn 仍在 await 时,改看 auditFinalized。
+    const interruptedDispatch = this.unfinishedDispatch(sessionId, previousBoundary);
     this.stopSession(sessionId);
     const clearBoundary = freshTurn(
       true,
@@ -1334,6 +1358,7 @@ export class GoalController {
     this.cancelDeferredManualResume(sessionId);
     this.cancelUsageResume(sessionId);
     const previousBoundary = this.turns.get(sessionId);
+    const interruptedDispatch = this.unfinishedDispatch(sessionId, previousBoundary);
     this.stopSession(sessionId);
     // 每次 Stop 都换新对象身份：后来的 Stop 必须能超越已在 await 中的 Resume，
     // 不能复用旧 cancelled 对象形成 ABA。边界留到后续显式 Resume / setGoal / clearGoal，
@@ -1365,6 +1390,13 @@ export class GoalController {
           from: state.status,
           to: 'paused',
           reason: updated.lastReason,
+          ...(interruptedDispatch
+            ? {
+                lifecycleId: interruptedDispatch.lifecycleId,
+                generation: interruptedDispatch.generation,
+                turnIndex: (state.turnsUsed ?? 0) + 1,
+              }
+            : {}),
         });
         this.emit(updated);
       }
@@ -1385,6 +1417,13 @@ export class GoalController {
         from: state.status,
         to: 'paused',
         reason: updated.lastReason,
+        ...(interruptedDispatch
+          ? {
+              lifecycleId: interruptedDispatch.lifecycleId,
+              generation: interruptedDispatch.generation,
+              turnIndex: (state.turnsUsed ?? 0) + 1,
+            }
+          : {}),
       });
       this.emit(updated);
     }
@@ -2900,6 +2939,9 @@ export class GoalController {
         // onDispatching 是归属登记的唯一边界。不能在 await send 后再次 add：极快的
         // turn 可能已经发出终态并同步释放归属，重新登记会把后续用户 turn 误认成 Goal。
         baselineStarted = false;
+        // 被 setGoal 替换后的迟到 accepted 不再记旧派发:closeout 已由替换路径发出
+        // (Codex #2107 P2)。
+        if (!isCurrentDispatch()) return;
         if (dispatchBoundary?.finalized === true && dispatchBoundary?.auditFinalized !== true) {
           dispatchBoundary.pendingDispatch = {
             generation: dispatchGeneration,
