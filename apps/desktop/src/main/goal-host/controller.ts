@@ -1106,10 +1106,13 @@ export class GoalController {
 
       let changed: GoalState | null;
       let limitBoundary: TurnAccumulator | undefined;
+      // 必须提到 shouldLimit 块外:persistence 成功后的 flush 仍要拿到被中断
+      // dispatch 的退休 boundary (Codex #2107 P1 / CI TS2304)。
+      let previousBoundary: TurnAccumulator | undefined;
       if (shouldLimit) {
         // 降低上限是显式生命周期接管：同步摘掉旧 listener/timer，等旧 finalize 写完后，
         // 用同一条 UPDATE 同时提交新上限与 budgetLimited，避免暴露可被旧写覆盖的 active 中间态。
-        const previousBoundary = this.turns.get(sessionId);
+        previousBoundary = this.turns.get(sessionId);
         const interruptedDispatch = this.unfinishedDispatch(sessionId, previousBoundary);
         this.stopSession(sessionId);
         limitBoundary = freshTurn(
