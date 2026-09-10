@@ -5699,7 +5699,12 @@ export class CodexAgent extends BaseAgent {
               'features.remote_plugin': false,
             }
           : {}),
-        ...(!opts.botRuntimeProfile && opts.remoteHostId
+        // Shared Codex/Pi bridges premount cindy_memory (empty workingDir factory).
+        // Remote daemons keep it disabled by default and overlay per task. Local
+        // non-Bot tasks must still send enabled=false when Maker Memory is off;
+        // otherwise Codex enables the premounted server and withStore only
+        // returns MAKER_MEMORY_NOT_READY after the model has already called it.
+        ...(!opts.botRuntimeProfile && (opts.remoteHostId || !makerMemoryEnabled)
           ? { 'mcp_servers.cindy_memory.enabled': makerMemoryEnabled }
           : {}),
         // Configure the native window and its 90% compaction budget together.
