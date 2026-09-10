@@ -959,7 +959,10 @@ async function detachReservedSource(
 async function restoreParkedSource(src: string, parked: string): Promise<void> {
   try {
     if (await pathExists(src)) {
-      await fs.unlink(parked).catch(() => {});
+      // src already names an inode (host rewrite / concurrent recreate).
+      // parked may be the only copy of an unreviewed replacement moved off
+      // src after trash reservation — never unlink it just because src exists
+      // (Codex P1 on #2561: do not delete an unidentified parked shard).
       return;
     }
     await fs.rename(parked, src);

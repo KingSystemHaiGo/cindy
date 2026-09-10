@@ -1164,6 +1164,46 @@ describe('runMemoryCleanup', () => {
     }
   });
 
+  it('does not unlink parked when src already exists after a transient identity failure', async () => {
+    await shard('feedback_a.md', 'feedback', 'Same', 'hook', 'same', '2026-01-01T00:00:00.000Z');
+    await shard('feedback_b.md', 'feedback', 'Same', 'hook', 'same', '2026-02-01T00:00:00.000Z');
+
+    const plan = await planMemoryCleanup(dir);
+    // park 后身份检查瞬态失败; 此时编辑器已重建 src。restoreParkedSource 不得
+    // 仅凭 src 存在就 unlink parked (parked 可能是未审阅替换的唯一 inode)。
+    const realLstat = fs.lstat.bind(fs);
+    let failedOnce = false;
+    const lstatSpy = vi.spyOn(fs, 'lstat').mockImplementation(async (p) => {
+      if (!failedOnce && String(p).includes('cleanup-parked')) {
+        failedOnce = true;
+        await writeFile(
+          path.join(dir, 'feedback_a.md'),
+          "---\ntitle: Recreated\ndescription: host\ntype: feedback\nupdatedAt: '2026-03-01T00:00:00.000Z'\n---\nHOST RECREATED SRC\n",
+          'utf8',
+        );
+        throw Object.assign(new Error('transient lock'), { code: 'EACCES' });
+      }
+      return realLstat(p as string);
+    });
+    try {
+      const result = await runMemoryCleanup(plan);
+      expect(failedOnce).toBe(true);
+      expect(result.archived.some((a) => a.filename === 'feedback_a.md')).toBe(false);
+      await expect(readFile(path.join(dir, 'feedback_a.md'), 'utf8')).resolves.toContain(
+        'HOST RECREATED SRC',
+      );
+      const names = await readdir(dir);
+      const parked = names.filter((n) => n.includes('cleanup-parked'));
+      expect(parked.length).toBeGreaterThan(0);
+      const parkedRaws = await Promise.all(
+        parked.map((n) => readFile(path.join(dir, n), 'utf8')),
+      );
+      expect(parkedRaws.some((raw) => raw.includes('same'))).toBe(true);
+    } finally {
+      lstatSpy.mockRestore();
+    }
+  });
+
   it('restores src when a write lands during the quiesce window', async () => {
     await shard('feedback_a.md', 'feedback', 'Same', 'hook', 'same', '2026-01-01T00:00:00.000Z');
     await shard('feedback_b.md', 'feedback', 'Same', 'hook', 'same', '2026-02-01T00:00:00.000Z');
@@ -1360,6 +1400,60 @@ describe('storage list I/O vs corrupt shards (Codex P1 on #2561)', () => {
     expect(recs.map((r) => r.filename)).toEqual(['project_ok.md']);
     const withRaw = await storage.listWithRaw();
     expect(withRaw.map((x) => x.rec.filename)).toEqual(['project_ok.md']);
+  });
+
+  it('skips non-string YAML title/description as corrupt instead of TypeError', async () => {
+    await shard('project_ok.md', 'project', 'Ok', 'hook', 'body', '2026-01-01T00:00:00.000Z');
+    await writeFile(
+      path.join(dir, 'project_numtitle.md'),
+      [
+        '---',
+        'title: 123',
+        'description: hook',
+        'type: project',
+        "updatedAt: '2026-01-01T00:00:00.000Z'",
+        '---',
+        'body',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFile(
+      path.join(dir, 'project_booltitle.md'),
+      [
+        '---',
+        'title: true',
+        'description: hook',
+        'type: project',
+        "updatedAt: '2026-01-01T00:00:00.000Z'",
+        '---',
+        'body',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFile(
+      path.join(dir, 'project_numdesc.md'),
+      [
+        '---',
+        'title: Ok',
+        'description: 456',
+        'type: project',
+        "updatedAt: '2026-01-01T00:00:00.000Z'",
+        '---',
+        'body',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    const storage = new MemoryStorage(dir);
+    const recs = await storage.list();
+    expect(recs.map((r) => r.filename)).toEqual(['project_ok.md']);
+    const withRaw = await storage.listWithRaw();
+    expect(withRaw.map((x) => x.rec.filename)).toEqual(['project_ok.md']);
+    await expect(planMemoryCleanup(dir)).resolves.toMatchObject({
+      records: [{ filename: 'project_ok.md' }],
+    });
   });
 
   it('does not swallow shard I/O errors in planMemoryCleanup', async () => {

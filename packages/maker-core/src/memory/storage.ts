@@ -699,7 +699,16 @@ function parseRawShard(raw: string, filenameForErr: string): ParsedShard {
     );
   }
   const data = parsed.data as Partial<MemoryFrontmatter>;
-  if (!data.title || !data.description || !isMemoryType(data.type)) {
+  // gray-matter 会把 YAML `title: 123` / `title: true` 解成 number/boolean;
+  // 只检 truthy 再强转后, 清理扫描对 title.trim() 会 TypeError 中止整个
+  // dry-run (与 Codex P2 on #2561: 非字符串 frontmatter 判为损坏一致).
+  if (
+    typeof data.title !== 'string' ||
+    typeof data.description !== 'string' ||
+    !data.title ||
+    !data.description ||
+    !isMemoryType(data.type)
+  ) {
     throw new MemoryError(
       'invalid-frontmatter',
       `${filenameForErr} frontmatter 缺字段或 type 非法`,
