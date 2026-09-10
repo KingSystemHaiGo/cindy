@@ -448,4 +448,17 @@ describe('settings changes preserve independently joined capabilities', () => {
     });
     expect(botSettingsChanges(after, { ...after, name: 'Updated' }, true)).toEqual({ name: 'Updated' });
   });
+  it('carries a style editing baseline so concurrent subfields can merge', () => {
+    const before = payload({ style: { tone: 'warm', addressUserAs: 'Chris' } });
+    const after = payload({ style: { tone: 'warm', addressUserAs: 'Pat' } });
+    expect(botSettingsChanges(before, after, true)).toEqual({
+      style: { tone: 'warm', addressUserAs: 'Pat' },
+      styleBaseline: { tone: 'warm', addressUserAs: 'Chris' },
+    });
+    expect(botSettingsChanges(payload(), payload({ style: { tone: 'warm' } }), true)).toEqual({
+      style: { tone: 'warm' },
+      styleBaseline: null,
+    });
+    expect(botSettingsChanges(before, payload({ name: 'Updated' }), true)).toEqual({ name: 'Updated' });
+  });
 });

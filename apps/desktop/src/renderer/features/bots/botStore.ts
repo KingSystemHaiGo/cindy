@@ -967,13 +967,15 @@ export type BotProfileUpdatePatch = Partial<
   capabilityBaseline?: BotCapabilityBaseline;
   /** 显式 null 表示清掉沟通风格；undefined 表示本次不改。 */
   style?: BotCommunicationStyle | null;
+  /** Editing baseline, sent only for style objects changed by the settings form. */
+  styleBaseline?: BotCommunicationStyle | null;
 };
 
 export function updateBotProfile(id: string, patch: BotProfileUpdatePatch): Promise<BotProfile> {
   ensureProfileOwner();
   const before = profiles.find((bot) => bot.id === id);
   if (!before) return Promise.reject(new Error('Bot not found'));
-  const { avatarUploadToken, capabilityBaseline, ...profilePatch } = patch;
+  const { avatarUploadToken, capabilityBaseline, styleBaseline, ...profilePatch } = patch;
   const { style: patchStyle, capabilities: patchCapabilities, ...restPatch } = profilePatch;
   // restPatch 不含 style / Partial capabilities, 才能直接当 Partial<BotProfile>。
   const optimisticPatch: Partial<BotProfile> = { ...restPatch };
@@ -1010,6 +1012,7 @@ export function updateBotProfile(id: string, patch: BotProfileUpdatePatch): Prom
       id,
       ...profilePatch,
       ...(capabilityBaseline ? { capabilityBaseline } : {}),
+      ...(styleBaseline !== undefined ? { styleBaseline } : {}),
       ...(avatarUploadToken ? { avatarUploadToken } : {}),
       ...(profilePatch.avatar !== undefined || avatarUploadToken
         ? { expectedAvatar: before.avatar }

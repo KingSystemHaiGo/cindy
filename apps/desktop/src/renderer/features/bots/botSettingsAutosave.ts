@@ -154,6 +154,7 @@ export function botSettingsChanges(previous: BotSettingsPayload, next: BotSettin
     ...changed,
     ...(Object.keys(capabilityChanges).length ? { capabilities: capabilityChanges } : {}),
     ...(includeCapabilityBaseline && Object.keys(capabilityBaseline).length ? { capabilityBaseline } : {}),
+    ...(includeCapabilityBaseline && 'style' in changed ? { styleBaseline: previous.style ?? null } : {}),
   };
 }
 

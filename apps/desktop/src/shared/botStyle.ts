@@ -43,6 +43,17 @@ export interface BotCommunicationStyle {
   languageHabits?: string;
 }
 
+export const BOT_STYLE_KEYS = [
+  'tone',
+  'customTone',
+  'addressUserAs',
+  'selfName',
+  'replyLength',
+  'emojiDensity',
+  'bannedPhrases',
+  'languageHabits',
+] as const satisfies readonly (keyof BotCommunicationStyle)[];
+
 const TONE_SET = new Set<string>(BOT_STYLE_TONES);
 const REPLY_LENGTH_SET = new Set<string>(BOT_STYLE_REPLY_LENGTHS);
 const EMOJI_SET = new Set<string>(BOT_STYLE_EMOJI_DENSITIES);
@@ -92,6 +103,28 @@ export function botStyleEqual(
   b: BotCommunicationStyle | null | undefined,
 ): boolean {
   return JSON.stringify(normalizeBotStyle(a) ?? null) === JSON.stringify(normalizeBotStyle(b) ?? null);
+}
+
+/**
+ * Apply this window's style-field additions/removals onto the latest persisted
+ * object so a later save of `addressUserAs` does not wipe a concurrent `tone`.
+ * Keys equal to the editing baseline take the remote value; keys this window
+ * changed keep the local value (including explicit clears).
+ */
+export function reconcileBotStyle(
+  previous: BotCommunicationStyle | null | undefined,
+  local: BotCommunicationStyle | null | undefined,
+  remote: BotCommunicationStyle | null | undefined,
+): BotCommunicationStyle | undefined {
+  const baseline = normalizeBotStyle(previous) ?? {};
+  const selected = normalizeBotStyle(local) ?? {};
+  const current = normalizeBotStyle(remote) ?? {};
+  const next: BotCommunicationStyle = {};
+  for (const key of BOT_STYLE_KEYS) {
+    const value = baseline[key] === selected[key] ? current[key] : selected[key];
+    if (value !== undefined) next[key] = value;
+  }
+  return Object.keys(next).length > 0 ? next : undefined;
 }
 
 const TONE_GUIDANCE: Record<Exclude<BotStyleTone, 'custom'>, string> = {

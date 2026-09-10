@@ -5,6 +5,7 @@ import {
   buildBotStyleGuidance,
   botStyleEqual,
   normalizeBotStyle,
+  reconcileBotStyle,
 } from '../botStyle';
 
 describe('normalizeBotStyle', () => {
@@ -65,6 +66,32 @@ describe('botStyleEqual', () => {
     expect(botStyleEqual(undefined, null)).toBe(true);
     expect(botStyleEqual({ tone: 'warm' }, { tone: 'warm', customTone: '  ' })).toBe(true);
     expect(botStyleEqual({ tone: 'warm' }, { tone: 'concise' })).toBe(false);
+  });
+});
+
+describe('reconcileBotStyle', () => {
+  it('keeps a concurrent tone when this window only edits addressUserAs', () => {
+    expect(
+      reconcileBotStyle(
+        { tone: 'warm', addressUserAs: 'Chris' },
+        { tone: 'warm', addressUserAs: 'Pat' },
+        { tone: 'concise', addressUserAs: 'Chris' },
+      ),
+    ).toEqual({ tone: 'concise', addressUserAs: 'Pat' });
+  });
+
+  it('clears only the field this window emptied', () => {
+    expect(
+      reconcileBotStyle(
+        { tone: 'warm', selfName: '小满' },
+        { tone: 'warm' },
+        { tone: 'warm', selfName: '小满', addressUserAs: 'Chris' },
+      ),
+    ).toEqual({ tone: 'warm', addressUserAs: 'Chris' });
+  });
+
+  it('returns undefined when this window cleared every baseline field and remote added none', () => {
+    expect(reconcileBotStyle({ tone: 'warm' }, null, { tone: 'warm' })).toBeUndefined();
   });
 });
 

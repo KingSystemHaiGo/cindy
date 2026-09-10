@@ -144,7 +144,7 @@ async function syncBotProfileFolder(
   }
 }
 import { buildDefaultBotIdentity } from '../../../shared/botProfileDefaults.js';
-import { normalizeBotStyle } from '../../../shared/botStyle.js';
+import { normalizeBotStyle, reconcileBotStyle } from '../../../shared/botStyle.js';
 import { coordinateBotCanonicalReplacement } from '../../maker-ipc/botCanonicalReplacementCoordinator.js';
 import { searchConversations } from '../conversationSearch.js';
 import {
@@ -1192,8 +1192,23 @@ export async function updateBotProfile(raw: unknown, expectedVersion?: number,
   }
   if (Object.prototype.hasOwnProperty.call(body, 'style')) {
     const nextStyle = readBotStyle(body.style);
-    if (nextStyle) nextConfig.style = nextStyle;
-    else delete nextConfig.style;
+    if (Object.prototype.hasOwnProperty.call(body, 'styleBaseline')) {
+      const baselineRaw = body.styleBaseline;
+      if (baselineRaw != null && (typeof baselineRaw !== 'object' || Array.isArray(baselineRaw))) {
+        throwIpcError('INVALID_PARAMS', 'styleBaseline must be an object');
+      }
+      const merged = reconcileBotStyle(
+        readBotStyle(baselineRaw),
+        nextStyle,
+        readBotStyle(previous.style),
+      );
+      if (merged) nextConfig.style = merged;
+      else delete nextConfig.style;
+    } else if (nextStyle) {
+      nextConfig.style = nextStyle;
+    } else {
+      delete nextConfig.style;
+    }
   }
   const normalizedNextConfig = normalizeBotModelCapabilitiesOrThrow(nextConfig);
   const nextIdentitySource =
