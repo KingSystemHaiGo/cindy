@@ -5447,6 +5447,48 @@ describe('GoalController', () => {
     expect(events.find((e) => e.type === 'terminal' && e.to === 'budgetLimited')).toMatchObject(owner);
   });
 
+  it('emits parked pause closeout when a stale send throws after takeover', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    let markDispatchStarted!: () => void;
+    let rejectDispatch!: (error: Error) => void;
+    const dispatchStarted = new Promise<void>((resolve) => {
+      markDispatchStarted = resolve;
+    });
+    const pendingDispatch = new Promise<SessionSendResult>((_resolve, reject) => {
+      rejectDispatch = reject;
+    });
+    vi.spyOn(local.session, 'send').mockImplementation(async (
+      message: Parameters<FakeSession['send']>[0],
+      opts: Parameters<FakeSession['send']>[1],
+    ): Promise<SessionSendResult> => {
+      const content = typeof message === 'string' ? message : message.content;
+      local.session.sends.push({ content, originKind: opts?.origin?.kind });
+      opts?.onDispatching?.();
+      markDispatchStarted();
+      return pendingDispatch;
+    });
+
+    const started = local.controller.setGoal({ sessionId: 's1', objective: 'ship it' });
+    await dispatchStarted;
+    await local.controller.pauseGoal('s1');
+    await tick();
+    expect(events.some((e) => e.type === 'turn-dispatched')).toBe(false);
+    expect(events.some((e) => e.type === 'state-transition' && e.to === 'paused')).toBe(false);
+    expect(await local.storage.get('s1')).toMatchObject({ status: 'paused' });
+
+    rejectDispatch(new Error('vendor send failed after dispatch'));
+    await started.catch(() => undefined);
+    await tick();
+
+    const paused = events.filter((e) => e.type === 'state-transition' && e.to === 'paused');
+    expect(paused).toHaveLength(1);
+    expect(paused[0]?.turnIndex).toBe(0);
+    expect(paused[0]?.lifecycleId).toBeTruthy();
+    expect(events.some((e) => e.type === 'turn-dispatched')).toBe(false);
+    expect(await local.storage.get('s1')).toMatchObject({ status: 'paused' });
+  });
+
   it('records stall-detected when noProgressLimit is hit (no tool use)', async () => {
     const events: Array<import('../runEvents').GoalRunEvent> = [];
     const local = makeController({ recordRunEvent: (e) => void events.push(e) });

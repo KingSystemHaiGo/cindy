@@ -714,6 +714,25 @@ export class GoalController {
     boundary.takeoverAbandoned = false;
   }
 
+  /** send 未接受或抛错:清 tentative,并把已 park 的接管 closeout 发成 unstamped。
+   * takeover 已换 owner 时 isCurrentDispatch 为 false,catch 也必须走这条,
+   * 不能只覆盖 accepted:false (Codex #2107 P2)。 */
+  private settleUnacceptedDispatch(
+    sessionId: string,
+    dispatchBoundary: TurnAccumulator | undefined,
+  ): void {
+    if (!dispatchBoundary) return;
+    const parkedCloseout = dispatchBoundary.pendingTakeoverCloseout;
+    const retiredLifecycle = {
+      lifecycleId: dispatchBoundary.lifecycleId,
+      generation: dispatchBoundary.generation,
+    };
+    this.clearTentativeDispatchMarkers(dispatchBoundary);
+    if (parkedCloseout) {
+      this.emitUnboundTakeoverCloseout(sessionId, parkedCloseout, retiredLifecycle);
+    }
+  }
+
   private emitTakeoverCloseout(
     sessionId: string,
     closeout: NonNullable<TurnAccumulator['pendingTakeoverCloseout']>,
@@ -3105,19 +3124,7 @@ export class GoalController {
         // takeover 已换 owner 时 isCurrentDispatch 为 false,仍必须清 tentative
         // markers / suppress closeout,否则 auditFinalized=false 会把未接受
         // send 钉成 interrupted (Codex #2107 P1)。
-        if (dispatchBoundary) {
-          const parkedCloseout = dispatchBoundary.pendingTakeoverCloseout;
-          // 钉到退休 lifecycle,但不带 dispatch turnIndex(unstamped)。
-          // 否则 recordRunEvent 会落到新 live owner,和下一轮 dispatch 撞号。
-          const retiredLifecycle = {
-            lifecycleId: dispatchBoundary.lifecycleId,
-            generation: dispatchBoundary.generation,
-          };
-          this.clearTentativeDispatchMarkers(dispatchBoundary);
-          if (parkedCloseout) {
-            this.emitUnboundTakeoverCloseout(sessionId, parkedCloseout, retiredLifecycle);
-          }
-        }
+        this.settleUnacceptedDispatch(sessionId, dispatchBoundary);
         if (!isCurrentDispatch()) return;
         this.goalTurnsInFlight.delete(sessionId);
 
@@ -3275,13 +3282,19 @@ export class GoalController {
         this.goalTurnsInFlight.delete(sessionId);
       }
       this.deps.logger.warn('[goal] fireTurn send failed', { sessionId, kind, error: String(e) });
-      if (!isCurrentFailure()) return;
-
       if ((e as { code?: unknown } | null)?.code === 'SESSION_RUNNING') {
         // dispatch 前的窄 race；现有 turn 的终态会暂停 Goal，空闲检查则负责稍后重试。
-        this.scheduleContinuation(sessionId);
+        if (isCurrentFailure()) {
+          this.scheduleContinuation(sessionId);
+          return;
+        }
+        this.settleUnacceptedDispatch(sessionId, dispatchBoundary);
         return;
       }
+      // stale send 抛错时 owner 可能已被 pause/clear 换掉;仍必须清 tentative
+      // 并兑现 parked closeout,不能只覆盖 accepted:false (Codex #2107 P2)。
+      this.settleUnacceptedDispatch(sessionId, dispatchBoundary);
+      if (!isCurrentFailure()) return;
 
       const errorMessage = e instanceof Error ? e.message : String(e);
       const persisted = await this.blockDispatchFailure(
