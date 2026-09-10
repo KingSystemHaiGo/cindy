@@ -263,7 +263,7 @@ describe('resolveMemoryScopeKey — fake probe 回落与缓存', () => {
     expect(calls).toBe(1);
   });
 
-  it('TTL 过期后重新探测', async () => {
+  it('成功归一化 sticky: TTL 过期后不重新探测 (Codex 3968440903)', async () => {
     let calls = 0;
     let tick = 0;
     const base = probeFor('/repo/.wt/x', '/repo/.git/worktrees/x', '/repo/.git', '/repo');
@@ -278,7 +278,61 @@ describe('resolveMemoryScopeKey — fake probe 回落与缓存', () => {
     expect(calls).toBe(2);
     tick = 61_000;
     await resolveMemoryScopeKey('/repo/.wt/x', null, { execGit: probe, now });
-    expect(calls).toBe(4);
+    expect(calls).toBe(2);
+  });
+
+  it('sticky 正缓存: TTL 后 git 失败仍返回 canonical, 不漂回 worktree (Codex 3968440903)', async () => {
+    const abs = (p: string) => (process.platform === 'win32' ? `C:${p}` : p);
+    const cwd = abs('/repo/.cindy-worktrees/feat');
+    let fail = false;
+    let tick = 0;
+    const base = probeFor(
+      abs('/repo/.cindy-worktrees/feat'),
+      abs('/repo/.git/worktrees/feat'),
+      abs('/repo/.git'),
+      abs('/repo'),
+    );
+    const probe: GitProbe = async (args, probeCwd) => {
+      if (fail) throw Object.assign(new Error('timed out'), { killed: true });
+      return base(args, probeCwd);
+    };
+    const first = await resolveMemoryScopeKey(cwd, null, { execGit: probe, now: () => tick });
+    expect(first).toBe(process.platform === 'win32' ? 'C:/repo' : abs('/repo'));
+    tick = 61_000;
+    fail = true;
+    const second = await resolveMemoryScopeKey(cwd, null, { execGit: probe, now: () => tick });
+    expect(second).toBe(first);
+  });
+
+  it('负结果 TTL 过期后重新探测 (Codex 3968440903)', async () => {
+    let calls = 0;
+    let tick = 0;
+    const probe: GitProbe = async () => {
+      calls += 1;
+      throw Object.assign(new Error('not a git repository'), { code: 128 });
+    };
+    await resolveMemoryScopeKey('/fake/neg-ttl', null, { execGit: probe, now: () => tick });
+    tick = 61_000;
+    await resolveMemoryScopeKey('/fake/neg-ttl', null, { execGit: probe, now: () => tick });
+    expect(calls).toBe(2);
+  });
+
+  it('合法子目录名以两点开头不判逃逸 (Codex 3974018445)', async () => {
+    const abs = (p: string) => (process.platform === 'win32' ? `C:${p}` : p);
+    const probe = probeFor(
+      abs('/repo/.cindy-worktrees/feat'),
+      abs('/repo/.git/worktrees/feat'),
+      abs('/repo/.git'),
+      abs('/repo'),
+    );
+    const key = await resolveMemoryScopeKey(
+      abs('/repo/.cindy-worktrees/feat/..config'),
+      null,
+      { execGit: probe },
+    );
+    expect(key).toBe(
+      process.platform === 'win32' ? 'C:/repo/..config' : path.join(abs('/repo'), '..config'),
+    );
   });
 
   it.skipIf(process.platform !== 'win32')(

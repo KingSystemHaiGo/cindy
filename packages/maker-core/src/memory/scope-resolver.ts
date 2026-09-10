@@ -33,9 +33,10 @@
  * (hasGitMarkerUpward, 与 rev-parse 上溯语义一致)。
  *
  * 缓存: lizi-mcps withStore 在每次 memory 工具调用都经本函数, 不能每次 spawn
- * git 子进程 — 进程内 Map 缓存 (正/负结果同 TTL, in-flight promise 去重)。
- * TTL 兜底「目录身份在进程生命周期内变化」(目录后变成 worktree 等) 的极端
- * 场景; 归一化本身幂等 (主仓路径再解析返回自身), 缓存不破坏正确性。
+ * git 子进程 — 进程内 Map 缓存, in-flight promise 去重。成功的 git 归一化
+ * (含「探测成功但无需映射」) sticky, 无 TTL: 活跃会话不得在 60s 后因探测
+ * 超时/失败从 canonical 漂回 worktree 路径 (Codex #2519 3968440903)。
+ * 失败/非仓库回落仍用 TTL, 以便目录稍后变成仓库时恢复。
  */
 
 import { execFile } from 'node:child_process';
@@ -134,22 +135,34 @@ export async function resolveMemoryScopeKey(
   const hit = scopeKeyCache.get(cacheKey);
   if (hit && hit.expiresAt > now()) return hit.value;
 
-  const value = (async () => {
+  const entry: CacheEntry = {
+    value: Promise.resolve(finalizeLocalScopeKey(workingDir)),
+    expiresAt: now() + CACHE_TTL_MS,
+  };
+  entry.value = (async () => {
     // 非仓库目录预检 (默认探测路径): 没有 .git 标记时 git rev-parse 必然失败,
     // 直接回落, 省掉一次进程 spawn (也避开 Windows 临时目录的 EPERM 竞争)。
     // 注入了 execGit 的调用方显式接管探测, 跳过预检。
     if (!execGit && !(await hasGitMarkerUpward(path.normalize(workingDir)).catch(() => true))) {
       return finalizeLocalScopeKey(workingDir);
     }
-    // 任何失败都回落 cwd 原样 — 归一化是纯增强, 绝不让 git 探测故障阻断 memory。
-    const resolved = await canonicalizeLocalWorkdir(
-      workingDir,
-      execGit ?? defaultExecGit,
-    ).catch(() => workingDir);
-    return finalizeLocalScopeKey(resolved);
+    try {
+      // 探测成功 (含无需映射) 即钉死: TTL 后再探测失败不得把已绑定的
+      // canonical 漂回 raw worktree (Codex #2519 3968440903)。
+      const resolved = await canonicalizeLocalWorkdir(
+        workingDir,
+        execGit ?? defaultExecGit,
+      );
+      entry.expiresAt = Number.POSITIVE_INFINITY;
+      return finalizeLocalScopeKey(resolved);
+    } catch {
+      // 失败回落 cwd 原样 — 归一化是纯增强, 绝不让 git 探测故障阻断 memory。
+      // 负结果保留 TTL, 不 sticky。
+      return finalizeLocalScopeKey(workingDir);
+    }
   })();
-  scopeKeyCache.set(cacheKey, { value, expiresAt: now() + CACHE_TTL_MS });
-  return value;
+  scopeKeyCache.set(cacheKey, entry);
+  return entry.value;
 }
 
 /**
@@ -230,8 +243,17 @@ async function canonicalizeLocalWorkdir(workingDir: string, execGit: GitProbe): 
   const rel = path.relative(mappingRoot, cwd);
   if (rel === '') return mainRoot;
   // cwd 不在映射根下 (symlink/大小写风格不一致等) — 不猜, 回落。
-  if (rel.startsWith('..') || path.isAbsolute(rel)) return workingDir;
+  // 只拒绝真正的父目录相对路径 (`..` / `../…`); `..config` / `...` 是合法
+  // 子目录名, `rel.startsWith('..')` 会误判逃逸 (Codex #2519 3974018445)。
+  if (isEscapedRelative(rel)) return workingDir;
   return path.join(mainRoot, rel);
+}
+
+/** path.relative 结果是否表示 cwd 已逃出 mappingRoot。 */
+function isEscapedRelative(rel: string): boolean {
+  if (path.isAbsolute(rel)) return true;
+  const norm = rel.replace(/\\/g, '/');
+  return norm === '..' || norm.startsWith('../');
 }
 
 function finalizeLocalScopeKey(key: string): string {

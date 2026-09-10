@@ -264,7 +264,14 @@ export async function planLegacyShardMigration(
     let lstat;
     try {
       lstat = await fs.lstat(dir);
-    } catch {
+    } catch (e) {
+      // ENOENT: 扫描窗口内条目消失, 忽略. 其它 I/O (EACCES/EIO) 必须进
+      // plan.failed, 不得静默丢弃 — 否则 --apply 在未检查任何分片时仍
+      // ok:true / exit 0 (Codex #2519 3974018433)。
+      if (isEnoentError(e)) continue;
+      plan.failed.push(
+        await buildSkippedInfo(dir, entry, `stat-failure:${errnoCode(e)}`),
+      );
       continue;
     }
     // 不跟随 symlink 分片目录: rename/updateMeta/dropStaleFts 会改到根外
@@ -330,6 +337,17 @@ export async function planLegacyShardMigration(
     if (hasParentDirTraversal(rawAbs)) {
       plan.skipped.push(await buildSkippedInfo(dir, entry, 'parent-dir-traversal', rawAbs));
       continue;
+    }
+    // 目录名必须由原始 absPath 派生: 手工复制/损坏 meta 若带着另一分片的
+    // 合法绝对路径, 不得被当成该路径的 legacy 并进目标 (Codex #2519 3974018438)。
+    {
+      const expectedDirName = memoryScopeDirName(rawAbs);
+      if (!sameMigrationDirName(expectedDirName, entry, windowsFsIdentity(rawAbs))) {
+        plan.failed.push(
+          await buildSkippedInfo(dir, entry, 'dir-name-mismatch', rawAbs),
+        );
+        continue;
+      }
     }
 
     let canonicalScopeKey: string;
@@ -414,6 +432,14 @@ export async function planLegacyShardMigration(
       // rebuildIndex / updateMeta 会跟随覆盖根外 (Codex #2519 3975030337)。
       plan.skipped.push(
         await buildSkippedInfo(dir, entry, 'symlink-system-file', canonicalScopeKey),
+      );
+      continue;
+    }
+    if (isLegacy && (await shardHasSymlinkShardFile(canonicalAbs))) {
+      // 既有 canonical 的合法记录若是 symlink, rebuildIndex 会把根外
+      // frontmatter/正文编进 MEMORY.md 与 FTS (Codex #2519 3975187669)。
+      plan.skipped.push(
+        await buildSkippedInfo(dir, entry, 'symlink-canonical-record', canonicalScopeKey),
       );
       continue;
     }
@@ -659,6 +685,19 @@ export async function runLegacyShardMigration(
   const renameFn = opts.rename ?? ((from: string, to: string) => fs.rename(from, to));
   const dropFtsFn = (dir: string) => dropStaleFts(dir, opts.rmFile);
   const result: RunMigrationResult = { results: [], conflicts: [] };
+  // 本轮 rename 创建的 canonical, 后续同目标候选走合并而非 concurrent-create
+  // (Codex #2519 3975187667)。大小写不敏感 FS 用小写键对齐目录身份。
+  const createdThisRun = new Set<string>();
+  const canonicalBackupDone = new Set<string>();
+  const targetIdentityKey = (dir: string, windowsFs: boolean) =>
+    windowsFs ? dir.toLowerCase() : dir;
+  const backupCanonicalOnce = async (targetDir: string, windowsFs: boolean) => {
+    if (!backupRoot) return;
+    const key = targetIdentityKey(targetDir, windowsFs);
+    if (canonicalBackupDone.has(key)) return;
+    await backupDir(targetDir, backupRoot);
+    canonicalBackupDone.add(key);
+  };
 
   // ── 1. 空分片删除 ───────────────────────────────────────────────
   for (const shard of plan.emptyToDelete) {
@@ -791,10 +830,25 @@ export async function runLegacyShardMigration(
         result.results.push(r);
         continue;
       }
+      if (await shardHasSymlinkShardFile(targetDir)) {
+        r.action = 'skipped';
+        r.error = 'symlink-canonical-record';
+        result.results.push(r);
+        continue;
+      }
+      const windowsFs =
+        windowsFsIdentity(shard.canonicalScopeKey) || windowsFsIdentity(shard.dir);
+      const createdKey = targetIdentityKey(targetDir, windowsFs);
       const targetExists = await dirExists(targetDir);
-      if (!shard.canonicalExistedAtPlan && (targetExists || (await pathExists(targetDir)))) {
-        // 计划时不存在、apply 前被并发创建 → 不得 rename/merge 覆盖新分片
-        // (Codex #2519 3974808630)。
+      const createdByThisRun = createdThisRun.has(createdKey);
+      if (
+        !shard.canonicalExistedAtPlan &&
+        !createdByThisRun &&
+        (targetExists || (await pathExists(targetDir)))
+      ) {
+        // 计划时不存在、apply 前被外部并发创建 → 不得 rename/merge 覆盖新分片
+        // (Codex #2519 3974808630)。本轮先前候选刚创建的目标除外
+        // (Codex #2519 3975187667)。
         r.action = 'skipped';
         r.error = 'concurrent-create';
         result.results.push(r);
@@ -816,6 +870,7 @@ export async function runLegacyShardMigration(
           }
           throw e;
         }
+        createdThisRun.add(createdKey);
         // meta.absPath 更新为 canonical scope key (原值 = 旧 worktree 路径)
         await updateMetaAbsPath(targetDir, shard.canonicalScopeKey, now());
         // 重建 MEMORY.md — legacy 分片索引可能缺失/过期 (写入与重建之间崩溃
@@ -836,7 +891,12 @@ export async function runLegacyShardMigration(
         }
       } else {
         // 慢路径: 逐文件合并
-        if (backupRoot) await backupDir(shard.dir, backupRoot);
+        if (backupRoot) {
+          // 首次改写已有 canonical 前备份目标, 否则默认备份只有 legacy 源,
+          // 无法把目标恢复到迁移前 (Codex #2519 3968440926)。
+          await backupCanonicalOnce(targetDir, windowsFs);
+          await backupDir(shard.dir, backupRoot);
+        }
         const merged = await mergeFilesInto(shard, targetDir, result.conflicts);
         r.mergedFiles = merged;
         // 合并后重建目标 MEMORY.md (从分片 frontmatter 派生)
