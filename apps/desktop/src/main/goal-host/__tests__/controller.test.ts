@@ -5236,6 +5236,65 @@ describe('GoalController', () => {
     expect(await local.storage.get('s1')).toMatchObject({ objective: 'first objective' });
   });
 
+  it('parks replacement closeout when the objective marker fails after the goal is committed', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({
+      recordRunEvent: (e) => void events.push(e),
+      persistUserMessage: async (_sessionId, _content, opts) => {
+        if (opts?.goalObjective?.updated) throw new Error('marker unavailable');
+      },
+    });
+    let markDispatchStarted!: () => void;
+    let releaseDispatch!: (result: SessionSendResult) => void;
+    const dispatchStarted = new Promise<void>((resolve) => {
+      markDispatchStarted = resolve;
+    });
+    const pendingDispatch = new Promise<SessionSendResult>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    let sendCount = 0;
+    vi.spyOn(local.session, 'send').mockImplementation(async (
+      message: Parameters<FakeSession['send']>[0],
+      opts: Parameters<FakeSession['send']>[1],
+    ): Promise<SessionSendResult> => {
+      sendCount += 1;
+      const content = typeof message === 'string' ? message : message.content;
+      local.session.sends.push({ content, originKind: opts?.origin?.kind });
+      opts?.onDispatching?.();
+      if (sendCount === 1) {
+        markDispatchStarted();
+        return pendingDispatch;
+      }
+      return { accepted: true };
+    });
+
+    const first = local.controller.setGoal({ sessionId: 's1', objective: 'first objective' });
+    await dispatchStarted;
+    await expect(
+      local.controller.setGoal({ sessionId: 's1', objective: 'replacement objective' }),
+    ).rejects.toThrow('marker unavailable');
+    expect(await local.storage.get('s1')).toMatchObject({
+      status: 'active',
+      objective: 'replacement objective',
+    });
+    expect(events.some((e) => e.type === 'turn-dispatched')).toBe(false);
+    expect(events.some((e) => e.type === 'cleared')).toBe(false);
+
+    releaseDispatch({ accepted: true });
+    await first.catch(() => undefined);
+    await tick();
+
+    const closeout = events.filter((e) => e.type === 'cleared' && e.reason === 'replaced by new goal');
+    expect(closeout).toHaveLength(1);
+    const oldLifecycle = closeout[0]?.lifecycleId;
+    const oldDispatch = events.filter((e) => e.type === 'turn-dispatched' && e.lifecycleId === oldLifecycle);
+    expect(oldDispatch).toHaveLength(1);
+    expect(oldDispatch[0]).toMatchObject({
+      generation: closeout[0]?.generation,
+      turnIndex: closeout[0]?.turnIndex,
+    });
+  });
+
   it('clears tentative markers when a stale owner later rejects', async () => {
     const events: Array<import('../runEvents').GoalRunEvent> = [];
     const local = makeController({ recordRunEvent: (e) => void events.push(e) });

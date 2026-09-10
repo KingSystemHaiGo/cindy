@@ -244,4 +244,43 @@ describe('createRunEventRecorder', () => {
       'g2:turn-dispatched',
     ]);
   });
+
+  it('keeps old-lifecycle closeout before a later same-timestamp new dispatch after same-lifecycle key moves', () => {
+    const rec = createRunEventRecorder();
+    rec.record(evt({
+      type: 'turn-dispatched',
+      goalSessionId: 's1',
+      lifecycleId: 'g1',
+      turnIndex: 1,
+      at: 1000,
+    }));
+    rec.record(evt({
+      type: 'turn-finalized',
+      goalSessionId: 's1',
+      lifecycleId: 'g2',
+      turnIndex: 1,
+      at: 1000,
+    }));
+    rec.record(evt({
+      type: 'terminal',
+      goalSessionId: 's1',
+      lifecycleId: 'g1',
+      turnIndex: 1,
+      to: 'complete',
+      at: 1000,
+    }));
+    rec.record(evt({
+      type: 'turn-dispatched',
+      goalSessionId: 's1',
+      lifecycleId: 'g2',
+      turnIndex: 1,
+      at: 1000,
+    }));
+    expect(rec.snapshot().map((e) => `${e.lifecycleId}:${e.type}`)).toEqual([
+      'g1:turn-dispatched',
+      'g1:terminal',
+      'g2:turn-dispatched',
+      'g2:turn-finalized',
+    ]);
+  });
 });

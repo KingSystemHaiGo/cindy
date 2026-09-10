@@ -137,7 +137,7 @@ export function createRunEventRecorder(limit = 200, sink?: RunEventSink): GoalRu
         ...evt,
         budget: evt.budget ? { ...evt.budget } : undefined,
       }));
-      // 只移动冲突的 same-session lifecycle 边:旧 closeout 若插在新 dispatch
+      // 只移动冲突的 same-session lifecycle 边:旧 closeout 若排在新 dispatch
       // 之后,提到该 dispatch 前。不得按 session 首事件把整段 session 提前,
       // 否则 A dispatch, B dispatch, A finalized 会变成 A,A,B (Codex #2107 P1)。
       const groups = new Map<string, typeof indexed>();
@@ -147,21 +147,8 @@ export function createRunEventRecorder(limit = 200, sink?: RunEventSink): GoalRu
         if (group) group.push(evt);
         else groups.set(key, [evt]);
       }
-      for (const group of groups.values()) {
-        const dispatches = group.filter((e) => dispatchGroup.has(e.type));
-        for (const closeout of group) {
-          if (!isCloseout(closeout)) continue;
-          const closeLife = lifecycleSeqOf(closeout.lifecycleId);
-          for (const dispatch of dispatches) {
-            if (lifecycleSeqOf(dispatch.lifecycleId) <= closeLife) continue;
-            if (dispatch._seq >= closeout._seq) continue;
-            closeout._key = Math.min(closeout._key, dispatch._seq - 0.5);
-          }
-        }
-      }
       // 同 lifecycle 的派发/收口约束写进 _key:派发必须排在同生命周期收口前。
-      // 用调整后的 _key,不能看原始 _seq——跨 lifecycle 移动可能把 closeout
-      // 提到更早的 dispatch 前,此时旧 dispatch 虽先插入,排序位已落后
+      // 二次移动会制造新的跨 lifecycle 倒序,必须用调整后 _key 迭代到稳定
       // (Codex #2107 P2)。比较器若 pairwise 绕过 _key 会成环。
       const byLifecycle = new Map<string, typeof indexed>();
       for (const evt of indexed) {
@@ -170,15 +157,46 @@ export function createRunEventRecorder(limit = 200, sink?: RunEventSink): GoalRu
         if (group) group.push(evt);
         else byLifecycle.set(key, [evt]);
       }
-      for (const group of byLifecycle.values()) {
-        const dispatches = group.filter((e) => dispatchGroup.has(e.type));
-        const closeouts = group.filter((e) => isCloseout(e));
-        for (const dispatch of dispatches) {
-          for (const closeout of closeouts) {
-            if (dispatch._key < closeout._key) continue;
-            dispatch._key = Math.min(dispatch._key, closeout._key - 0.5);
+      const applyCrossLifecycleKeys = (): boolean => {
+        let changed = false;
+        for (const group of groups.values()) {
+          const dispatches = group.filter((e) => dispatchGroup.has(e.type));
+          for (const closeout of group) {
+            if (!isCloseout(closeout)) continue;
+            const closeLife = lifecycleSeqOf(closeout.lifecycleId);
+            for (const dispatch of dispatches) {
+              if (lifecycleSeqOf(dispatch.lifecycleId) <= closeLife) continue;
+              if (dispatch._key >= closeout._key) continue;
+              const next = dispatch._key - 0.5;
+              if (next < closeout._key) {
+                closeout._key = next;
+                changed = true;
+              }
+            }
           }
         }
+        return changed;
+      };
+      const applySameLifecycleKeys = (): boolean => {
+        let changed = false;
+        for (const group of byLifecycle.values()) {
+          const dispatches = group.filter((e) => dispatchGroup.has(e.type));
+          const closeouts = group.filter((e) => isCloseout(e));
+          for (const dispatch of dispatches) {
+            for (const closeout of closeouts) {
+              if (dispatch._key < closeout._key) continue;
+              const next = closeout._key - 0.5;
+              if (next < dispatch._key) {
+                dispatch._key = next;
+                changed = true;
+              }
+            }
+          }
+        }
+        return changed;
+      };
+      for (let i = 0; i < indexed.length * 2; i += 1) {
+        if (!applyCrossLifecycleKeys() && !applySameLifecycleKeys()) break;
       }
       return indexed
         .sort((a, b) => {

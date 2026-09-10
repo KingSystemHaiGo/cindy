@@ -828,6 +828,30 @@ export class GoalController {
     });
   }
 
+  /** 已提交的 objective 替换:把旧派发收成 replaced-by-new-goal。
+   * persistUserMessage 失败也走这里——目标已落盘,不能当 abandoned。 */
+  private settleCommittedReplacementCloseout(
+    sessionId: string,
+    previousBoundary: TurnAccumulator | undefined,
+    editBoundary: TurnAccumulator,
+    existing: GoalState,
+  ): void {
+    const takeoverTarget = this.takeoverDispatchTarget(previousBoundary);
+    if (
+      editBoundary.interruptedDispatch ||
+      takeoverTarget?.auditFinalized === false ||
+      takeoverTarget?.pendingDispatch ||
+      takeoverTarget?.dispatchAcceptance === 'pending'
+    ) {
+      this.settleTakeoverCloseout(sessionId, previousBoundary, {
+        type: 'cleared',
+        reason: 'replaced by new goal',
+        from: existing.status,
+        state: existing,
+      });
+    }
+  }
+
   /** persist 成功后再绑 closeout;send 仍 tentative 则挂起等 acceptance。 */
   private settleTakeoverCloseout(
     sessionId: string,
@@ -1121,20 +1145,12 @@ export class GoalController {
           return null;
         }
         updatedState = updated;
-        const takeoverTarget = this.takeoverDispatchTarget(previousBoundary);
-        if (
-          editBoundary.interruptedDispatch ||
-          takeoverTarget?.auditFinalized === false ||
-          takeoverTarget?.pendingDispatch ||
-          takeoverTarget?.dispatchAcceptance === 'pending'
-        ) {
-          this.settleTakeoverCloseout(sessionId, previousBoundary, {
-            type: 'cleared',
-            reason: 'replaced by new goal',
-            from: existing.status,
-            state: existing,
-          });
-        }
+        this.settleCommittedReplacementCloseout(
+          sessionId,
+          previousBoundary,
+          editBoundary,
+          existing,
+        );
         this.resetTurn(sessionId);
         const activeBoundary = this.turns.get(sessionId);
         this.attachListener(sessionId);
@@ -1144,7 +1160,16 @@ export class GoalController {
         }
       } catch (error) {
         if (this.turns.get(sessionId) === editBoundary) {
-          if (!editObjectivePersisted) {
+          if (editObjectivePersisted) {
+            // 目标已提交,标记写入失败仍要给旧派发补 replacement closeout
+            // (Codex #2107 P1)。
+            this.settleCommittedReplacementCloseout(
+              sessionId,
+              previousBoundary,
+              editBoundary,
+              existing,
+            );
+          } else {
             const abandoned = this.takeoverDispatchTarget(previousBoundary);
             if (abandoned) {
               abandoned.takeoverAbandoned = true;
