@@ -1343,9 +1343,13 @@ export class GoalController {
             updatedAt: this.now(),
           }),
         );
+        if (limited) {
+          // persist 已提交就必须入队,哪怕后来的 pause/clear 已换 owner
+          // (Codex #2107 P2: settle committed budget closeout before stale-owner return)。
+          this.settleBudgetLimitCloseout(sessionId, previousBoundary, limited, current.status);
+        }
         if (this.turns.get(sessionId) !== limitBoundary) return reconcileLifecycleChange();
         if (limited) {
-          this.settleBudgetLimitCloseout(sessionId, previousBoundary, limited, current.status);
           this.stopSession(sessionId);
           this.emit(limited);
         }
@@ -1431,11 +1435,14 @@ export class GoalController {
           }),
           persistObjectiveMarker,
         );
-        if (this.turns.get(sessionId) !== limitBoundary) return reconcileLifecycleChange();
         if (!changed) {
-          this.turns.delete(sessionId);
+          if (this.turns.get(sessionId) === limitBoundary) this.turns.delete(sessionId);
           return null;
         }
+        // persist 已提交就必须入队,哪怕后来的 pause/clear 已换 owner
+        // (Codex #2107 P2: settle committed budget closeout before stale-owner return)。
+        this.settleBudgetLimitCloseout(sessionId, previousBoundary, changed, state.status);
+        if (this.turns.get(sessionId) !== limitBoundary) return reconcileLifecycleChange();
       } else {
         changed = await this.trackPersistence(
           operationBoundary,
@@ -1450,10 +1457,6 @@ export class GoalController {
       if (!changed) return null;
       rescheduleRejectedDispatchForObjective(changed.status);
       if (shouldLimit) {
-        if (this.turns.get(sessionId) !== limitBoundary) return reconcileLifecycleChange();
-        if (changed) {
-          this.settleBudgetLimitCloseout(sessionId, previousBoundary, changed, state.status);
-        }
         this.stopSession(sessionId);
       }
       let next = changed;
@@ -1664,13 +1667,15 @@ export class GoalController {
     }
     if (this.turns.get(sessionId) !== clearBoundary) return;
     await this.trackPersistence(clearBoundary, this.deps.storage.clear(sessionId));
-    if (this.turns.get(sessionId) !== clearBoundary) return;
+    // 删除已提交就必须入队,哪怕后来的 pause 已换 owner
+    // (Codex #2107 P2: keep a committed clear closeout after a later takeover)。
     this.settleTakeoverCloseout(sessionId, previousBoundary, {
       type: 'cleared',
       reason: 'cleared by user',
       from: auditSnapshot?.status,
       state: auditSnapshot,
     });
+    if (this.turns.get(sessionId) !== clearBoundary) return;
     this.deps.emitStatus({ sessionId, goal: null });
     this.turns.delete(sessionId);
   }
@@ -2750,9 +2755,9 @@ export class GoalController {
           updatedAt: this.now(),
         }),
       );
-      if (!isCurrent()) return true;
       if (blocked) {
-        this.emit(blocked);
+        // persist 已提交就必须记迁移,哪怕 pause/clear/replace 已换 owner
+        // (Codex #2107 P2: record committed blocked after owner change)。
         // 记录真实来源状态:resume/edit 可能从 paused/blocked/usageLimited
         // 失败,不能一律写成 active→blocked。同源 blocked 省略迁移
         // (Codex #2107 P1)。
@@ -2765,7 +2770,9 @@ export class GoalController {
             generation: boundary.generation,
           });
         }
+        if (isCurrent()) this.emit(blocked);
       }
+      if (!isCurrent()) return true;
     } catch (persistError) {
       this.deps.logger.error('[goal] failed to persist dispatch failure', {
         sessionId,
