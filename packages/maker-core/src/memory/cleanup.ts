@@ -845,10 +845,18 @@ async function reserveTrashTarget(
       await detachReservedSource(src, candidate, shardDir, filename, stamp);
       return candidate;
     } catch (e) {
-      const code = (e as NodeJS.ErrnoException).code;
+      const err = e as NodeJS.ErrnoException & { parkedPath?: string };
+      const code = err.code;
       if (code === 'CLEANUP_SOURCE_LOCKED' || code === 'CLEANUP_SOURCE_REPLACED') {
         await fs.unlink(candidate).catch(() => {});
         throw e;
+      }
+      // rename(src → parked) 已成功、后续 lstat/readFile 瞬态失败时, src 已空。
+      // 必须先把 parked 恢复到 src, 再删 candidate 重试; 否则下一轮 ENOENT,
+      // rebuildIndex 也看不到 .cleanup-parked-* (Codex P1 on #2561:
+      // restore parked source before retrying reservation)。
+      if (err.parkedPath) {
+        await restoreParkedSource(src, err.parkedPath);
       }
       await fs.unlink(candidate).catch(() => {});
       continue;
@@ -887,20 +895,33 @@ async function detachReservedSource(
       { code: 'CLEANUP_SOURCE_LOCKED' },
     );
   }
-  const [parkedStat, reservedStat, parkedBuf, reservedBuf] = await Promise.all([
-    fs.lstat(parked),
-    fs.lstat(reserved),
-    fs.readFile(parked),
-    fs.readFile(reserved),
-  ]);
-  // Prefer inode identity; also treat equal content / nlink>=2 as the reserved
-  // extra name (Windows can report ino=0). Never unlink parked when it holds a
-  // different replacement payload.
+  let parkedStat: Awaited<ReturnType<typeof fs.lstat>>;
+  let reservedStat: Awaited<ReturnType<typeof fs.lstat>>;
+  let parkedBuf: Buffer;
+  let reservedBuf: Buffer;
+  try {
+    ;[parkedStat, reservedStat, parkedBuf, reservedBuf] = await Promise.all([
+      fs.lstat(parked),
+      fs.lstat(reserved),
+      fs.readFile(parked),
+      fs.readFile(reserved),
+    ]);
+  } catch (e) {
+    // Caller restores parked → src before retrying. Never swallow this into a
+    // generic retry while src is empty (Codex P1 on #2561).
+    (e as NodeJS.ErrnoException & { parkedPath?: string }).parkedPath = parked;
+    throw e;
+  }
+  // Identity = same inode (when the FS reports a real ino) or equal bytes.
+  // Do **not** use reserved.nlink: a leftover retained hard link from a prior
+  // restoreRetained() keeps nlink>=2 after an editor replaces src, so parked
+  // would look reserved and be unlinked (Codex P1 on #2561: do not use link
+  // count to identify the parked inode). Windows often reports ino=0; equal
+  // content is the fallback identity, never nlink.
   const sameReservedInode =
     (parkedStat.ino !== 0 &&
       parkedStat.ino === reservedStat.ino &&
       parkedStat.dev === reservedStat.dev) ||
-    reservedStat.nlink >= 2 ||
     parkedBuf.equals(reservedBuf);
   if (sameReservedInode) {
     // parked is an extra name for the reserved inode — drop it, not live src.
@@ -920,6 +941,18 @@ async function detachReservedSource(
     new Error('source replaced after trash reservation; replan required'),
     { code: 'CLEANUP_SOURCE_REPLACED' },
   );
+}
+
+async function restoreParkedSource(src: string, parked: string): Promise<void> {
+  try {
+    if (await pathExists(src)) {
+      await fs.unlink(parked).catch(() => {});
+      return;
+    }
+    await fs.rename(parked, src);
+  } catch {
+    // Leave parked reachable if restore fails; do not unlink it.
+  }
 }
 
 async function pathExists(p: string): Promise<boolean> {

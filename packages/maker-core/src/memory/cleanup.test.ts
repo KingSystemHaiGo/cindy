@@ -1052,6 +1052,80 @@ describe('runMemoryCleanup', () => {
     }
   });
 
+  it('does not treat leftover nlink as proof parked is the reserved inode', async () => {
+    await shard('feedback_a.md', 'feedback', 'Same', 'hook', 'same', '2026-01-01T00:00:00.000Z');
+    await shard('feedback_b.md', 'feedback', 'Same', 'hook', 'same', '2026-02-01T00:00:00.000Z');
+
+    const plan = await planMemoryCleanup(dir);
+    // 上次 restoreRetained 留下的硬链接: reserved nlink>=2, 但 parked 是编辑器
+    // 原子替换后的新 inode。不得因 nlink 把 parked 当成 reserved 并 unlink。
+    const leftover = path.join(dir, 'feedback_a.md.retained-leftover');
+    await fs.link(path.join(dir, 'feedback_a.md'), leftover);
+    const realLink = fs.link.bind(fs);
+    const realRename = fs.rename.bind(fs);
+    const unlinkSpy = vi.spyOn(fs, 'unlink');
+    const linkSpy = vi.spyOn(fs, 'link').mockImplementation(async (src, dst) => {
+      const r = await realLink(src as string, dst as string);
+      if (String(src).endsWith('feedback_a.md') && String(dst).includes('cleanup-trash')) {
+        const tmp = `${String(src)}.editor-tmp`;
+        await writeFile(
+          tmp,
+          "---\ntitle: REPLACEMENT\ndescription: new\ntype: feedback\nupdatedAt: '2026-03-01T00:00:00.000Z'\n---\nREPLACEMENT DESPITE NLINK\n",
+          'utf8',
+        );
+        await realRename(tmp, String(src));
+      }
+      return r;
+    });
+
+    try {
+      const result = await runMemoryCleanup(plan);
+      expect(result.failed.some((f) => f.filename === 'feedback_a.md')).toBe(true);
+      expect(result.archived).toHaveLength(0);
+      await expect(readFile(path.join(dir, 'feedback_a.md'), 'utf8')).resolves.toContain(
+        'REPLACEMENT DESPITE NLINK',
+      );
+      expect(
+        unlinkSpy.mock.calls.every((call) => !String(call[0]).endsWith('feedback_a.md')),
+      ).toBe(true);
+    } finally {
+      linkSpy.mockRestore();
+      unlinkSpy.mockRestore();
+      await unlink(leftover).catch(() => {});
+    }
+  });
+
+  it('restores parked src before retrying after a transient lstat failure', async () => {
+    await shard('feedback_a.md', 'feedback', 'Same', 'hook', 'same', '2026-01-01T00:00:00.000Z');
+    await shard('feedback_b.md', 'feedback', 'Same', 'hook', 'same', '2026-02-01T00:00:00.000Z');
+
+    const plan = await planMemoryCleanup(dir);
+    // park 成功后第一次 lstat(parked) 抛 EACCES, 必须把 parked 移回 src 再重试,
+    // 不能留下 src 空 + .cleanup-parked-* 被 rebuildIndex 忽略。
+    const realLstat = fs.lstat.bind(fs);
+    let failedOnce = false;
+    const lstatSpy = vi.spyOn(fs, 'lstat').mockImplementation(async (p) => {
+      if (!failedOnce && String(p).includes('cleanup-parked')) {
+        failedOnce = true;
+        throw Object.assign(new Error('transient lock'), { code: 'EACCES' });
+      }
+      return realLstat(p as string);
+    });
+
+    try {
+      const result = await runMemoryCleanup(plan);
+      expect(failedOnce).toBe(true);
+      const names = await readdir(dir);
+      expect(names.some((n) => n.includes('cleanup-parked'))).toBe(false);
+      expect(result.failed).toHaveLength(0);
+      expect(result.archived.map((a) => a.filename)).toContain('feedback_a.md');
+      const archived = await readdir(path.join(dir, ARCHIVE_DIR_NAME));
+      expect(archived.some((n) => n.startsWith('feedback_a.md'))).toBe(true);
+    } finally {
+      lstatSpy.mockRestore();
+    }
+  });
+
   it('restores src when a write lands during the quiesce window', async () => {
     await shard('feedback_a.md', 'feedback', 'Same', 'hook', 'same', '2026-01-01T00:00:00.000Z');
     await shard('feedback_b.md', 'feedback', 'Same', 'hook', 'same', '2026-02-01T00:00:00.000Z');
