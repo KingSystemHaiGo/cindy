@@ -33,6 +33,7 @@ import { pathToFileURL } from 'node:url';
 // tsx 运行本脚本, 直接 import maker-core 源码 (同 migrate-maker-memory.mjs)。
 import {
   bindReviewedStaleCandidates,
+  parseKeepDigests,
   parseReviewedStalePlan,
   planMemoryCleanup,
   runMemoryCleanup,
@@ -120,11 +121,14 @@ function parseArgs(argv) {
       const n = Number(raw);
       // 边界校验 (Greptile P1 on #2561): 0 / 负数 / 小数 / 非数字都要明确拒绝,
       // 不能靠 truthy 或 slice 语义静默误解释。0 合法 (全清 digest)。
-      if (raw == null || raw === '' || !Number.isInteger(n) || n < 0) {
+      // 与 parseReviewedStalePlan 共用 parseKeepDigests, 避免手改 plan 绕过 CLI。
+      try {
+        if (raw == null || raw === '') throw new Error('missing');
+        out.keepDigests = parseKeepDigests(n);
+      } catch {
         process.stderr.write(`--keep-digests 必须是 >=0 的整数, 收到 "${raw}"\n`);
         process.exit(2);
       }
-      out.keepDigests = n;
     } else if (a === '--backup-dir') {
       out.backupDir = requireOperand(argv, ++i, '--backup-dir');
     } else if (a === '--force') {

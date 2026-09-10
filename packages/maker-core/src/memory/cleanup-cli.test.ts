@@ -193,6 +193,32 @@ describe('cleanup-maker-memory CLI stale binding', () => {
     expect(r.code).toBe(2);
     expect(r.stderr).toMatch(/basename|canonical|--from-plan/);
   });
+
+  it('rejects a reviewed plan whose keepDigests is negative', async () => {
+    const planPath = path.join(dir, 'bad-keep.json');
+    await writeFile(
+      planPath,
+      JSON.stringify({
+        version: 1,
+        shardDir: dir,
+        keepDigests: -100,
+        archiveStale: false,
+        staleFingerprint: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+        staleCandidates: [],
+      }),
+      'utf8',
+    );
+    const r = await runCli(['--shard', dir, '--apply', '--from-plan', planPath, '--force', '--json']);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toMatch(/keepDigests|--from-plan/);
+  });
+
+  it('declares tsx on the repo-root installer graph for node --import tsx', async () => {
+    const pkg = JSON.parse(await readFile(path.join(repoRoot, 'package.json'), 'utf8')) as {
+      devDependencies?: Record<string, string>;
+    };
+    expect(pkg.devDependencies?.tsx).toMatch(/^\^4\./);
+  });
 });
 
 describe('normalizeProcessComm (Codex P1 macOS ps paths)', () => {

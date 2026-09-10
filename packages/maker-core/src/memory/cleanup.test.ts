@@ -1294,4 +1294,35 @@ describe('bindReviewedStaleCandidates (Codex P1 on #2561 apply vs dry-run)', () 
       ).toThrow(/basename|canonical/);
     }
   });
+
+  it('rejects non-integer and negative keepDigests from a reviewed plan', () => {
+    const staleCandidates = [{ filename: 'project_a.md', expectedHash: 'abc' }];
+    const staleFingerprint = staleSetFingerprint(staleCandidates);
+    for (const keepDigests of [-100, 1.5, Number.NaN, Number.POSITIVE_INFINITY, '2']) {
+      expect(() =>
+        parseReviewedStalePlan({
+          version: 1,
+          staleFingerprint,
+          staleCandidates,
+          keepDigests,
+        }),
+      ).toThrow(/keepDigests/);
+    }
+    expect(
+      parseReviewedStalePlan({
+        version: 1,
+        staleFingerprint,
+        staleCandidates,
+        keepDigests: 0,
+      }).keepDigests,
+    ).toBe(0);
+    expect(
+      parseReviewedStalePlan({
+        version: 1,
+        staleFingerprint,
+        staleCandidates,
+        keepDigests: 5,
+      }).keepDigests,
+    ).toBe(5);
+  });
 });

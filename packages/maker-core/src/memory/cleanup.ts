@@ -83,6 +83,18 @@ export const DEFAULT_STALE_AGE_DAYS = 90;
 /** digest 保留数默认值 (#2379 正文「digest 只留最近 1–2 份」)。 */
 export const DEFAULT_KEEP_DIGESTS = 2;
 
+/**
+ * CLI `--keep-digests` 与审阅 plan 共用: 必须是 >=0 的整数。
+ * 0 合法 (全清 digest); 负数会让 slice(0, -N) 把全部 digest 标成归档
+ * (Codex P2 on #2561: Validate keepDigests loaded from the reviewed plan)。
+ */
+export function parseKeepDigests(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new Error(`keepDigests must be a >=0 integer, got ${String(value)}`);
+  }
+  return value;
+}
+
 /** 清理工具依赖注入 (测试可替换)。 */
 export interface MemoryCleanupDeps {
   now?: () => string;
@@ -245,7 +257,8 @@ export async function planMemoryCleanup(
   opts: CleanupPlanOptions = {},
 ): Promise<CleanupPlan> {
   const now = opts.deps?.now ?? (() => new Date().toISOString());
-  const keepDigests = opts.keepDigests ?? DEFAULT_KEEP_DIGESTS;
+  const keepDigests =
+    opts.keepDigests === undefined ? DEFAULT_KEEP_DIGESTS : parseKeepDigests(opts.keepDigests);
   const staleAgeDays = opts.staleAgeDays ?? DEFAULT_STALE_AGE_DAYS;
 
   const plan: CleanupPlan = {
@@ -514,7 +527,10 @@ export function parseReviewedStalePlan(raw: unknown): ReviewedStalePlanFile {
   return {
     version: 1,
     shardDir: typeof obj.shardDir === 'string' ? obj.shardDir : undefined,
-    keepDigests: typeof obj.keepDigests === 'number' ? obj.keepDigests : null,
+    keepDigests:
+      obj.keepDigests === undefined || obj.keepDigests === null
+        ? null
+        : parseKeepDigests(obj.keepDigests),
     archiveStale: obj.archiveStale === true,
     staleFingerprint: fingerprint,
     staleCandidates,
