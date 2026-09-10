@@ -83,4 +83,45 @@ describe('createRunEventRecorder', () => {
     expect(e.budget?.tokensUsed).toBe(500);
     expect(e.budget?.budgetTokens).toBe(400);
   });
+
+  it('keeps insertion order across independent sessions at the same timestamp', () => {
+    const rec = createRunEventRecorder();
+    rec.record(evt({
+      type: 'turn-dispatched',
+      goalSessionId: 'b',
+      lifecycleId: 'g2',
+      turnIndex: 1,
+      at: 1000,
+    }));
+    rec.record(evt({
+      type: 'terminal',
+      goalSessionId: 'a',
+      lifecycleId: 'g1',
+      turnIndex: 1,
+      to: 'complete',
+      at: 1000,
+    }));
+    expect(rec.snapshot().map((e) => e.goalSessionId)).toEqual(['b', 'a']);
+  });
+
+  it('still orders same-session replacements by lifecycle sequence at the same timestamp', () => {
+    const rec = createRunEventRecorder();
+    rec.record(evt({
+      type: 'turn-dispatched',
+      goalSessionId: 's1',
+      lifecycleId: 'g2',
+      turnIndex: 1,
+      at: 1000,
+    }));
+    rec.record(evt({
+      type: 'terminal',
+      goalSessionId: 's1',
+      lifecycleId: 'g1',
+      turnIndex: 4,
+      to: 'complete',
+      at: 1000,
+    }));
+    expect(rec.snapshot().map((e) => e.lifecycleId)).toEqual(['g1', 'g2']);
+    expect(rec.snapshot().map((e) => e.type)).toEqual(['terminal', 'turn-dispatched']);
+  });
 });

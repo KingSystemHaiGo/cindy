@@ -371,6 +371,9 @@ interface TurnAccumulator {
     resumeReason?: string | undefined;
     state: GoalRunEventStateSnapshot;
   };
+  /** onDispatching 时的 1-based 派发序号(turnsUsed+1)。clear/pause/replace
+   * 的 closeout 用它,不依赖随后可能失败的 storage.get 快照。 */
+  dispatchTurnIndex?: number;
   /** 生命周期唯一 id(freshTurn 生成,跨换代不变;generation 重置为 0 时仍可
    * 区分生命周期——事件排序/配对以此为准)。 */
   lifecycleId: string;
@@ -609,12 +612,18 @@ export class GoalController {
   private unfinishedDispatch(
     sessionId: string,
     boundary: TurnAccumulator | undefined,
-  ): { lifecycleId: string; generation: number } | null {
+  ): { lifecycleId: string; generation: number; turnIndex: number } | null {
     if (!boundary || boundary.cancelled) return null;
     const inFlight = this.goalTurnsInFlight.has(sessionId);
     const dispatchedUnclosed = boundary.auditFinalized === false;
     if (!inFlight && !dispatchedUnclosed) return null;
-    return { lifecycleId: boundary.lifecycleId, generation: boundary.generation };
+    return {
+      lifecycleId: boundary.lifecycleId,
+      generation: boundary.generation,
+      // snapshot 失败时仍要保留被中断的派发序号,不能回退成 1
+      // (Codex #2107 P1)。
+      turnIndex: boundary.dispatchTurnIndex ?? 1,
+    };
   }
 
   /** finalizeTurn 写收口事件后补发挂起的派发(保证 dispatch 与收口配对)。 */
@@ -812,7 +821,7 @@ export class GoalController {
             reason: 'replaced by new goal',
             lifecycleId: interruptedDispatch.lifecycleId,
             generation: interruptedDispatch.generation,
-            turnIndex: (existing.turnsUsed ?? 0) + 1,
+            turnIndex: interruptedDispatch.turnIndex,
           });
         }
         this.resetTurn(sessionId);
@@ -1336,7 +1345,7 @@ export class GoalController {
         ? {
             lifecycleId: interruptedDispatch.lifecycleId,
             generation: interruptedDispatch.generation,
-            turnIndex: (auditSnapshot?.turnsUsed ?? 0) + 1,
+            turnIndex: interruptedDispatch.turnIndex,
           }
         : {}),
     });
@@ -1394,7 +1403,7 @@ export class GoalController {
             ? {
                 lifecycleId: interruptedDispatch.lifecycleId,
                 generation: interruptedDispatch.generation,
-                turnIndex: (state.turnsUsed ?? 0) + 1,
+                turnIndex: interruptedDispatch.turnIndex,
               }
             : {}),
         });
@@ -1421,7 +1430,7 @@ export class GoalController {
           ? {
               lifecycleId: interruptedDispatch.lifecycleId,
               generation: interruptedDispatch.generation,
-              turnIndex: (state.turnsUsed ?? 0) + 1,
+              turnIndex: interruptedDispatch.turnIndex,
             }
           : {}),
       });
@@ -2852,7 +2861,10 @@ export class GoalController {
           onDispatching: () => {
             if (!isCurrentDispatch()) return;
             this.goalTurnsInFlight.add(sessionId);
-            if (dispatchBoundary) dispatchBoundary.auditFinalized = false;
+            if (dispatchBoundary) {
+              dispatchBoundary.auditFinalized = false;
+              dispatchBoundary.dispatchTurnIndex = (state.turnsUsed ?? 0) + 1;
+            }
             // signal 只负责取消 dispatch 前的 gate。跨过这个边界后由 coordinator Stop
             // 负责 active turn；否则快速终态的 stopSession 会把真实已派发轮次误报为
             // cancelled-before-dispatch。
@@ -2939,9 +2951,20 @@ export class GoalController {
         // onDispatching 是归属登记的唯一边界。不能在 await send 后再次 add：极快的
         // turn 可能已经发出终态并同步释放归属，重新登记会把后续用户 turn 误认成 Goal。
         baselineStarted = false;
-        // 被 setGoal 替换后的迟到 accepted 不再记旧派发:closeout 已由替换路径发出
-        // (Codex #2107 P2)。
-        if (!isCurrentDispatch()) return;
+        // 被 setGoal/pause/clear 换成新 owner 后的迟到 accepted 不再记旧派发:
+        // closeout 已由替换路径发出(Codex #2107 P2)。
+        // 同一生命周期的快终态(resetTurn 换代 / complete 后 stopSession 摘 owner)
+        // 仍要补记 turn-dispatched,否则审计只剩孤儿 turn-finalized/terminal
+        // (Codex #2107 P1)。
+        const currentOwner = this.turns.get(sessionId);
+        // 真替换:新 live owner(setGoal 换 objective)才丢弃迟到 accepted。
+        // 快终态 stopSession 后 currentOwner 为空、continue 的 resetTurn 仍是
+        // 同一对象、pause/clear 留下 cancelled owner —— 这些都要补记派发。
+        const replacedByNewLiveOwner =
+          currentOwner != null &&
+          currentOwner !== dispatchBoundary &&
+          !currentOwner.cancelled;
+        if (replacedByNewLiveOwner || this.disposed) return;
         if (dispatchBoundary?.finalized === true && dispatchBoundary?.auditFinalized !== true) {
           dispatchBoundary.pendingDispatch = {
             generation: dispatchGeneration,

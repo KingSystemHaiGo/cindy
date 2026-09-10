@@ -3859,6 +3859,29 @@ describe('GoalController', () => {
     expect(cleared[0]?.reason).toBe('cleared by user');
   });
 
+  it('keeps the interrupted turnIndex on cleared when the audit snapshot read fails', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    await local.storage.set(seededGoal({ status: 'paused', turnsUsed: 5, objective: 'keep going' }));
+    await local.controller.setGoal({ sessionId: 's1', objective: 'keep going', agentKind: 'claude-code' });
+    await tick();
+    const dispatched = events.filter((e) => e.type === 'turn-dispatched');
+    expect(dispatched.length).toBeGreaterThanOrEqual(1);
+    expect(dispatched[0]?.turnIndex).toBe(6);
+    vi.spyOn(local.storage, 'get').mockRejectedValueOnce(new Error('db proxy unavailable'));
+
+    await expect(local.controller.clearGoal('s1')).resolves.toBeUndefined();
+
+    const cleared = events.filter((e) => e.type === 'cleared');
+    expect(cleared).toHaveLength(1);
+    expect(cleared[0]).toMatchObject({
+      lifecycleId: dispatched[0]?.lifecycleId,
+      generation: dispatched[0]?.generation,
+      turnIndex: 6,
+      reason: 'cleared by user',
+    });
+  });
+
   it('does not emit cleared until storage.clear succeeds', async () => {
     const events: Array<import('../runEvents').GoalRunEvent> = [];
     const local = makeController({ recordRunEvent: (e) => void events.push(e) });
@@ -4645,6 +4668,97 @@ describe('GoalController', () => {
     expect(types).toContain('terminal');
     const terminal = events.find((e) => e.type === 'terminal');
     expect(terminal).toMatchObject({ to: 'complete', reason: 'all green' });
+  });
+
+  it('records turn-dispatched when accepted returns after a fast complete finalizer', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    let markDispatchStarted!: () => void;
+    let releaseDispatch!: (result: SessionSendResult) => void;
+    const dispatchStarted = new Promise<void>((resolve) => {
+      markDispatchStarted = resolve;
+    });
+    const pendingDispatch = new Promise<SessionSendResult>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    vi.spyOn(local.session, 'send').mockImplementation(async (
+      message: Parameters<FakeSession['send']>[0],
+      opts: Parameters<FakeSession['send']>[1],
+    ): Promise<SessionSendResult> => {
+      const content = typeof message === 'string' ? message : message.content;
+      local.session.sends.push({ content, originKind: opts?.origin?.kind });
+      opts?.onDispatching?.();
+      markDispatchStarted();
+      return pendingDispatch;
+    });
+
+    const started = local.controller.setGoal({ sessionId: 's1', objective: 'ship it' });
+    await dispatchStarted;
+    expect(events.some((e) => e.type === 'turn-dispatched')).toBe(false);
+
+    local.session.emitGoalTurn({
+      toolUse: true,
+      verdictJson: '```json\n{"goal_status":"complete","reason":"fast done"}\n```',
+      tokens: 12,
+    });
+    await tick();
+    expect(events.some((e) => e.type === 'terminal')).toBe(true);
+    expect(events.some((e) => e.type === 'turn-dispatched')).toBe(false);
+
+    releaseDispatch({ accepted: true });
+    await started;
+    await tick();
+
+    const dispatched = events.filter((e) => e.type === 'turn-dispatched');
+    const terminal = events.find((e) => e.type === 'terminal');
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0]).toMatchObject({
+      lifecycleId: terminal?.lifecycleId,
+      generation: terminal?.generation,
+      turnIndex: 1,
+    });
+  });
+
+  it('does not record a late accepted dispatch after the Goal is replaced', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    let markDispatchStarted!: () => void;
+    let releaseDispatch!: (result: SessionSendResult) => void;
+    const dispatchStarted = new Promise<void>((resolve) => {
+      markDispatchStarted = resolve;
+    });
+    const pendingDispatch = new Promise<SessionSendResult>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    let sendCount = 0;
+    vi.spyOn(local.session, 'send').mockImplementation(async (
+      message: Parameters<FakeSession['send']>[0],
+      opts: Parameters<FakeSession['send']>[1],
+    ): Promise<SessionSendResult> => {
+      sendCount += 1;
+      const content = typeof message === 'string' ? message : message.content;
+      local.session.sends.push({ content, originKind: opts?.origin?.kind });
+      opts?.onDispatching?.();
+      if (sendCount === 1) {
+        markDispatchStarted();
+        return pendingDispatch;
+      }
+      return { accepted: true };
+    });
+
+    const first = local.controller.setGoal({ sessionId: 's1', objective: 'first objective' });
+    await dispatchStarted;
+
+    await local.controller.setGoal({ sessionId: 's1', objective: 'replacement objective' });
+    releaseDispatch({ accepted: true });
+    await first.catch(() => undefined);
+    await tick();
+
+    const closeout = events.filter((e) => e.type === 'cleared' && e.reason === 'replaced by new goal');
+    expect(closeout.length).toBeGreaterThanOrEqual(1);
+    const oldLifecycle = closeout[0]?.lifecycleId;
+    expect(oldLifecycle).toBeTruthy();
+    expect(events.filter((e) => e.type === 'turn-dispatched' && e.lifecycleId === oldLifecycle)).toHaveLength(0);
   });
 
   it('records stall-detected when noProgressLimit is hit (no tool use)', async () => {

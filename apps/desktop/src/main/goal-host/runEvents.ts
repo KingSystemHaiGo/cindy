@@ -116,9 +116,10 @@ export function createRunEventRecorder(limit = 200, sink?: RunEventSink): GoalRu
         'cleared',
         'terminal',
       ]);
-      // lifecycleId 序号(g\d+ 单调递增):同 at 跨生命周期时按序号排序——
-      // 旧生命周期的事件(含 terminal)排在新生命周期的 turn-dispatched 之前,
-      // 保持因果顺序(同毫秒换代不把"新 run 开始"排到"旧 run 结束"之前)。
+      // lifecycleId 序号(g\d+ 单调递增):仅同 goalSessionId 的跨生命周期换代
+      // 按序号排序——旧 run 的 terminal 排在新 run 的 turn-dispatched 之前。
+      // 独立 session 不得用全局 gN:B 先落环的 dispatch 不能被更早创建的 A 的
+      // 同毫秒 terminal 插到前面(Codex #2107 P1)。
       const lifecycleSeqOf = (id?: string): number => {
         if (!id) return Number.MAX_SAFE_INTEGER;
         const m = /^g(\d+)$/.exec(id);
@@ -151,9 +152,12 @@ export function createRunEventRecorder(limit = 200, sink?: RunEventSink): GoalRu
             if (aD && bF) return -1;
             if (aF && bD) return 1;
           }
-          // 同 at 跨生命周期:按生命周期序号先后(旧生命周期先落)。
-          const byLifecycle = lifecycleSeqOf(a.lifecycleId) - lifecycleSeqOf(b.lifecycleId);
-          if (byLifecycle !== 0) return byLifecycle;
+          // 同 at 且同 session 的跨生命周期:按生命周期序号先后(旧 run 先落)。
+          // 不同 session 保持插入序,不用全局 gN。
+          if (a.goalSessionId && a.goalSessionId === b.goalSessionId) {
+            const byLifecycle = lifecycleSeqOf(a.lifecycleId) - lifecycleSeqOf(b.lifecycleId);
+            if (byLifecycle !== 0) return byLifecycle;
+          }
           // 显式插入序号作最终 tie-breaker(规范不保证 sort 稳定)。
           return a._seq - b._seq;
         })
