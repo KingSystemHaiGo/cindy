@@ -1712,8 +1712,9 @@ export class GoalController {
           updatedAt: this.now(),
         }),
       );
-      if (this.turns.get(sessionId) !== pauseBoundary) return;
       if (updated) {
+        // persist 已提交就必须入队,哪怕后来的 pause/clear 已换 owner
+        // (Codex #2107 P1: queue committed pauses before the stale-owner return)。
         this.settleTakeoverCloseout(sessionId, previousBoundary, {
           type: 'state-transition',
           reason: updated.lastReason ?? 'paused by user',
@@ -1721,7 +1722,7 @@ export class GoalController {
           to: 'paused',
           state: updated,
         });
-        this.emit(updated);
+        if (this.turns.get(sessionId) === pauseBoundary) this.emit(updated);
       }
       return;
     }
@@ -1734,7 +1735,6 @@ export class GoalController {
         updatedAt: this.now(),
       }),
     );
-    if (this.turns.get(sessionId) !== pauseBoundary) return;
     if (updated) {
       this.settleTakeoverCloseout(sessionId, previousBoundary, {
         type: 'state-transition',
@@ -1743,7 +1743,7 @@ export class GoalController {
         to: 'paused',
         state: updated,
       });
-      this.emit(updated);
+      if (this.turns.get(sessionId) === pauseBoundary) this.emit(updated);
     }
   }
 
