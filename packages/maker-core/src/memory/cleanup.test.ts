@@ -232,6 +232,31 @@ describe('planMemoryCleanup', () => {
     expect(plan.archiveItems).toHaveLength(0);
   });
 
+  it('classifies unquoted YAML Date updatedAt as age-stale from raw frontmatter', async () => {
+    // gray-matter 把未加引号 ISO 解成 Date; parseRawShard 会写成 now。
+    // stale-age 必须读 raw, 否则真正旧分片永远报不成 age。
+    await writeFile(
+      path.join(dir, 'project_oldunquoted.md'),
+      [
+        '---',
+        'title: Old',
+        'description: hook',
+        'type: project',
+        'updatedAt: 2020-01-01T00:00:00.000Z',
+        '---',
+        'no signal',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    const plan = await planMemoryCleanup(dir, {
+      deps: { now: () => '2026-06-01T00:00:00.000Z' },
+    });
+    const hit = plan.staleCandidates.find((c) => c.filename === 'project_oldunquoted.md');
+    expect(hit?.reason).toBe('age');
+    expect(plan.archiveItems).toHaveLength(0);
+  });
+
   it('lists non-adjacent question/negation as report-only candidates too', async () => {
     // 非紧邻疑问/否定 (Greptile P1 on #2561): 不再靠前缀排除, 因为终态候选
     // 本来就是 report-only, 不会误归档; 它们进候选列表由用户判断。
@@ -1130,6 +1155,100 @@ describe('runMemoryCleanup', () => {
       linkSpy.mockRestore();
       unlinkSpy.mockRestore();
       await unlink(leftover).catch(() => {});
+    }
+  });
+
+  it('does not treat equal bytes as reserved when POSIX inodes differ', async () => {
+    await shard('feedback_a.md', 'feedback', 'Same', 'hook', 'same', '2026-01-01T00:00:00.000Z');
+    await shard('feedback_b.md', 'feedback', 'Same', 'hook', 'same', '2026-02-01T00:00:00.000Z');
+
+    const plan = await planMemoryCleanup(dir);
+    const original = await readFile(path.join(dir, 'feedback_a.md'));
+    const realLink = fs.link.bind(fs);
+    const realRename = fs.rename.bind(fs);
+    const realLstat = fs.lstat.bind(fs);
+    const unlinkSpy = vi.spyOn(fs, 'unlink');
+    const linkSpy = vi.spyOn(fs, 'link').mockImplementation(async (src, dst) => {
+      const r = await realLink(src as string, dst as string);
+      if (String(src).endsWith('feedback_a.md') && String(dst).includes('cleanup-trash')) {
+        const tmp = `${String(src)}.editor-tmp`;
+        await writeFile(tmp, original);
+        await realRename(tmp, String(src));
+      }
+      return r;
+    });
+    const lstatSpy = vi.spyOn(fs, 'lstat').mockImplementation(async (p) => {
+      const st = await realLstat(p as string);
+      const pathStr = String(p);
+      if (pathStr.includes('cleanup-parked')) {
+        return Object.assign(st, { ino: 111, dev: 1 });
+      }
+      if (pathStr.includes('cleanup-trash')) {
+        return Object.assign(st, { ino: 222, dev: 1 });
+      }
+      return st;
+    });
+
+    try {
+      const result = await runMemoryCleanup(plan);
+      expect(result.failed.some((f) => f.filename === 'feedback_a.md')).toBe(true);
+      expect(result.archived.some((a) => a.filename === 'feedback_a.md')).toBe(false);
+      await expect(readFile(path.join(dir, 'feedback_a.md'), 'utf8')).resolves.toContain('same');
+      expect(
+        unlinkSpy.mock.calls.every((call) => !String(call[0]).endsWith('feedback_a.md')),
+      ).toBe(true);
+    } finally {
+      linkSpy.mockRestore();
+      lstatSpy.mockRestore();
+      unlinkSpy.mockRestore();
+    }
+  });
+
+  it('restores replacement parked to src via exclusive copy when hard links fail', async () => {
+    await shard('feedback_a.md', 'feedback', 'Same', 'hook', 'same', '2026-01-01T00:00:00.000Z');
+    await shard('feedback_b.md', 'feedback', 'Same', 'hook', 'same', '2026-02-01T00:00:00.000Z');
+
+    const plan = await planMemoryCleanup(dir);
+    const realLink = fs.link.bind(fs);
+    const realRename = fs.rename.bind(fs);
+    const unlinkSpy = vi.spyOn(fs, 'unlink');
+    const linkSpy = vi.spyOn(fs, 'link').mockImplementation(async (src, dst) => {
+      if (String(src).includes('cleanup-parked') && String(dst).endsWith('feedback_a.md')) {
+        throw Object.assign(new Error('hard links unsupported'), { code: 'ENOTSUP' });
+      }
+      const r = await realLink(src as string, dst as string);
+      if (String(src).endsWith('feedback_a.md') && String(dst).includes('cleanup-trash')) {
+        const tmp = `${String(src)}.editor-tmp`;
+        await writeFile(
+          tmp,
+          "---\ntitle: REPLACEMENT\ndescription: new\ntype: feedback\nupdatedAt: '2026-03-01T00:00:00.000Z'\n---\nREPLACEMENT INODE\n",
+          'utf8',
+        );
+        await realRename(tmp, String(src));
+      }
+      return r;
+    });
+
+    try {
+      const result = await runMemoryCleanup(plan);
+      expect(result.failed.some((f) => f.filename === 'feedback_a.md')).toBe(true);
+      expect(result.archived.some((a) => a.filename === 'feedback_a.md')).toBe(false);
+      await expect(readFile(path.join(dir, 'feedback_a.md'), 'utf8')).resolves.toContain(
+        'REPLACEMENT INODE',
+      );
+      const names = await readdir(dir);
+      const parked = names.filter((n) => n.includes('cleanup-parked'));
+      expect(parked.length).toBeGreaterThan(0);
+      const parkedRaws = await Promise.all(
+        parked.map((n) => readFile(path.join(dir, n), 'utf8')),
+      );
+      expect(parkedRaws.some((raw) => raw.includes('REPLACEMENT INODE'))).toBe(true);
+      expect(
+        unlinkSpy.mock.calls.every((call) => !String(call[0]).endsWith('feedback_a.md')),
+      ).toBe(true);
+    } finally {
+      linkSpy.mockRestore();
+      unlinkSpy.mockRestore();
     }
   });
 

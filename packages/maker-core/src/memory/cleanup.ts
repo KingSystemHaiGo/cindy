@@ -373,8 +373,13 @@ export async function planMemoryCleanup(
       });
       continue;
     }
-    const ts = Date.parse(rec.frontmatter.updatedAt);
-    if (!Number.isNaN(ts) && ts < ageCutoff) {
+    // YAML 未加引号的 ISO 会被 gray-matter 解成 Date, parseRawShard 再写成
+    // now — 必须从 raw frontmatter 取龄, 与 duplicate/digest 路径一致
+    // (Codex P1 on #2561: Parse raw YAML dates for stale-age classification)。
+    const ts =
+      parseFrontmatterUpdatedAt(rawByName.get(rec.filename)) ??
+      parseUpdatedAtMs(rec.frontmatter.updatedAt);
+    if (ts !== null && ts < ageCutoff) {
       plan.staleCandidates.push({
         filename: rec.filename,
         reason: 'age',
@@ -934,29 +939,37 @@ async function detachReservedSource(
     (e as NodeJS.ErrnoException & { parkedPath?: string }).parkedPath = parked;
     throw e;
   }
-  // Identity = same inode (when the FS reports a real ino) or equal bytes.
-  // Do **not** use reserved.nlink: a leftover retained hard link from a prior
-  // restoreRetained() keeps nlink>=2 after an editor replaces src, so parked
-  // would look reserved and be unlinked (Codex P1 on #2561: do not use link
-  // count to identify the parked inode). Windows often reports ino=0; equal
-  // content is the fallback identity, never nlink.
-  const sameReservedInode =
-    (parkedStat.ino !== 0 &&
-      parkedStat.ino === reservedStat.ino &&
-      parkedStat.dev === reservedStat.dev) ||
-    parkedBuf.equals(reservedBuf);
+  // Identity = same inode when the FS reports a real ino. Byte equality is
+  // **only** a fallback when inode identity is unavailable (both ino=0, e.g.
+  // Windows). Do not OR bytes into a reliable POSIX inode check: an editor
+  // can atomically replace src with a distinct inode of the same bytes, then
+  // keep writing through the open fd — treating parked as reserved would
+  // unlink it and lose later writes (Codex P1 on #2561: Restrict byte
+  // fallback to unavailable inode identities). Never use nlink.
+  const posixInodeAvailable = parkedStat.ino !== 0 || reservedStat.ino !== 0;
+  const sameReservedInode = posixInodeAvailable
+    ? parkedStat.ino === reservedStat.ino && parkedStat.dev === reservedStat.dev
+    : parkedBuf.equals(reservedBuf);
   if (sameReservedInode) {
     // parked is an extra name for the reserved inode — drop it, not live src.
     await fs.unlink(parked).catch(() => {});
     return;
   }
-  // parked is the replacement inode — restore it; never unlink that inode.
+  // parked is the replacement inode — restore it onto src so list()/MEMORY.md
+  // still see a canonical shard. Never unlink that inode on restore failure.
   try {
     await fs.link(parked, src);
     await fs.unlink(parked).catch(() => {});
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== 'EEXIST') {
-      // restore failed: leave parked reachable, do not unlink the replacement.
+      // ENOTSUP/EPERM/…: exclusive copy back to src; keep parked for an open
+      // writer (Codex P1 on #2561: Restore replacement files when hard links
+      // fail). Do not POSIX-rename — that can clobber a concurrent recreate.
+      try {
+        await fs.copyFile(parked, src, fs.constants.COPYFILE_EXCL);
+      } catch {
+        // copy also failed — leave parked reachable, do not clobber src.
+      }
     }
   }
   throw Object.assign(
