@@ -50,9 +50,9 @@ import {
   type RemoteMoney,
 } from '@/session/remoteMoney';
 import {
-  localizeToolLoopError,
+  localizeAgentError,
   parseMobileToolLoopErrorDetails,
-} from '@/session/toolLoopErrorI18n';
+} from '@/session/agentErrorI18n';
 import type { MobileToolInputProjection } from '@/session/messageToolPayloadProjection';
 
 export type NormalizedRemoteMessageKind =
@@ -301,7 +301,7 @@ export function normalizeRemoteMessages(
       const rawText = typeof c?.message === 'string' ? c.message : contentToPreview(message.content);
       const toolLoop = parseMobileToolLoopErrorDetails(c?.toolLoop);
       const errText =
-        describeAgentAuthError(rawText) ?? localizeToolLoopError(c?.reason, toolLoop) ?? rawText;
+        describeAgentAuthError(rawText) ?? localizeAgentError(c?.reason, toolLoop) ?? rawText;
       result.push({
         key: messageNormalizeKey(message),
         source: message,
