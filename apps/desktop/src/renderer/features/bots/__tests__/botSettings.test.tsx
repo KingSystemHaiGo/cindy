@@ -562,7 +562,7 @@ describe('Bot settings unified autosave', () => {
 
   it('keeps trailing spaces while typing style text and trims on blur', async () => {
     vi.useFakeTimers();
-    renderSettings();
+    const view = renderSettings();
     const address = screen.getByLabelText('bots.profile.style.addressUserAs') as HTMLInputElement;
     fireEvent.change(address, { target: { value: 'Chris ' } });
     expect(address.value).toBe('Chris ');
@@ -575,12 +575,24 @@ describe('Bot settings unified autosave', () => {
       style: { addressUserAs: 'Chris' },
     });
     expect(address.value).toBe('Chris ');
+    // Production updateBotProfile publishes the normalized bot; the echo must
+    // not trim the still-focused draft before blur.
+    await act(async () => {
+      view.rerender(
+        <BotSettings
+          bot={bot({ style: { addressUserAs: 'Chris' } })}
+          onBack={view.onBack}
+          onOpenSession={view.onOpenSession}
+        />,
+      );
+    });
+    expect(address.value).toBe('Chris ');
     fireEvent.blur(address);
     expect(address.value).toBe('Chris');
 
     const habits = screen.getByLabelText('bots.profile.style.languageHabits') as HTMLTextAreaElement;
-    fireEvent.change(habits, { target: { value: '先结论\n后解释' } });
-    expect(habits.value).toBe('先结论\n后解释');
+    fireEvent.change(habits, { target: { value: '先结论\n后解释\n' } });
+    expect(habits.value).toBe('先结论\n后解释\n');
   });
 
   it('clears discrete style fields when the user picks follow-default', async () => {

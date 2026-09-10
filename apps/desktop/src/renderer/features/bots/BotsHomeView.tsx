@@ -159,6 +159,7 @@ export function BotSettings({
     setDescription(next.description);
     setIdentitySource(next.identitySource);
     setUserContextSource(next.userContextSource);
+    // Self-save echo: next.style keeps the in-progress draft (trailing space/newline). Trim is IPC/blur only.
     setStyle(next.style);
     setAvatar(next.avatar);
     setAvatarColor(next.avatarColor);

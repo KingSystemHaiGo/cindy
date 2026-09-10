@@ -165,7 +165,7 @@ export function reconcileBotSettingsDraft(
 ): BotSettingsDraft {
   const normalized = normalizeBotSettingsPayload(draft, baseline.name);
   const changes = botSettingsChanges(baseline, normalized);
-  return {
+  const next: BotSettingsDraft = {
     ...incoming,
     ...Object.fromEntries(Object.keys(changes)
       .filter((key) => key !== 'capabilities')
@@ -178,6 +178,14 @@ export function reconcileBotSettingsDraft(
       toolsets: reconcileBotCapabilityList(baseline.capabilities.toolsets, draft.capabilities.toolsets, incoming.capabilities.toolsets),
     },
   };
+  // Style text is trimmed only at IPC time. A self-save echo is not a `changes`
+  // entry (normalized draft already equals baseline), so spreading `incoming`
+  // would put "Chris" back into a still-focused "Chris " field and the next
+  // word glues on. Keep the local draft when it matches the echo after normalize.
+  if (!('style' in changes) && botStyleEqual(draft.style, incoming.style)) {
+    next.style = draft.style;
+  }
+  return next;
 }
 
 /** 自动保存对用户可见的状态。`saved` 由 UI 侧短暂显示后淡出,不常驻。 */

@@ -6,6 +6,7 @@ import {
   botSettingsPayloadEqual,
   createBotSettingsAutosave,
   normalizeBotSettingsPayload,
+  reconcileBotSettingsDraft,
   type BotAutosaveStatus,
   type BotSettingsPayload,
 } from '../botSettingsAutosave';
@@ -158,6 +159,40 @@ describe('normalizeBotSettingsPayload', () => {
     ).toBe(true);
   });
 });
+
+describe('reconcileBotSettingsDraft style echo',
+  () => {
+    it('keeps trailing spaces and newlines in the local style draft on a self-save echo',
+      () => {
+        const baseline = payload({ style: { addressUserAs: 'Chris', languageHabits: '先结论\n后解释' } });
+        const draft = payload({
+          style: { addressUserAs: 'Chris ', languageHabits: '先结论\n后解释\n' },
+        });
+        const incoming = payload({ style: { addressUserAs: 'Chris', languageHabits: '先结论\n后解释' } });
+        expect(reconcileBotSettingsDraft(baseline, draft, incoming).style).toEqual({
+          addressUserAs: 'Chris ',
+          languageHabits: '先结论\n后解释\n',
+        });
+      });
+
+    it('keeps a real in-flight style edit that has not been saved yet', () => {
+      const baseline = payload({ style: { addressUserAs: 'Chris' } });
+      const draft = payload({ style: { addressUserAs: 'Chris Smith' } });
+      const incoming = payload({ style: { addressUserAs: 'Chris' } });
+      expect(reconcileBotSettingsDraft(baseline, draft, incoming).style).toEqual({
+        addressUserAs: 'Chris Smith',
+      });
+    });
+
+    it('adopts a true external style update instead of the local whitespace draft', () => {
+      const baseline = payload({ style: { addressUserAs: 'Chris' } });
+      const draft = payload({ style: { addressUserAs: 'Chris ' } });
+      const incoming = payload({ style: { addressUserAs: 'Pat' } });
+      expect(reconcileBotSettingsDraft(baseline, draft, incoming).style).toEqual({
+        addressUserAs: 'Pat',
+      });
+    });
+  });
 
 describe('botSettingsPayloadEqual', () => {
   it('detects changes in every persisted field', () => {
