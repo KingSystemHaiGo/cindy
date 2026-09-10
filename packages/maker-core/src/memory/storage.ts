@@ -42,6 +42,26 @@ const INDEX_FILENAME = 'MEMORY.md';
 const META_FILENAME = 'meta.json';
 const SHARD_EXT = '.md';
 const SLUG_REGEX = /^[a-z0-9_-]+$/;
+/** apply 全程持有的排他锁目录 — 宿主 write/delete 必须让路。 */
+export const CLEANUP_EXCLUSIVE_LOCK_DIR = '.cleanup-exclusive.lock';
+
+/**
+ * 清理 CLI 持锁期间拒绝宿主写/删, 避免 detectHost 快照后启动的 Cindy
+ * 写到即将被 rename 的 inode (Codex P1 on #2561: hold exclusive lock
+ * after host check through apply/rebuild)。
+ */
+export async function assertNoCleanupExclusiveLock(dir: string): Promise<void> {
+  try {
+    await fs.lstat(path.join(dir, CLEANUP_EXCLUSIVE_LOCK_DIR));
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw e;
+  }
+  throw new MemoryError(
+    'io-error',
+    'cleanup exclusive lock is held; host write blocked until apply/rebuild finishes',
+  );
+}
 
 /**
  * 把 workdir 绝对路径转成 sanitize 后的目录名 (Claude Code 风格)。
@@ -378,6 +398,7 @@ export class MemoryStorage {
    */
   async write(opts: WriteOptions): Promise<WriteResult> {
     this.validateOpts(opts);
+    await assertNoCleanupExclusiveLock(this.dir);
     const filename = buildFilename(opts.type, opts.name);
     const fullPath = path.join(this.dir, filename);
 
@@ -427,6 +448,8 @@ export class MemoryStorage {
     // tryReadRaw 的 await 窗口后、真正写盘前复核 owner scope (review #2388
     // Codex 8th P1): 边界不得把 shard 写入旧 owner 根。
     this.beforeFileWrite?.();
+    // await 窗口后再次确认清理锁, 避免 detectHost 快照后启动的宿主写盘。
+    await assertNoCleanupExclusiveLock(this.dir);
     await fs.writeFile(fullPath, fileText, 'utf8');
     // shard write 后、索引重建前复核 (review #2388 Codex 12th P1): writeFile
     // await 期间边界可能发生, 不得继续在旧 owner 下 rebuildIndex / 返回成功。
@@ -447,10 +470,12 @@ export class MemoryStorage {
 
   async delete(filename: string): Promise<void> {
     this.assertSafeFilename(filename);
+    await assertNoCleanupExclusiveLock(this.dir);
     const fullPath = path.join(this.dir, filename);
     // 删除前复核 (review #2388 Codex 14th P1): 单次预检只保护 delete 开始瞬间,
     // 边界在 fs.unlink / rebuildIndex 之间发生仍会删旧 owner 文件并重建索引。
     this.beforeFileWrite?.();
+    await assertNoCleanupExclusiveLock(this.dir);
     try {
       await fs.unlink(fullPath);
     } catch (e) {

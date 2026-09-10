@@ -15,13 +15,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   ARCHIVE_DIR_NAME,
+  acquireCleanupExclusiveLock,
   bindReviewedStaleCandidates,
+  CleanupLockError,
   parseReviewedStalePlan,
   planMemoryCleanup,
+  releaseCleanupExclusiveLock,
   runMemoryCleanup,
   staleSetFingerprint,
 } from './cleanup.js';
-import { MemoryStorage } from './storage.js';
+import { CLEANUP_EXCLUSIVE_LOCK_DIR, MemoryStorage } from './storage.js';
 import { MemoryError } from './types.js';
 
 let dir: string;
@@ -2052,4 +2055,74 @@ describe('bindReviewedStaleCandidates (Codex P1 on #2561 apply vs dry-run)', () 
       }).keepDigests,
     ).toBe(5);
   });
+});
+
+describe('cleanup exclusive lock (Codex P1 hold after host check)', () => {
+  it('blocks host write/delete while apply holds the exclusive lock',
+    async () => {
+      await shard(
+        'feedback_a.md',
+        'feedback',
+        'A',
+        'hook',
+        'keep',
+        '2026-01-01T00:00:00.000Z',
+      );
+      const lock = await acquireCleanupExclusiveLock(dir);
+      try {
+        const store = new MemoryStorage(dir);
+        await expect(
+          store.write({
+            type: 'feedback',
+            name: 'late',
+            title: 'Late',
+            description: 'hook',
+            body: 'host started after detectHost',
+          }),
+        ).rejects.toMatchObject({
+          code: 'io-error',
+          message: /cleanup exclusive lock/,
+        });
+        await expect(store.delete('feedback_a.md')).rejects.toMatchObject({
+          code: 'io-error',
+          message: /cleanup exclusive lock/,
+        });
+        await expect(
+          readFile(path.join(dir, 'feedback_a.md'), 'utf8'),
+        ).resolves.toMatch(/keep/);
+        await expect(
+          readFile(path.join(dir, 'feedback_late.md'), 'utf8'),
+        ).rejects.toMatchObject({ code: 'ENOENT' });
+        await expect(
+          acquireCleanupExclusiveLock(dir),
+        ).rejects.toBeInstanceOf(CleanupLockError);
+      } finally {
+        await releaseCleanupExclusiveLock(lock);
+      }
+      const store = new MemoryStorage(dir);
+      await expect(
+        store.write({
+          type: 'feedback',
+          name: 'after',
+          title: 'After',
+          description: 'hook',
+          body: 'unlocked',
+        }),
+      ).resolves.toMatchObject({ ok: true, filename: 'feedback_after.md' });
+    },
+  );
+
+  it('steals a stale lock whose owner pid is dead',
+    async () => {
+      const lockDir = path.join(dir, CLEANUP_EXCLUSIVE_LOCK_DIR);
+      await mkdir(lockDir);
+      await writeFile(
+        path.join(lockDir, 'owner.json'),
+        `${JSON.stringify({ pid: 2_147_483_647, startedAt: '2020-01-01T00:00:00.000Z' })}\n`,
+        'utf8',
+      );
+      const lock = await acquireCleanupExclusiveLock(dir);
+      await releaseCleanupExclusiveLock(lock);
+    },
+  );
 });

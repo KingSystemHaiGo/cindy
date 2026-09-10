@@ -37,8 +37,82 @@ import * as path from 'node:path';
 
 import matter from 'gray-matter';
 
-import { MemoryStorage, parseFilename } from './storage.js';
+import {
+  CLEANUP_EXCLUSIVE_LOCK_DIR,
+  MemoryStorage,
+  parseFilename,
+} from './storage.js';
 import type { MemoryRecord } from './types.js';
+
+export { CLEANUP_EXCLUSIVE_LOCK_DIR };
+
+export class CleanupLockError extends Error {
+  override name = 'CleanupLockError';
+  code = 'CLEANUP_LOCK_HELD';
+}
+
+export interface CleanupExclusiveLock {
+  lockDir: string;
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    // EPERM: 进程存在但无权发信号, 仍视为持有者活着。
+    return (e as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+async function stealStaleCleanupLock(lockDir: string): Promise<boolean> {
+  try {
+    const raw = await fs.readFile(path.join(lockDir, 'owner.json'), 'utf8');
+    const pid = (JSON.parse(raw) as { pid?: unknown }).pid;
+    if (typeof pid === 'number' && pidAlive(pid)) return false;
+  } catch {
+    // 缺 owner.json / 损坏 → 视为 stale
+  }
+  await fs.rm(lockDir, { recursive: true, force: true });
+  return true;
+}
+
+/**
+ * apply 从宿主检查到 rebuild 完成期间持有的排他锁。mkdir 原子占有;
+ * 活着的 holder 不得被抢 (Codex P1 on #2561: hold exclusive lock after
+ * host check through apply/rebuild)。
+ */
+export async function acquireCleanupExclusiveLock(
+  shardDir: string,
+): Promise<CleanupExclusiveLock> {
+  const lockDir = path.join(shardDir, CLEANUP_EXCLUSIVE_LOCK_DIR);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await fs.mkdir(lockDir);
+      await fs.writeFile(
+        path.join(lockDir, 'owner.json'),
+        `${JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() })}\n`,
+        'utf8',
+      );
+      return { lockDir };
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+      if (!(await stealStaleCleanupLock(lockDir))) {
+        throw new CleanupLockError(
+          'another process holds the maker-memory cleanup exclusive lock; wait for it to finish',
+        );
+      }
+    }
+  }
+  throw new CleanupLockError('unable to acquire maker-memory cleanup exclusive lock');
+}
+
+export async function releaseCleanupExclusiveLock(
+  handle: CleanupExclusiveLock | null | undefined,
+): Promise<void> {
+  if (!handle?.lockDir) return;
+  await fs.rm(handle.lockDir, { recursive: true, force: true });
+}
 
 /** 归档子目录名 — 退出 storage.list()/MEMORY.md/FTS 正常路径的可逆软删除区。 */
 export const ARCHIVE_DIR_NAME = '.archive';

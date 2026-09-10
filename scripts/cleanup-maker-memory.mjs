@@ -21,6 +21,7 @@
  *   - --backup-dir 可选真备份; 归档/备份目标循环递增后缀, 绝不覆盖
  *   - 执行前检测宿主进程 (Cindy 桌面应用) — 持有 Store/SQLite 句柄时拒绝;
     检测失败 (缺 tasklist/ps、权限拒绝) 同样拒绝, 须显式 --force
+  - --apply 在宿主检查后持有分片排他锁直到归档/rebuild 结束; 检测不是一次性快照
  *
  * 输出格式: 人类可读报告 + 末尾一行机器可读的 `RESULT <json>`。
  */
@@ -32,12 +33,15 @@ import { pathToFileURL } from 'node:url';
 
 // tsx 运行本脚本, 直接 import maker-core 源码 (同 migrate-maker-memory.mjs)。
 import {
+  acquireCleanupExclusiveLock,
   bindReviewedStaleCandidates,
+  CleanupLockError,
   isCindyHostComm,
   normalizeProcessComm,
   parseCleanupCliArgs,
   parseReviewedStalePlan,
   planMemoryCleanup,
+  releaseCleanupExclusiveLock,
   requireFromPlanForArchiveStale,
   resolveReviewedKeepDigests,
   runMemoryCleanup,
@@ -74,7 +78,7 @@ const HELP = `cleanup-maker-memory — 分片内清理 (P0.5, #2379)
   - --apply --archive-stale 只归档 --from-plan 里审阅过的终态集, 新命中须重新 dry-run
   - 归档/备份目标循环递增后缀, 同名冲突绝不覆盖
   - SSH 分片 / 无 meta.json 目录不属于本工具范围 (那是 migrate-maker-memory 的活)
-  - 执行前检测宿主进程
+  - 执行前检测宿主进程; --apply 持有分片排他锁直到归档/rebuild 结束
 
 示例:
   node --import tsx scripts/cleanup-maker-memory.mjs --shard "%APPDATA%/cindy/maker-memory/E--repo" --dry-run
@@ -283,119 +287,146 @@ async function main() {
     return;
   }
 
-  // --apply: 宿主排他检测 (归档会移动用户记忆文件, 见 #2529 行动项 2)。
+  // --apply: 宿主检查后持有排他锁直到归档/rebuild 结束
+  // (Codex P1 on #2561: hold exclusive lock after host check through apply)。
   const banner = (msg) => (opts.json ? process.stderr : process.stdout).write(`${msg}\n`);
   if (opts.backupDir) {
     banner(`备份目录: ${path.resolve(opts.backupDir)}`);
   }
-  if (!opts.force) {
-    const host = await detectHost();
-    if (host.status === 'unknown') {
-      process.stderr.write(
-        '❌ 无法确认宿主 (Cindy 桌面应用) 是否在运行: ' +
-          `${host.error}\n` +
-          '缺少 tasklist/ps、权限拒绝或进程查询失败时不得当作「未运行」继续 ' +
-          '(fail-open 会绕过排他检查并移动记忆文件)。\n' +
-          '请修复检测环境后重跑, 或确认无活动会话后显式加 --force。\n',
-      );
-      process.exit(3);
-    }
-    if (host.running) {
-      process.stderr.write(
-        '❌ 检测到宿主 (Cindy 桌面应用) 正在运行 — 归档会移动用户记忆文件, ' +
-          '宿主持有的 Store/SQLite 句柄会与归档冲突。\n' +
-          '请先退出 Cindy 再运行; 确认无活动会话时可用 --force 继续。\n',
-      );
-      process.exit(3);
-    }
-  }
-
-  // --apply --archive-stale 必须绑 dry-run 审阅集, 不得 live 重扫后把新 stale
-  // 一并归档 (Codex P1 on #2561: apply must bind to the reviewed dry-run set)。
-  let extraLive = [];
-  let archiveStale = opts.archiveStale;
-  let boundFingerprint = null;
-  if (reviewedPlan) {
-    extraLive = bindReviewedStaleCandidates(plan, reviewedPlan.staleCandidates).extraLive;
-    boundFingerprint = reviewedPlan.staleFingerprint;
-    // 审阅文件带 archiveStale, 或 CLI 显式 --archive-stale, 才归档该审阅集。
-    archiveStale = opts.archiveStale || reviewedPlan.archiveStale;
-  } else if (archiveStale) {
+  let exclusiveLock = null;
+  const abortApply = async (code) => {
+    await releaseCleanupExclusiveLock(exclusiveLock);
+    exclusiveLock = null;
+    process.exit(code);
+  };
+  try {
     try {
-      requireFromPlanForArchiveStale(opts);
+      exclusiveLock = await acquireCleanupExclusiveLock(shard);
     } catch (e) {
+      if (e instanceof CleanupLockError) {
+        process.stderr.write(`❌ ${e.message}\n`);
+        process.exit(3);
+      }
+      throw e;
+    }
+    if (!opts.force) {
+      const host = await detectHost();
+      if (host.status === 'unknown') {
+        process.stderr.write(
+          '❌ 无法确认宿主 (Cindy 桌面应用) 是否在运行: ' +
+            `${host.error}\n` +
+            '缺少 tasklist/ps、权限拒绝或进程查询失败时不得当作「未运行」继续 ' +
+            '(fail-open 会绕过排他检查并移动记忆文件)。\n' +
+            '请修复检测环境后重跑, 或确认无活动会话后显式加 --force。\n',
+        );
+        await abortApply(3);
+      }
+      if (host.running) {
+        process.stderr.write(
+          '❌ 检测到宿主 (Cindy 桌面应用) 正在运行 — 归档会移动用户记忆文件, ' +
+            '宿主持有的 Store/SQLite 句柄会与归档冲突。\n' +
+            '请先退出 Cindy 再运行; 确认无活动会话时可用 --force 继续。\n',
+        );
+        await abortApply(3);
+      }
+      const hostAgain = await detectHost();
+      if (hostAgain.status === 'unknown' || hostAgain.running) {
+        process.stderr.write(
+          '❌ 持锁后复查仍检测到宿主或无法确认宿主状态; 拒绝 apply, 避免并发写。\n',
+        );
+        await abortApply(3);
+      }
+    }
+
+    // --apply --archive-stale 必须绑 dry-run 审阅集, 不得 live 重扫后把新 stale
+    // 一并归档 (Codex P1 on #2561: apply must bind to the reviewed dry-run set)。
+    let extraLive = [];
+    let archiveStale = opts.archiveStale;
+    let boundFingerprint = null;
+    if (reviewedPlan) {
+      extraLive = bindReviewedStaleCandidates(plan, reviewedPlan.staleCandidates).extraLive;
+      boundFingerprint = reviewedPlan.staleFingerprint;
+      // 审阅文件带 archiveStale, 或 CLI 显式 --archive-stale, 才归档该审阅集。
+      archiveStale = opts.archiveStale || reviewedPlan.archiveStale;
+    } else if (archiveStale) {
+      try {
+        requireFromPlanForArchiveStale(opts);
+      } catch (e) {
+        process.stderr.write(
+          `${e?.message ?? e}\n` +
+            '  apply 不得重新扫描终态候选; 新命中须重新 dry-run 审阅后再 apply。\n',
+        );
+        await abortApply(2);
+      }
+    }
+
+    if (opts.staleSetHash) {
+      const expected = boundFingerprint ?? staleSetFingerprint(plan.staleCandidates);
+      if (opts.staleSetHash !== expected) {
+        process.stderr.write(
+          `--stale-set-hash 与审阅终态集不一致:\n  expected: ${opts.staleSetHash}\n  bound: ${expected}\n` +
+            '  请重新 --dry-run 审阅, 或传入 RESULT.staleFingerprint。\n',
+        );
+        await abortApply(2);
+      }
+    }
+    if (archiveStale && extraLive.length > 0 && !opts.confirmStaleDiff) {
       process.stderr.write(
-        `${e?.message ?? e}\n` +
-          '  apply 不得重新扫描终态候选; 新命中须重新 dry-run 审阅后再 apply。\n',
+        `live 扫描比审阅集多出 ${extraLive.length} 条终态候选, 拒绝归档以免删未审阅分片:\n`,
       );
-      process.exit(2);
-    }
-  }
-
-  if (opts.staleSetHash) {
-    const expected = boundFingerprint ?? staleSetFingerprint(plan.staleCandidates);
-    if (opts.staleSetHash !== expected) {
+      for (const c of extraLive) {
+        process.stderr.write(`  - ${c.filename} (${c.reason}${c.matchedSignal ? ` "${c.matchedSignal}"` : ''})\n`);
+      }
       process.stderr.write(
-        `--stale-set-hash 与审阅终态集不一致:\n  expected: ${opts.staleSetHash}\n  bound: ${expected}\n` +
-          '  请重新 --dry-run 审阅, 或传入 RESULT.staleFingerprint。\n',
+        '请重新 --dry-run 审阅, 或显式 --confirm-stale-diff 只归档审阅集、跳过上述新命中。\n',
       );
-      process.exit(2);
+      await abortApply(6);
     }
-  }
-  if (archiveStale && extraLive.length > 0 && !opts.confirmStaleDiff) {
-    process.stderr.write(
-      `live 扫描比审阅集多出 ${extraLive.length} 条终态候选, 拒绝归档以免删未审阅分片:\n`,
-    );
-    for (const c of extraLive) {
-      process.stderr.write(`  - ${c.filename} (${c.reason}${c.matchedSignal ? ` "${c.matchedSignal}"` : ''})\n`);
-    }
-    process.stderr.write(
-      '请重新 --dry-run 审阅, 或显式 --confirm-stale-diff 只归档审阅集、跳过上述新命中。\n',
-    );
-    process.exit(6);
-  }
 
-  const result = await runMemoryCleanup(plan, {
-    ...(opts.backupDir ? { backupRoot: path.resolve(opts.backupDir) } : {}),
-    archiveStale,
-  });
-
-  if (!opts.json) {
-    process.stdout.write(`清理完成: 归档 ${result.archived.length} 条 → ${shard}/.archive/\n`);
-    for (const a of result.archived) {
-      process.stdout.write(`  [${a.reason}] ${a.filename} — ${a.detail}\n`);
-    }
-    for (const f of result.failed) {
-      process.stdout.write(`  [failed] ${f.filename} — ${f.error}\n`);
-    }
-  }
-  process.stdout.write(
-    `RESULT ${JSON.stringify({
-      mode: 'apply',
+    const result = await runMemoryCleanup(plan, {
+      ...(opts.backupDir ? { backupRoot: path.resolve(opts.backupDir) } : {}),
       archiveStale,
-      staleFingerprint: boundFingerprint,
-      skippedUnreviewedStale: extraLive.map((c) => c.filename),
-      archived: result.archived,
-      failed: result.failed,
-      indexRebuildError: result.indexRebuildError ?? null,
-    })}\n`,
-  );
+    });
 
-  // 归档失败必须非零退出 (Codex P1 on #2561): 自动化会误把「源保留未清理」
-  // 当成成功, 导致清理被静默跳过。exit 5 区分于缺参(2)/宿主(3)/索引失败(4)。
-  if (result.failed.length > 0) {
-    const warn = (msg) => (opts.json ? process.stderr : process.stdout).write(`${msg}\n`);
-    warn(`⚠️ ${result.failed.length} 个文件归档失败, 源已保留在分片目录, 请修复后重跑。`);
-    process.exit(5);
-  }
+    if (!opts.json) {
+      process.stdout.write(`清理完成: 归档 ${result.archived.length} 条 → ${shard}/.archive/\n`);
+      for (const a of result.archived) {
+        process.stdout.write(`  [${a.reason}] ${a.filename} — ${a.detail}\n`);
+      }
+      for (const f of result.failed) {
+        process.stdout.write(`  [failed] ${f.filename} — ${f.error}\n`);
+      }
+    }
+    process.stdout.write(
+      `RESULT ${JSON.stringify({
+        mode: 'apply',
+        archiveStale,
+        staleFingerprint: boundFingerprint,
+        skippedUnreviewedStale: extraLive.map((c) => c.filename),
+        archived: result.archived,
+        failed: result.failed,
+        indexRebuildError: result.indexRebuildError ?? null,
+      })}\n`,
+    );
 
-  // MEMORY.md 重建失败必须暴露 (Codex P2 on #2561): 静默会让旧索引把已归档
-  // 文件继续注入后续会话, 且 store.init() 只修 FTS 不重建索引。
-  if (result.indexRebuildError) {
-    const warn = (msg) => (opts.json ? process.stderr : process.stdout).write(`${msg}\n`);
-    warn('⚠️ MEMORY.md 重建失败: ' + result.indexRebuildError);
-    warn('  归档已落盘, 但旧索引可能仍引用已归档文件; 请修复索引文件权限/磁盘后重跑。');
-    process.exit(4);
+    // 归档失败必须非零退出 (Codex P1 on #2561): 自动化会误把「源保留未清理」
+    // 当成成功, 导致清理被静默跳过。exit 5 区分于缺参(2)/宿主(3)/索引失败(4)。
+    if (result.failed.length > 0) {
+      const warn = (msg) => (opts.json ? process.stderr : process.stdout).write(`${msg}\n`);
+      warn(`⚠️ ${result.failed.length} 个文件归档失败, 源已保留在分片目录, 请修复后重跑。`);
+      await abortApply(5);
+    }
+
+    // MEMORY.md 重建失败必须暴露 (Codex P2 on #2561): 静默会让旧索引把已归档
+    // 文件继续注入后续会话, 且 store.init() 只修 FTS 不重建索引。
+    if (result.indexRebuildError) {
+      const warn = (msg) => (opts.json ? process.stderr : process.stdout).write(`${msg}\n`);
+      warn('⚠️ MEMORY.md 重建失败: ' + result.indexRebuildError);
+      warn('  归档已落盘, 但旧索引可能仍引用已归档文件; 请修复索引文件权限/磁盘后重跑。');
+      await abortApply(4);
+    }
+  } finally {
+    await releaseCleanupExclusiveLock(exclusiveLock);
   }
 }
 
@@ -438,3 +469,4 @@ if (isCliEntry()) {
     process.exit(1);
   });
 }
+
