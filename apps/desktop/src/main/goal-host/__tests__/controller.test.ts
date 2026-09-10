@@ -5319,6 +5319,134 @@ describe('GoalController', () => {
     });
   });
 
+  it('binds budget closeout to the tentative dispatch after send is accepted', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    let markDispatchStarted!: () => void;
+    let releaseDispatch!: (result: SessionSendResult) => void;
+    const dispatchStarted = new Promise<void>((resolve) => {
+      markDispatchStarted = resolve;
+    });
+    const pendingDispatch = new Promise<SessionSendResult>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    vi.spyOn(local.session, 'send').mockImplementation(async (
+      message: Parameters<FakeSession['send']>[0],
+      opts: Parameters<FakeSession['send']>[1],
+    ): Promise<SessionSendResult> => {
+      const content = typeof message === 'string' ? message : message.content;
+      local.session.sends.push({ content, originKind: opts?.origin?.kind });
+      opts?.onDispatching?.();
+      markDispatchStarted();
+      return pendingDispatch;
+    });
+
+    await local.storage.upsert(seededGoal({
+      status: 'active',
+      turnsUsed: 3,
+      maxTurns: 10,
+      objective: 'ship it',
+    }));
+    const started = local.controller.resumeActiveGoals();
+    await dispatchStarted;
+
+    await local.controller.updateGoal('s1', { maxTurns: 1 });
+    await tick();
+    expect(events.some((e) => e.type === 'turn-dispatched')).toBe(false);
+    expect(events.some((e) => e.type === 'budget-consumed')).toBe(false);
+    expect(events.some((e) => e.type === 'terminal')).toBe(false);
+
+    releaseDispatch({ accepted: true });
+    await started.catch(() => undefined);
+    await tick();
+
+    const dispatched = events.filter((e) => e.type === 'turn-dispatched');
+    expect(dispatched).toHaveLength(1);
+    const owner = {
+      lifecycleId: dispatched[0]?.lifecycleId,
+      generation: dispatched[0]?.generation,
+      turnIndex: dispatched[0]?.turnIndex,
+    };
+    expect(events.find((e) => e.type === 'state-transition' && e.to === 'budgetLimited')).toMatchObject(owner);
+    expect(events.find((e) => e.type === 'budget-consumed')).toMatchObject(owner);
+    expect(events.find((e) => e.type === 'terminal' && e.to === 'budgetLimited')).toMatchObject(owner);
+    expect(await local.storage.get('s1')).toMatchObject({ status: 'budgetLimited', maxTurns: 1 });
+  });
+
+  it('parks a late accepted dispatch until budget persist commits', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    let markDispatchStarted!: () => void;
+    let releaseDispatch!: (result: SessionSendResult) => void;
+    const dispatchStarted = new Promise<void>((resolve) => {
+      markDispatchStarted = resolve;
+    });
+    const pendingDispatch = new Promise<SessionSendResult>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    vi.spyOn(local.session, 'send').mockImplementation(async (
+      message: Parameters<FakeSession['send']>[0],
+      opts: Parameters<FakeSession['send']>[1],
+    ): Promise<SessionSendResult> => {
+      const content = typeof message === 'string' ? message : message.content;
+      local.session.sends.push({ content, originKind: opts?.origin?.kind });
+      opts?.onDispatching?.();
+      markDispatchStarted();
+      return pendingDispatch;
+    });
+
+    await local.storage.upsert(seededGoal({
+      status: 'active',
+      turnsUsed: 3,
+      maxTurns: 10,
+      objective: 'ship it',
+    }));
+    const started = local.controller.resumeActiveGoals();
+    await dispatchStarted;
+
+    const origUpdate = local.storage.update.bind(local.storage);
+    let releaseUpdate!: (state: GoalState | null) => void;
+    const blockedUpdate = new Promise<GoalState | null>((resolve) => {
+      releaseUpdate = resolve;
+    });
+    let blockedOnce = false;
+    vi.spyOn(local.storage, 'update').mockImplementation(async (sessionId, patch) => {
+      if (!blockedOnce && patch.status === 'budgetLimited') {
+        blockedOnce = true;
+        return blockedUpdate;
+      }
+      return origUpdate(sessionId, patch);
+    });
+
+    const limit = local.controller.updateGoal('s1', { maxTurns: 1 });
+    await vi.waitFor(() => expect(blockedOnce).toBe(true));
+    releaseDispatch({ accepted: true });
+    await tick();
+    expect(events.some((e) => e.type === 'turn-dispatched')).toBe(false);
+    expect(events.some((e) => e.type === 'budget-consumed')).toBe(false);
+
+    const existing = await origUpdate('s1', {
+      maxTurns: 1,
+      status: 'budgetLimited',
+      lastReason: 'budget limit lowered below current usage',
+    });
+    releaseUpdate(existing);
+    await limit;
+    await started.catch(() => undefined);
+    await tick();
+
+    const dispatched = events.filter((e) => e.type === 'turn-dispatched');
+    expect(dispatched).toHaveLength(1);
+    const owner = {
+      lifecycleId: dispatched[0]?.lifecycleId,
+      generation: dispatched[0]?.generation,
+      turnIndex: dispatched[0]?.turnIndex,
+    };
+    expect(events.find((e) => e.type === 'state-transition' && e.to === 'budgetLimited')).toMatchObject(owner);
+    expect(events.find((e) => e.type === 'budget-consumed')).toMatchObject(owner);
+    expect(events.find((e) => e.type === 'terminal' && e.to === 'budgetLimited')).toMatchObject(owner);
+  });
+
   it('records stall-detected when noProgressLimit is hit (no tool use)', async () => {
     const events: Array<import('../runEvents').GoalRunEvent> = [];
     const local = makeController({ recordRunEvent: (e) => void events.push(e) });

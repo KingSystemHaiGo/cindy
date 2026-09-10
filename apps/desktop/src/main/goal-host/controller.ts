@@ -375,14 +375,14 @@ interface TurnAccumulator {
    * 的 closeout 用它,不依赖随后可能失败的 storage.get 快照。 */
   dispatchTurnIndex?: number;
   /**
-   * send 尚未返回前的派发只是 tentative。clear/pause/replace 不得把
-   * closeout 绑到未确认 send;accepted:false 时还要清掉已停的 markers
-   * (Codex #2107 P1)。
+   * send 尚未返回前的派发只是 tentative。clear/pause/replace/预算接管
+   * 不得把 closeout 绑到未确认 send;accepted:false 时还要清掉已停的
+   * markers (Codex #2107 P1 / P2)。
    */
   dispatchAcceptance?: 'pending' | 'accepted' | 'rejected';
   /** 接管 persist 成功但 send 仍 tentative 时,挂起 closeout 等 acceptance。 */
   pendingTakeoverCloseout?: {
-    type: 'cleared' | 'state-transition';
+    type: 'cleared' | 'state-transition' | 'budget-limited';
     reason: string;
     from?: GoalStatus;
     to?: GoalStatus;
@@ -729,6 +729,10 @@ export class GoalController {
       });
       return;
     }
+    if (closeout.type === 'budget-limited') {
+      this.emitBudgetLimitCloseout(sessionId, closeout, owner);
+      return;
+    }
     this.recordRunEvent('state-transition', sessionId, closeout.state, {
       from: closeout.from,
       to: closeout.to,
@@ -736,6 +740,32 @@ export class GoalController {
       lifecycleId: owner.lifecycleId,
       generation: owner.generation,
       turnIndex: owner.turnIndex,
+    });
+  }
+
+  /** 预算接管的三件组必须同一 owner,不能让 state-transition 跟 dispatched 而
+   * budget-consumed/terminal 掉到新 lifecycle (Codex #2107 P2)。 */
+  private emitBudgetLimitCloseout(
+    sessionId: string,
+    closeout: NonNullable<TurnAccumulator['pendingTakeoverCloseout']>,
+    identity?: { lifecycleId: string; generation: number; turnIndex?: number },
+  ): void {
+    this.recordRunEvent('state-transition', sessionId, closeout.state, {
+      from: closeout.from,
+      to: 'budgetLimited',
+      reason: closeout.reason,
+      ...identity,
+    });
+    this.recordRunEvent('budget-consumed', sessionId, closeout.state, {
+      from: closeout.from,
+      to: 'budgetLimited',
+      reason: closeout.reason,
+      ...identity,
+    });
+    this.recordRunEvent('terminal', sessionId, closeout.state, {
+      to: 'budgetLimited',
+      reason: closeout.reason,
+      ...identity,
     });
   }
 
@@ -777,11 +807,31 @@ export class GoalController {
       });
       return;
     }
+    if (closeout.type === 'budget-limited') {
+      this.emitBudgetLimitCloseout(sessionId, closeout, identity);
+      return;
+    }
     this.recordRunEvent('state-transition', sessionId, closeout.state, {
       from: closeout.from,
       to: closeout.to,
       reason: closeout.reason,
       ...identity,
+    });
+  }
+
+  /** persist 成功后再绑预算收口;send 仍 tentative 则挂起等 acceptance。 */
+  private settleBudgetLimitCloseout(
+    sessionId: string,
+    previous: TurnAccumulator | undefined,
+    limited: GoalState,
+    from: GoalStatus,
+  ): void {
+    this.settleTakeoverCloseout(sessionId, previous, {
+      type: 'budget-limited',
+      reason: limited.lastReason ?? 'budget limit lowered below current usage',
+      from,
+      to: 'budgetLimited',
+      state: limited,
     });
   }
 
@@ -1196,31 +1246,7 @@ export class GoalController {
         );
         if (this.turns.get(sessionId) !== limitBoundary) return reconcileLifecycleChange();
         if (limited) {
-          this.flushRetiredPendingDispatch(sessionId, previousBoundary);
-          const budgetOwner = limitBoundary.interruptedDispatch
-            ? {
-                lifecycleId: limitBoundary.interruptedDispatch.lifecycleId,
-                generation: limitBoundary.interruptedDispatch.generation,
-                turnIndex: limitBoundary.interruptedDispatch.turnIndex,
-              }
-            : {};
-          this.recordRunEvent('state-transition', sessionId, limited, {
-            from: current.status,
-            to: 'budgetLimited',
-            reason: limited.lastReason,
-            ...budgetOwner,
-          });
-          this.recordRunEvent('budget-consumed', sessionId, limited, {
-            from: current.status,
-            to: 'budgetLimited',
-            reason: limited.lastReason,
-            ...budgetOwner,
-          });
-          this.recordRunEvent('terminal', sessionId, limited, {
-            to: 'budgetLimited',
-            reason: limited.lastReason,
-            ...budgetOwner,
-          });
+          this.settleBudgetLimitCloseout(sessionId, previousBoundary, limited, current.status);
           this.stopSession(sessionId);
           this.emit(limited);
         }
@@ -1327,31 +1353,7 @@ export class GoalController {
       if (shouldLimit) {
         if (this.turns.get(sessionId) !== limitBoundary) return reconcileLifecycleChange();
         if (changed) {
-          this.flushRetiredPendingDispatch(sessionId, previousBoundary);
-          const budgetOwner = limitBoundary?.interruptedDispatch
-            ? {
-                lifecycleId: limitBoundary.interruptedDispatch.lifecycleId,
-                generation: limitBoundary.interruptedDispatch.generation,
-                turnIndex: limitBoundary.interruptedDispatch.turnIndex,
-              }
-            : {};
-          this.recordRunEvent('state-transition', sessionId, changed, {
-            from: state.status,
-            to: 'budgetLimited',
-            reason: changed.lastReason,
-            ...budgetOwner,
-          });
-          this.recordRunEvent('budget-consumed', sessionId, changed, {
-            from: state.status,
-            to: 'budgetLimited',
-            reason: changed.lastReason,
-            ...budgetOwner,
-          });
-          this.recordRunEvent('terminal', sessionId, changed, {
-            to: 'budgetLimited',
-            reason: changed.lastReason,
-            ...budgetOwner,
-          });
+          this.settleBudgetLimitCloseout(sessionId, previousBoundary, changed, state.status);
         }
         this.stopSession(sessionId);
       }
