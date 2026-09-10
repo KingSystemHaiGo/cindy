@@ -612,6 +612,19 @@ export class GoalController {
   }
 
   /**
+   * 接管路径把挂起的派发从退休 boundary 发出。accepted 已 park 但 finalizeTurn
+   * 还在 await 时,clear/pause/replace/budget-limit 会让 isCurrentTurn 失败,
+   * 不在这里补发就会丢 turn-dispatched (Codex #2107 P1)。
+   */
+  private flushRetiredPendingDispatch(
+    sessionId: string,
+    previous: TurnAccumulator | undefined,
+  ): void {
+    if (!previous?.pendingDispatch) return;
+    this.flushPendingDispatch(sessionId, previous);
+  }
+
+  /**
    * 未收口的派发:onDispatching 之后、finalizeTurn 审计写完之前。
    * done 会先摘掉 goalTurnsInFlight,不能只靠 in-flight 集合判断
    * (Codex #2107 P2: preserve dispatch owner after done)。
@@ -780,11 +793,13 @@ export class GoalController {
       const previousBoundary = this.turns.get(sessionId);
       const interruptedDispatch = this.unfinishedDispatch(sessionId, previousBoundary);
       this.stopSession(sessionId);
+      this.flushRetiredPendingDispatch(sessionId, previousBoundary);
       const editBoundary = freshTurn(
         false,
         previousBoundary?.pendingPersistence ?? null,
         previousBoundary?.pendingCompletion ?? null,
       );
+      if (interruptedDispatch) editBoundary.interruptedDispatch = interruptedDispatch;
       this.turns.set(sessionId, editBoundary);
       let editObjectivePersisted = false;
       let updatedState: GoalState | null = null;
@@ -987,12 +1002,15 @@ export class GoalController {
       // 预算条件仍成立；必须用 settle 后的最新 counters 再判一次，不能返回超限 active。
       if (current.status === 'active' && exceedsGoalBudget(current)) {
         const previousBoundary = this.turns.get(sessionId);
+        const interruptedDispatch = this.unfinishedDispatch(sessionId, previousBoundary);
         this.stopSession(sessionId);
+        this.flushRetiredPendingDispatch(sessionId, previousBoundary);
         const limitBoundary = freshTurn(
           true,
           previousBoundary?.pendingPersistence ?? null,
           previousBoundary?.pendingCompletion ?? null,
         );
+        if (interruptedDispatch) limitBoundary.interruptedDispatch = interruptedDispatch;
         this.turns.set(sessionId, limitBoundary);
         await this.awaitPendingLifecycle(limitBoundary);
         if (this.turns.get(sessionId) !== limitBoundary) return reconcileLifecycleChange();
@@ -1006,19 +1024,29 @@ export class GoalController {
         );
         if (this.turns.get(sessionId) !== limitBoundary) return reconcileLifecycleChange();
         if (limited) {
+          const budgetOwner = interruptedDispatch
+            ? {
+                lifecycleId: interruptedDispatch.lifecycleId,
+                generation: interruptedDispatch.generation,
+                turnIndex: interruptedDispatch.turnIndex,
+              }
+            : {};
           this.recordRunEvent('state-transition', sessionId, limited, {
             from: current.status,
             to: 'budgetLimited',
             reason: limited.lastReason,
+            ...budgetOwner,
           });
           this.recordRunEvent('budget-consumed', sessionId, limited, {
             from: current.status,
             to: 'budgetLimited',
             reason: limited.lastReason,
+            ...budgetOwner,
           });
           this.recordRunEvent('terminal', sessionId, limited, {
             to: 'budgetLimited',
             reason: limited.lastReason,
+            ...budgetOwner,
           });
           this.stopSession(sessionId);
           this.emit(limited);
@@ -1082,12 +1110,15 @@ export class GoalController {
         // 降低上限是显式生命周期接管：同步摘掉旧 listener/timer，等旧 finalize 写完后，
         // 用同一条 UPDATE 同时提交新上限与 budgetLimited，避免暴露可被旧写覆盖的 active 中间态。
         const previousBoundary = this.turns.get(sessionId);
+        const interruptedDispatch = this.unfinishedDispatch(sessionId, previousBoundary);
         this.stopSession(sessionId);
+        this.flushRetiredPendingDispatch(sessionId, previousBoundary);
         limitBoundary = freshTurn(
           true,
           previousBoundary?.pendingPersistence ?? null,
           previousBoundary?.pendingCompletion ?? null,
         );
+        if (interruptedDispatch) limitBoundary.interruptedDispatch = interruptedDispatch;
         this.turns.set(sessionId, limitBoundary);
         await this.awaitPendingLifecycle(limitBoundary);
         if (this.turns.get(sessionId) !== limitBoundary) return reconcileLifecycleChange();
@@ -1122,19 +1153,29 @@ export class GoalController {
       if (shouldLimit) {
         if (this.turns.get(sessionId) !== limitBoundary) return reconcileLifecycleChange();
         if (changed) {
+          const budgetOwner = limitBoundary?.interruptedDispatch
+            ? {
+                lifecycleId: limitBoundary.interruptedDispatch.lifecycleId,
+                generation: limitBoundary.interruptedDispatch.generation,
+                turnIndex: limitBoundary.interruptedDispatch.turnIndex,
+              }
+            : {};
           this.recordRunEvent('state-transition', sessionId, changed, {
             from: state.status,
             to: 'budgetLimited',
             reason: changed.lastReason,
+            ...budgetOwner,
           });
           this.recordRunEvent('budget-consumed', sessionId, changed, {
             from: state.status,
             to: 'budgetLimited',
             reason: changed.lastReason,
+            ...budgetOwner,
           });
           this.recordRunEvent('terminal', sessionId, changed, {
             to: 'budgetLimited',
             reason: changed.lastReason,
+            ...budgetOwner,
           });
         }
         this.stopSession(sessionId);
@@ -1316,6 +1357,7 @@ export class GoalController {
       previousBoundary?.pendingCompletion ?? null,
     );
     if (interruptedDispatch) clearBoundary.interruptedDispatch = interruptedDispatch;
+    this.flushRetiredPendingDispatch(sessionId, previousBoundary);
     this.turns.set(sessionId, clearBoundary);
     if (hasActiveGoalTurn) {
       try {
@@ -1389,6 +1431,7 @@ export class GoalController {
       previousBoundary?.pendingCompletion ?? null,
     );
     if (interruptedDispatch) pauseBoundary.interruptedDispatch = interruptedDispatch;
+    this.flushRetiredPendingDispatch(sessionId, previousBoundary);
     this.turns.set(sessionId, pauseBoundary);
     await this.awaitPendingPersistence(pauseBoundary);
     if (this.turns.get(sessionId) !== pauseBoundary) return;
@@ -2963,20 +3006,29 @@ export class GoalController {
         // onDispatching 是归属登记的唯一边界。不能在 await send 后再次 add：极快的
         // turn 可能已经发出终态并同步释放归属，重新登记会把后续用户 turn 误认成 Goal。
         baselineStarted = false;
-        // 被 setGoal/pause/clear 换成新 owner 后的迟到 accepted 不再记旧派发:
-        // closeout 已由替换路径发出(Codex #2107 P2)。
         // 同一生命周期的快终态(resetTurn 换代 / complete 后 stopSession 摘 owner)
         // 仍要补记 turn-dispatched,否则审计只剩孤儿 turn-finalized/terminal
         // (Codex #2107 P1)。
         const currentOwner = this.turns.get(sessionId);
-        // 真替换:新 live owner(setGoal 换 objective)才丢弃迟到 accepted。
-        // 快终态 stopSession 后 currentOwner 为空、continue 的 resetTurn 仍是
-        // 同一对象、pause/clear 留下 cancelled owner —— 这些都要补记派发。
+        // 真替换:新 live owner(setGoal 换 objective)仍要给旧 boundary 补记
+        // 迟到 accepted,否则 replacement closeout 没有配对的 turn-dispatched
+        // (Codex #2107 P1)。pause/clear 留下 cancelled owner,同样补记。
         const replacedByNewLiveOwner =
           currentOwner != null &&
           currentOwner !== dispatchBoundary &&
           !currentOwner.cancelled;
-        if (replacedByNewLiveOwner || this.disposed) return;
+        if (this.disposed) return;
+        if (replacedByNewLiveOwner) {
+          this.emitDispatchEvents(
+            sessionId,
+            state,
+            dispatchBoundary,
+            dispatchGeneration,
+            dispatchAt ?? this.now(),
+            dispatchResumeReason,
+          );
+          return;
+        }
         // 只有当前 owner 仍是本派发 boundary 时才挂起等 finalizeTurn flush。
         // pause/clear 已换成 cancelled owner 后,finalizer 会 isCurrentTurn 失败,
         // 挂在退休 boundary 上的 pendingDispatch 永远不会 flush
