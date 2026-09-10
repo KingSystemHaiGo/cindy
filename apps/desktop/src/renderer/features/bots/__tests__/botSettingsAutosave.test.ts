@@ -192,6 +192,26 @@ describe('reconcileBotSettingsDraft style echo',
         addressUserAs: 'Pat',
       });
     });
+
+    it('keeps both windows when each edited a different style subfield', () => {
+      const baseline = payload({ style: { tone: 'warm', addressUserAs: 'Chris' } });
+      const draft = payload({ style: { tone: 'warm', addressUserAs: 'Pat' } });
+      const incoming = payload({ style: { tone: 'concise', addressUserAs: 'Chris' } });
+      expect(reconcileBotSettingsDraft(baseline, draft, incoming).style).toEqual({
+        tone: 'concise',
+        addressUserAs: 'Pat',
+      });
+    });
+
+    it('keeps an in-flight local subfield together with a concurrent remote subfield', () => {
+      const baseline = payload({ style: { tone: 'warm', addressUserAs: 'Chris' } });
+      const draft = payload({ style: { tone: 'warm', addressUserAs: 'Pat ' } });
+      const incoming = payload({ style: { tone: 'concise', addressUserAs: 'Chris' } });
+      expect(reconcileBotSettingsDraft(baseline, draft, incoming).style).toEqual({
+        tone: 'concise',
+        addressUserAs: 'Pat ',
+      });
+    });
   });
 
 describe('botSettingsPayloadEqual', () => {

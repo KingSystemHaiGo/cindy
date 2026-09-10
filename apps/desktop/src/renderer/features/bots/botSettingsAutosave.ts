@@ -24,7 +24,13 @@
 
 import type { BotCapabilities, BotProfileUpdatePatch } from './botStore';
 import { reconcileBotCapabilityList } from '../../../shared/botCapabilitySelection';
-import { botStyleEqual, normalizeBotStyle, type BotCommunicationStyle } from '../../../shared/botStyle';
+import {
+  BOT_STYLE_KEYS,
+  botStyleEqual,
+  normalizeBotStyle,
+  reconcileBotStyle,
+  type BotCommunicationStyle,
+} from '../../../shared/botStyle';
 
 /** 提交给 `updateBotProfile` 的字段集合(与手动保存时的载荷完全一致)。 */
 export interface BotSettingsPayload {
@@ -169,7 +175,7 @@ export function reconcileBotSettingsDraft(
   const next: BotSettingsDraft = {
     ...incoming,
     ...Object.fromEntries(Object.keys(changes)
-      .filter((key) => key !== 'capabilities')
+      .filter((key) => key !== 'capabilities' && key !== 'style')
       .map((key) => [key, draft[key as keyof BotSettingsDraft]])),
     skills: reconcileBotCapabilityList(baseline.skills, draft.skills, incoming.skills),
     capabilities: {
@@ -178,15 +184,36 @@ export function reconcileBotSettingsDraft(
       mcpServers: reconcileBotCapabilityList(baseline.capabilities.mcpServers, draft.capabilities.mcpServers, incoming.capabilities.mcpServers),
       toolsets: reconcileBotCapabilityList(baseline.capabilities.toolsets, draft.capabilities.toolsets, incoming.capabilities.toolsets),
     },
+    style: reconcileAutosaveStyle(baseline.style, draft.style, incoming.style),
   };
-  // Style text is trimmed only at IPC time. A self-save echo is not a `changes`
-  // entry (normalized draft already equals baseline), so spreading `incoming`
-  // would put "Chris" back into a still-focused "Chris " field and the next
-  // word glues on. Keep the local draft when it matches the echo after normalize.
-  if (!('style' in changes) && botStyleEqual(draft.style, incoming.style)) {
-    next.style = draft.style;
-  }
   return next;
+}
+
+/**
+ * Merge incoming style by field against this window's draft, using the same
+ * three-way rule as IPC `reconcileBotStyle`. Untrimmed local text that still
+ * matches after normalize is kept so a focused "Chris " is not replaced by the
+ * saved "Chris" (or a concurrent sibling field) mid-keystroke.
+ */
+function reconcileAutosaveStyle(
+  previous: BotCommunicationStyle | null | undefined,
+  local: BotCommunicationStyle | null | undefined,
+  remote: BotCommunicationStyle | null | undefined,
+): BotCommunicationStyle | null {
+  const merged = reconcileBotStyle(previous, local, remote);
+  if (!merged) {
+    return botStyleEqual(local, remote) ? local ?? null : null;
+  }
+  const raw = local && typeof local === 'object' && !Array.isArray(local) ? local : {};
+  const next: Partial<Record<keyof BotCommunicationStyle, string>> = { ...merged };
+  for (const key of BOT_STYLE_KEYS) {
+    const draftValue = raw[key];
+    if (typeof draftValue !== 'string') continue;
+    if (botStyleEqual({ [key]: draftValue }, { [key]: next[key] })) {
+      next[key] = draftValue;
+    }
+  }
+  return next as BotCommunicationStyle;
 }
 
 /** 自动保存对用户可见的状态。`saved` 由 UI 侧短暂显示后淡出,不常驻。 */
