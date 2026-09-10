@@ -1,3 +1,4 @@
+import { registerPluginListHandler } from './pluginListHandler.js';
 import { initializeBotAuthorizationHost } from './botAuthorizationHost.js';
 import { resolveBotAuthorizationDelivery, buildBotAuthorizationContinuation, commitBotAuthorizationInput, type BotAuthorizationInputGuard, getBotAuthorizationService } from './botAuthorizationService.js';
 import { registerSessionSetModelHandler } from './sessionSetModelHandler.js';
@@ -417,11 +418,14 @@ import {
   getMaker,
   getMakerIfReady,
   getPluginRegistry,
+  isBotToolsetAvailable,
+  listBotRuntimeMcpServers,
   preflightBotRuntimeResources,
   prepareCodexForAuthModeChange,
   prepareCodexForCustomProviderHostChange,
   restartCodexAfterAuthModeChange,
   setBeforeLocalCodexSessionStartHook,
+  setBotCapabilityAgentKindResolver,
   setModelContextRuntimeRefreshListener,
 } from '../maker-host/index.js';
 import {
@@ -562,6 +566,7 @@ import {
 
 import { requireEnum, requireObject, throwIpcError } from '../utils/ipcValidate.js';
 import { isIpcError, type IpcErrorCode } from '../../shared/ipc-errors.js';
+import { piPackageCommandDiagnostic } from '../maker-host/pi-package-diagnostic.js';
 import {
   runPiPackageListIpcBoundary,
   runPiPackageMutationIpcBoundary,
@@ -854,6 +859,7 @@ import { readSessionRuntimeFallbackSettings } from '../maker-host/session-runtim
 import {
   getModelVisibilityMirrorSnapshot,
   syncModelVisibilityMirrorForOwner,
+  waitForModelVisibilityMirror,
 } from '../maker-host/model-visibility-mirror.js';
 import {
   clearProviderDisableOverrides,
@@ -4578,7 +4584,7 @@ let disposePiPackagesChangedBroadcast: (() => void) | null = null;
 export function registerModelVisibilitySyncIpc(): void {
   ipcMain.handle(
     MAKER_INVOKE.MODEL_VISIBILITY_SYNC,
-    async (event, dataOwnerId: unknown, ownerGeneration: unknown, map: unknown) => {
+    async (event, dataOwnerId: unknown, ownerGeneration: unknown, map: unknown, policy?: unknown) => {
       assertTrustedAppRendererEvent(event);
       syncModelVisibilityMirrorForOwner(
         map,
@@ -4588,6 +4594,7 @@ export function registerModelVisibilitySyncIpc(): void {
         () => {
           broadcastToAllWindows(MAKER_PUSH.PROVIDER_CHANGED, {});
         },
+        policy,
       );
     },
   );
@@ -5327,7 +5334,10 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
 
   registerProviderHandlers(createElectronIpcHandlerRegistry(), {
     listProviders: (opts) => getDesktopProviderService().listProviders(opts),
-    getModelVisibilityOverrides: () => getModelVisibilityMirrorSnapshot(),
+    getModelVisibilityOverrides: async (providers, trusted) => {
+      if (!trusted) await waitForModelVisibilityMirror();
+      return getModelVisibilityMirrorSnapshot(providers, trusted);
+    },
     refreshCatalog: () => refreshCustomProvidersIntoCatalog(),
     codexCustomProviderConfigSignature,
     hasAppliedCodexCustomProviderImageGeneration: (providerId) =>
@@ -5551,6 +5561,13 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   // 自定义 MCP 服务器 CRUD —— CRUD 成功后刷新三个 agent 的 mcpProviders 数组
   // （下次新建会话生效）并广播 MCP_CHANGED 让设置页列表 live 刷新。
   registerMcpHandlers(createElectronIpcHandlerRegistry(), {
+    listMcpServers: listBotRuntimeMcpServers,
+    resolveBotContext: async (sessionId, chain) => {
+      const route = await reconcileBotModelRoute.preview(sessionId, chain);
+      if (!route) return null;
+      const meta = await maker.getSessionMeta(sessionId);
+      return meta ? { agentKind: route.agentKind, remoteHostId: meta.remoteHostId } : null;
+    },
     refreshProviders: () => refreshCustomMcpProviders(),
     broadcastChanged: () => broadcastToAllWindows(MAKER_PUSH.MCP_CHANGED, {}),
     // 内置 server 名对自定义 MCP 是保留名：撞名会在装配层顶替内置 server 并继承
@@ -5886,6 +5903,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         log.warn('Pi extension mutation failed', {
           action: request.action,
           failureCategory: piPackageMutationFailureCategory(error),
+          diagnostic: piPackageCommandDiagnostic(error),
           mayHaveChangedState: piPackageMutationMayHaveChangedState(error),
         });
       },
@@ -9153,6 +9171,10 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   });
   botDelegationServiceHolder?.dispose();
   botDelegationServiceHolder = createBotDelegationService({
+    readCallerPermission: (sessionId) => {
+      const state = maker.getSession(sessionId)?.stablePermissionModeState;
+      return state?.mode ? { mode: state.mode, generation: state.generation } : null;
+    },
     readCallerRuntime: (sessionId) => {
       const session = maker.getSession(sessionId);
       return session ? {
@@ -10757,7 +10779,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
 
   const reconcileBotModelRoute = createBotModelRouteReconciler({
     ownerEpoch: captureSessionRuntimeControlOwnerEpoch,
-    read: async (sessionId) => {
+    read: async (sessionId, purpose) => {
       const [row] = await getDbClient().drizzle.select({
         capabilitiesJson: botProfileVersions.capabilitiesJson,
         agentKind: sessions.agentKind,
@@ -10776,7 +10798,10 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
           eq(botSessionLinks.sessionId, sessionId),
           eq(botSessionLinks.role, 'canonical'),
           isNull(botSessionLinks.archivedAt),
-          eq(botProfiles.status, 'active'),
+          // Paused settings may preview grants; sending still requires an active Bot.
+          purpose === 'preview'
+            ? inArray(botProfiles.status, ['active', 'paused'])
+            : eq(botProfiles.status, 'active'),
           eq(sessions.source, 'bot'),
           eq(sessions.status, 'active'),
         )).limit(1);
@@ -10795,6 +10820,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
           fastMode: live ? getSessionFastMode(sessionId) : !!row.fastMode,
         },
         hasRuntimeOverride: control.effectiveOverride !== null || control.pending !== null,
+        next: control.pending?.profile ?? control.effectiveOverride ?? undefined,
       };
     },
     apply: async (sessionId, route, current) => {
@@ -10819,6 +10845,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       }
     },
   });
+
+  setBotCapabilityAgentKindResolver(async (sessionId, chain) =>
+    (await reconcileBotModelRoute.preview(sessionId, chain))?.agentKind ?? null);
 
   const readBotFallbackCandidate = async (
     sessionId: string,
@@ -17109,9 +17138,12 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   });
 
   // ── Plugin system (Phase 1) ──────────────────────────────────────────────
-  ipcMain.handle(MAKER_INVOKE.PLUGINS_LIST, async (_e, workingDir: unknown) => {
-    const wd = typeof workingDir === 'string' ? workingDir : undefined;
-    return getPluginRegistry().listPlugins(wd);
+  registerPluginListHandler(createElectronIpcHandlerRegistry(), {
+    getPluginRegistry,
+    isBotToolsetAvailable,
+    assertBotQuery: (event) => {
+      if (!isDeviceLinkInvoke()) assertTrustedAppRendererEvent(event as Parameters<typeof assertTrustedAppRendererEvent>[0]);
+    },
   });
 
   // Read one plugin's enable state by id. Unlike PLUGINS_LIST this does NOT skip
