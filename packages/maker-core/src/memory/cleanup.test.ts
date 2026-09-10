@@ -513,13 +513,13 @@ describe('runMemoryCleanup', () => {
       }
       return realLink(src as string, dst as string);
     });
-    const realUnlink = fs.unlink.bind(fs);
-    const unlinkSpy = vi.spyOn(fs, 'unlink').mockImplementation(async (p) => {
-      const r = await realUnlink(p as string);
-      if (String(p).endsWith('feedback_a.md')) {
-        // 宿主在 src 被 unlink (移入 trash) 后立即重建 src (新写入)。
+    const realRename = fs.rename.bind(fs);
+    const renameSpy = vi.spyOn(fs, 'rename').mockImplementation(async (src, dst) => {
+      const r = await realRename(src as string, dst as string);
+      if (String(src).endsWith('feedback_a.md') && String(dst).includes('cleanup-parked')) {
+        // 宿主在 src 被 park 走后立即重建 src (新写入)。
         await writeFile(
-          String(p),
+          String(src),
           "---\ntitle: RECREATED\ndescription: new\ntype: feedback\nupdatedAt: '2026-03-02T00:00:00.000Z'\n---\nrecreated by host\n",
           'utf8',
         );
@@ -536,7 +536,7 @@ describe('runMemoryCleanup', () => {
       expect(files.some((f) => f.includes('cleanup-trash'))).toBe(true);
     } finally {
       linkSpy.mockRestore();
-      unlinkSpy.mockRestore();
+      renameSpy.mockRestore();
     }
   });
 
@@ -726,13 +726,13 @@ describe('runMemoryCleanup', () => {
       }
       return r;
     });
-    const realUnlink = fs.unlink.bind(fs);
-    const unlinkSpy = vi.spyOn(fs, 'unlink').mockImplementation(async (p) => {
-      const r = await realUnlink(p as string);
-      if (String(p).endsWith('feedback_a.md')) {
-        // 宿主在 src 被 unlink (移入 trash) 后立即重建 src (新写入)。
+    const realRename = fs.rename.bind(fs);
+    const renameSpy = vi.spyOn(fs, 'rename').mockImplementation(async (src, dst) => {
+      const r = await realRename(src as string, dst as string);
+      if (String(src).endsWith('feedback_a.md') && String(dst).includes('cleanup-parked')) {
+        // 宿主在 src 被 park 走后立即重建 src (新写入)。
         await writeFile(
-          String(p),
+          String(src),
           "---\ntitle: RECREATED\ndescription: new\ntype: feedback\nupdatedAt: '2026-03-02T00:00:00.000Z'\n---\nrecreated by host\n",
           'utf8',
         );
@@ -755,7 +755,7 @@ describe('runMemoryCleanup', () => {
       ).resolves.toContain('WRITTEN AFTER MOVE');
     } finally {
       linkSpy.mockRestore();
-      unlinkSpy.mockRestore();
+      renameSpy.mockRestore();
     }
   });
 
@@ -815,9 +815,13 @@ describe('runMemoryCleanup', () => {
       .spyOn(fs, 'copyFile')
       .mockRejectedValue(Object.assign(new Error('permission denied'), { code: 'EACCES' }));
     // rename 兜底也失败 (真锁) → retained 保留 .archive 可达。
-    const renameSpy = vi
-      .spyOn(fs, 'rename')
-      .mockRejectedValue(Object.assign(new Error('locked'), { code: 'EPERM' }));
+    const realRename = fs.rename.bind(fs);
+    const renameSpy = vi.spyOn(fs, 'rename').mockImplementation(async (src, dst) => {
+      if (String(dst).includes('cleanup-parked') || String(src).includes('cleanup-parked')) {
+        return realRename(src as string, dst as string);
+      }
+      throw Object.assign(new Error('locked'), { code: 'EPERM' });
+    });
 
     try {
       const result = await runMemoryCleanup(plan);
@@ -960,15 +964,15 @@ describe('runMemoryCleanup', () => {
 
     const plan = await planMemoryCleanup(dir);
     // 模拟 Windows 文件锁: reserveTrashTarget 的 link (src → trash) 成功,
-    // 但 unlink(src) 抛 EPERM — src 仍在活动分片, 必须 failed 而非吞错标
+    // 但 park/rename(src) 抛 EPERM — src 仍在活动分片, 必须 failed 而非吞错标
     // archived (否则 rebuildIndex 仍把 src 写回 MEMORY.md, CLI 误报成功;
     // Greptile P1 / Codex P1 on #2561 第二十三轮)。
-    const realUnlink = fs.unlink.bind(fs);
-    const unlinkSpy = vi.spyOn(fs, 'unlink').mockImplementation(async (p) => {
-      if (String(p).endsWith('feedback_a.md')) {
+    const realRename = fs.rename.bind(fs);
+    const renameSpy = vi.spyOn(fs, 'rename').mockImplementation(async (src, dst) => {
+      if (String(src).endsWith('feedback_a.md') && String(dst).includes('cleanup-parked')) {
         throw Object.assign(new Error('source locked'), { code: 'EPERM' });
       }
-      return realUnlink(p as string);
+      return realRename(src as string, dst as string);
     });
 
     try {
@@ -978,6 +982,47 @@ describe('runMemoryCleanup', () => {
       expect(result.archived).toHaveLength(0);
       await expect(readFile(path.join(dir, 'feedback_a.md'), 'utf8')).resolves.toContain('same');
     } finally {
+      renameSpy.mockRestore();
+    }
+  });
+
+  it('does not unlink a replacement inode reserved after trash link', async () => {
+    await shard('feedback_a.md', 'feedback', 'Same', 'hook', 'same', '2026-01-01T00:00:00.000Z');
+    await shard('feedback_b.md', 'feedback', 'Same', 'hook', 'same', '2026-02-01T00:00:00.000Z');
+
+    const plan = await planMemoryCleanup(dir);
+    // 模拟编辑器原子保存: link(src → trash) 成功后、park/rename 前用 rename
+    // 把新 inode 换到 src。pathname unlink(src) 会删掉新 inode; park 后按
+    // inode/内容核对, 只丢掉预留 trash inode, 新写入必须回到 src。
+    const realLink = fs.link.bind(fs);
+    const realRename = fs.rename.bind(fs);
+    const unlinkSpy = vi.spyOn(fs, 'unlink');
+    const linkSpy = vi.spyOn(fs, 'link').mockImplementation(async (src, dst) => {
+      const r = await realLink(src as string, dst as string);
+      if (String(src).endsWith('feedback_a.md') && String(dst).includes('cleanup-trash')) {
+        const tmp = `${String(src)}.editor-tmp`;
+        await writeFile(
+          tmp,
+          "---\ntitle: REPLACEMENT\ndescription: new\ntype: feedback\nupdatedAt: '2026-03-01T00:00:00.000Z'\n---\nREPLACEMENT INODE\n",
+          'utf8',
+        );
+        await realRename(tmp, String(src));
+      }
+      return r;
+    });
+
+    try {
+      const result = await runMemoryCleanup(plan);
+      expect(result.failed.some((f) => f.filename === 'feedback_a.md')).toBe(true);
+      expect(result.archived).toHaveLength(0);
+      await expect(readFile(path.join(dir, 'feedback_a.md'), 'utf8')).resolves.toContain(
+        'REPLACEMENT INODE',
+      );
+      expect(
+        unlinkSpy.mock.calls.every((call) => !String(call[0]).endsWith('feedback_a.md')),
+      ).toBe(true);
+    } finally {
+      linkSpy.mockRestore();
       unlinkSpy.mockRestore();
     }
   });
@@ -1091,9 +1136,13 @@ describe('runMemoryCleanup', () => {
     const copySpy = vi
       .spyOn(fs, 'copyFile')
       .mockRejectedValue(Object.assign(new Error('disk full'), { code: 'ENOSPC' }));
-    const renameSpy = vi
-      .spyOn(fs, 'rename')
-      .mockRejectedValue(Object.assign(new Error('locked'), { code: 'EPERM' }));
+    const realRename = fs.rename.bind(fs);
+    const renameSpy = vi.spyOn(fs, 'rename').mockImplementation(async (src, dst) => {
+      if (String(dst).includes('cleanup-parked') || String(src).includes('cleanup-parked')) {
+        return realRename(src as string, dst as string);
+      }
+      throw Object.assign(new Error('locked'), { code: 'EPERM' });
+    });
 
     try {
       const result = await runMemoryCleanup(plan);

@@ -797,8 +797,9 @@ export async function runMemoryCleanup(
  * 失败清理遗留的 cleanup-trash 文件是 live-writer 内容的恢复路径 — 同 stamp
  * rerun 或并发清理时 rename(src, trash) 会覆盖既有 trash, 丢弃唯一可达副本
  * (Codex P2 on #2561 第二十二轮: reserve trash targets before renaming)。
- * 用 link 原子排他预留 (EEXIST 换随机后缀重试) + unlink 删源; link 不可用
- * (ENOTSUP/EPERM/ENOSYS) 时 fallback rename (随机后缀, 碰撞窗口极小)。
+ * 用 link 原子排他预留 (EEXIST 换随机后缀重试), 再 rename src 到唯一 parked 名 — **绝不 unlink(src)**; link 不可用
+ * (ENOTSUP/EPERM/ENOSYS) 时 fallback rename (随机后缀)。pathname unlink 会删掉
+ * 比较之后原子替换上来的新 inode (Codex P0 on #2561: unlink only the reserved trash inode)
  */
 async function reserveTrashTarget(
   src: string,
@@ -813,32 +814,9 @@ async function reserveTrashTarget(
     );
     try {
       await fs.link(src, candidate);
-      // link 成功后、unlink 前核对 inode: 编辑器原子保存 (rename 替换 src)
-      // 会让 src 指向新 inode, 此时 unlink(src) 会删掉替换文件而留下旧内容
-      // 的 trash (Codex P1 on #2561: avoid unlinking a replacement inode)。
-      // 发现不一致 → 丢掉 candidate (审阅快照已在 .archive), 保留新 src, 失败重规划。
-      const [srcStat, candStat] = await Promise.all([fs.lstat(src), fs.lstat(candidate)]);
-      if (srcStat.ino !== candStat.ino || srcStat.dev !== candStat.dev) {
-        await fs.unlink(candidate).catch(() => {});
-        throw Object.assign(
-          new Error('source replaced after trash reservation; replan required'),
-          { code: 'CLEANUP_SOURCE_REPLACED' },
-        );
-      }
-      // unlink 失败 (Windows 锁 / --force 下其他进程持有 src) 时**必须抛错**:
-      // src 仍在活动分片, 若吞错继续会标 archived 而 rebuildIndex() 仍把 src
-      // 写回 MEMORY.md, CLI 误报成功 (Greptile P1 / Codex P1 on #2561 第二十三轮)。
-      await fs.unlink(src).catch((e) => {
-        throw Object.assign(
-          new Error(`unable to remove source after reservation: ${String(e)}`),
-          { code: 'CLEANUP_SOURCE_LOCKED' },
-        );
-      });
-      return candidate;
     } catch (e) {
       const code = (e as NodeJS.ErrnoException).code;
       if (code === 'EEXIST') continue;
-      if (code === 'CLEANUP_SOURCE_LOCKED') throw e; // 源锁: 直接暴露, 不 fallback
       // link 不可用 (文件系统不支持硬链接) → fallback rename。目标仍需
       // no-clobber: 失败清理遗留的 .cleanup-trash-* 恢复文件是 live-writer
       // 内容的唯一可达副本, 随机后缀碰撞时 rename 会覆盖它 (Codex P2 on
@@ -849,8 +827,85 @@ async function reserveTrashTarget(
       await fs.rename(src, candidate);
       return candidate;
     }
+    try {
+      await detachReservedSource(src, candidate, shardDir, filename, stamp);
+      return candidate;
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code === 'CLEANUP_SOURCE_LOCKED' || code === 'CLEANUP_SOURCE_REPLACED') {
+        await fs.unlink(candidate).catch(() => {});
+        throw e;
+      }
+      await fs.unlink(candidate).catch(() => {});
+      continue;
+    }
   }
   throw new Error(`unable to reserve trash target for ${filename}`);
+}
+
+/**
+ * Move the src directory entry to a unique parked name, then drop that extra
+ * name only when it still names the reserved trash inode. Never unlink(src):
+ * pathname unlink can delete a replacement inode that landed between the
+ * inode comparison and the unlink (Codex P0 on #2561).
+ */
+async function detachReservedSource(
+  src: string,
+  reserved: string,
+  shardDir: string,
+  filename: string,
+  stamp: string,
+): Promise<void> {
+  const parked = path.join(
+    shardDir,
+    `${filename}.cleanup-parked-${stamp}-${randomBytes(4).toString('hex')}`,
+  );
+  if (await pathExists(parked)) {
+    throw Object.assign(new Error('parked path collision'), { code: 'EEXIST' });
+  }
+  try {
+    await fs.rename(src, parked);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return; // src name already gone; reserved holds the inode
+    throw Object.assign(
+      new Error(`unable to remove source after reservation: ${String(e)}`),
+      { code: 'CLEANUP_SOURCE_LOCKED' },
+    );
+  }
+  const [parkedStat, reservedStat, parkedBuf, reservedBuf] = await Promise.all([
+    fs.lstat(parked),
+    fs.lstat(reserved),
+    fs.readFile(parked),
+    fs.readFile(reserved),
+  ]);
+  // Prefer inode identity; also treat equal content / nlink>=2 as the reserved
+  // extra name (Windows can report ino=0). Never unlink parked when it holds a
+  // different replacement payload.
+  const sameReservedInode =
+    (parkedStat.ino !== 0 &&
+      parkedStat.ino === reservedStat.ino &&
+      parkedStat.dev === reservedStat.dev) ||
+    reservedStat.nlink >= 2 ||
+    parkedBuf.equals(reservedBuf);
+  if (sameReservedInode) {
+    // parked is an extra name for the reserved inode — drop it, not live src.
+    await fs.unlink(parked).catch(() => {});
+    return;
+  }
+  // parked is the replacement inode — restore it; never unlink that inode.
+  try {
+    await fs.link(parked, src);
+    await fs.unlink(parked).catch(() => {});
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'EEXIST') {
+      // restore failed: leave parked reachable, do not unlink the replacement.
+    }
+  }
+  throw Object.assign(
+    new Error('source replaced after trash reservation; replan required'),
+    { code: 'CLEANUP_SOURCE_REPLACED' },
+  );
 }
 
 async function pathExists(p: string): Promise<boolean> {
