@@ -356,6 +356,9 @@ interface PendingTakeoverCloseout {
   from?: GoalStatus;
   to?: GoalStatus;
   state: GoalRunEventStateSnapshot | GoalState | null;
+  /** persist 提交时刻。延迟兑现 closeout 必须沿用它,不能改成 acceptance 的 now()
+   * (Codex #2107 P2: snapshot 按 at 排序,t2 替换写 vs t4 兑现否则新 dispatch 会插到旧 cleared 前)。 */
+  at?: number;
 }
 
 interface TurnAccumulator {
@@ -796,6 +799,7 @@ export class GoalController {
         lifecycleId: owner.lifecycleId,
         generation: owner.generation,
         turnIndex: owner.turnIndex,
+        at: closeout.at,
       });
       return;
     }
@@ -810,6 +814,7 @@ export class GoalController {
       lifecycleId: owner.lifecycleId,
       generation: owner.generation,
       turnIndex: owner.turnIndex,
+      at: closeout.at,
     });
   }
 
@@ -820,22 +825,23 @@ export class GoalController {
     closeout: PendingTakeoverCloseout,
     identity?: { lifecycleId: string; generation: number; turnIndex?: number },
   ): void {
+    const stamped = { ...identity, at: closeout.at };
     this.recordRunEvent('state-transition', sessionId, closeout.state, {
       from: closeout.from,
       to: 'budgetLimited',
       reason: closeout.reason,
-      ...identity,
+      ...stamped,
     });
     this.recordRunEvent('budget-consumed', sessionId, closeout.state, {
       from: closeout.from,
       to: 'budgetLimited',
       reason: closeout.reason,
-      ...identity,
+      ...stamped,
     });
     this.recordRunEvent('terminal', sessionId, closeout.state, {
       to: 'budgetLimited',
       reason: closeout.reason,
-      ...identity,
+      ...stamped,
     });
   }
 
@@ -859,6 +865,7 @@ export class GoalController {
         reason: 'replaced by new goal',
         from: existing.status,
         state: existing,
+        at: this.now(),
       });
     }
   }
@@ -904,6 +911,7 @@ export class GoalController {
         from: closeout.from,
         reason: closeout.reason,
         ...identity,
+        at: closeout.at,
       });
       return;
     }
@@ -916,6 +924,7 @@ export class GoalController {
       to: closeout.to,
       reason: closeout.reason,
       ...identity,
+      at: closeout.at,
     });
   }
 
@@ -932,6 +941,7 @@ export class GoalController {
       from,
       to: 'budgetLimited',
       state: limited,
+      at: this.now(),
     });
   }
 
@@ -955,6 +965,7 @@ export class GoalController {
       lifecycleId: previous.lifecycleId,
       generation: previous.generation,
       turnIndex: previous.dispatchTurnIndex ?? 1,
+      at: this.now(),
     });
     previous.pendingTakeoverCloseouts = undefined;
     previous.auditFinalized = true;
@@ -1691,6 +1702,7 @@ export class GoalController {
       reason: 'cleared by user',
       from: auditSnapshot?.status,
       state: auditSnapshot,
+      at: this.now(),
     });
     if (this.turns.get(sessionId) !== clearBoundary) return;
     this.deps.emitStatus({ sessionId, goal: null });
@@ -1746,6 +1758,7 @@ export class GoalController {
           from: state.status,
           to: 'paused',
           state: updated,
+          at: this.now(),
         });
         if (this.turns.get(sessionId) === pauseBoundary) this.emit(updated);
       }
@@ -1767,6 +1780,7 @@ export class GoalController {
         from: state.status,
         to: 'paused',
         state: updated,
+        at: this.now(),
       });
       if (this.turns.get(sessionId) === pauseBoundary) this.emit(updated);
     }

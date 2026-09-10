@@ -14,6 +14,7 @@ import {
   type GoalCounters,
 } from '../controller';
 import { buildContinuationDirective, buildFirstTurnDirective } from '../directive';
+import { createRunEventRecorder } from '../runEvents';
 import { MAX_CONSECUTIVE_OVERLOAD_TURNS } from '../usageLimit';
 import type {
   AccountLimitInfo,
@@ -5844,6 +5845,92 @@ describe('GoalController', () => {
     expect(events.findIndex((e) => e.type === 'turn-dispatched')).toBeLessThan(
       events.findIndex((e) => e.type === 'cleared'),
     );
+  });
+
+  it('stamps delayed replacement closeout with the persist time not the acceptance time', async () => {
+    let clock = 1000;
+    const rec = createRunEventRecorder();
+    const local = makeController({
+      now: () => clock,
+      recordRunEvent: (e) => rec.record(e),
+    });
+    let markDispatchStarted!: () => void;
+    let releaseDispatch!: (result: SessionSendResult) => void;
+    const dispatchStarted = new Promise<void>((resolve) => {
+      markDispatchStarted = resolve;
+    });
+    const pendingDispatch = new Promise<SessionSendResult>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    let sendCount = 0;
+    vi.spyOn(local.session, 'send').mockImplementation(async (
+      message: Parameters<FakeSession['send']>[0],
+      opts: Parameters<FakeSession['send']>[1],
+    ): Promise<SessionSendResult> => {
+      sendCount += 1;
+      const content = typeof message === 'string' ? message : message.content;
+      local.session.sends.push({ content, originKind: opts?.origin?.kind });
+      opts?.onDispatching?.();
+      if (sendCount === 1) {
+        markDispatchStarted();
+        return pendingDispatch;
+      }
+      return { accepted: true };
+    });
+
+    const started = local.controller.setGoal({ sessionId: 's1', objective: 'first objective' });
+    await dispatchStarted;
+
+    const origUpdate = local.storage.update.bind(local.storage);
+    let releaseUpdate!: (state: GoalState | null) => void;
+    const blockedUpdate = new Promise<GoalState | null>((resolve) => {
+      releaseUpdate = resolve;
+    });
+    let blockedOnce = false;
+    vi.spyOn(local.storage, 'update').mockImplementation(async (sessionId, patch) => {
+      if (!blockedOnce && patch.objective === 'replacement objective') {
+        blockedOnce = true;
+        return blockedUpdate;
+      }
+      return origUpdate(sessionId, patch);
+    });
+
+    const replacement = local.controller.setGoal({
+      sessionId: 's1',
+      objective: 'replacement objective',
+    });
+    await vi.waitFor(() => expect(blockedOnce).toBe(true));
+    clock = 2000;
+    const replaced = await origUpdate('s1', { objective: 'replacement objective' });
+    releaseUpdate(replaced);
+    await replacement.catch(() => undefined);
+    await tick();
+    expect(rec.snapshot().some((e) => e.type === 'cleared')).toBe(false);
+
+    clock = 4000;
+    releaseDispatch({ accepted: true });
+    await started.catch(() => undefined);
+    await tick();
+
+    const snap = rec.snapshot();
+    const dispatched = snap.filter((e) => e.type === 'turn-dispatched');
+    const cleared = snap.filter((e) => e.type === 'cleared' && e.reason === 'replaced by new goal');
+    expect(dispatched).toHaveLength(2);
+    expect(cleared).toHaveLength(1);
+    expect(dispatched[0]?.at).toBe(1000);
+    expect(cleared[0]?.at).toBe(2000);
+    expect(dispatched[1]?.at).toBe(2000);
+    expect(snap.map((e) => e.type)).toEqual([
+      'turn-dispatched',
+      'cleared',
+      'turn-dispatched',
+    ]);
+    expect(cleared[0]).toMatchObject({
+      lifecycleId: dispatched[0]?.lifecycleId,
+      generation: dispatched[0]?.generation,
+      turnIndex: dispatched[0]?.turnIndex,
+      reason: 'replaced by new goal',
+    });
   });
 
   it('queues a committed budget closeout when a later pause supersedes the limit owner', async () => {
