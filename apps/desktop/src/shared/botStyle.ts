@@ -119,35 +119,15 @@ export function reconcileBotStyle(
   const baseline = normalizeBotStyle(previous) ?? {};
   const selected = normalizeBotStyle(local) ?? {};
   const current = normalizeBotStyle(remote) ?? {};
-  const next: BotCommunicationStyle = {};
-  // Per-field writes keep each optional union member; a looped `next[key]`
-  // intersects every style field and collapses the target type to undefined.
-  const tone = pickReconciledStyleField('tone', baseline, selected, current);
-  if (tone !== undefined) next.tone = tone;
-  const customTone = pickReconciledStyleField('customTone', baseline, selected, current);
-  if (customTone !== undefined) next.customTone = customTone;
-  const addressUserAs = pickReconciledStyleField('addressUserAs', baseline, selected, current);
-  if (addressUserAs !== undefined) next.addressUserAs = addressUserAs;
-  const selfName = pickReconciledStyleField('selfName', baseline, selected, current);
-  if (selfName !== undefined) next.selfName = selfName;
-  const replyLength = pickReconciledStyleField('replyLength', baseline, selected, current);
-  if (replyLength !== undefined) next.replyLength = replyLength;
-  const emojiDensity = pickReconciledStyleField('emojiDensity', baseline, selected, current);
-  if (emojiDensity !== undefined) next.emojiDensity = emojiDensity;
-  const bannedPhrases = pickReconciledStyleField('bannedPhrases', baseline, selected, current);
-  if (bannedPhrases !== undefined) next.bannedPhrases = bannedPhrases;
-  const languageHabits = pickReconciledStyleField('languageHabits', baseline, selected, current);
-  if (languageHabits !== undefined) next.languageHabits = languageHabits;
-  return Object.keys(next).length > 0 ? next : undefined;
-}
-
-function pickReconciledStyleField<K extends keyof BotCommunicationStyle>(
-  key: K,
-  baseline: BotCommunicationStyle,
-  selected: BotCommunicationStyle,
-  current: BotCommunicationStyle,
-): BotCommunicationStyle[K] | undefined {
-  return baseline[key] === selected[key] ? current[key] : selected[key];
+  // Indexed writes through BotCommunicationStyle collapse optional unions to
+  // `undefined` (TS2322). Partial Record keeps the target `string | undefined`.
+  // Cleared keys stay omitted (undefined), never `''`.
+  const next: Partial<Record<keyof BotCommunicationStyle, string>> = {};
+  for (const key of BOT_STYLE_KEYS) {
+    const value = baseline[key] === selected[key] ? current[key] : selected[key];
+    if (value !== undefined) next[key] = value;
+  }
+  return Object.keys(next).length > 0 ? (next as BotCommunicationStyle) : undefined;
 }
 
 const TONE_GUIDANCE: Record<Exclude<BotStyleTone, 'custom'>, string> = {
