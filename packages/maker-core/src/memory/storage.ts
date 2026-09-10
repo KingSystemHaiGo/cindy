@@ -723,6 +723,19 @@ function parseRawShard(raw: string, filenameForErr: string): ParsedShard {
       `${filenameForErr} frontmatter 解析失败: ${(e as Error).message}`,
     );
   }
+  // gray-matter 对 YAML 文档 `null` / `~` 返回 parsed.data === null;
+  // 直接读 data.title 会 TypeError, isCorruptShardError 认不出, list/dry-run
+  // 整片中止 (Codex P1 on #2561: Classify null YAML roots as corrupt shards).
+  if (
+    parsed.data === null ||
+    typeof parsed.data !== 'object' ||
+    Array.isArray(parsed.data)
+  ) {
+    throw new MemoryError(
+      'invalid-frontmatter',
+      `${filenameForErr} frontmatter 根节点不是对象`,
+    );
+  }
   const data = parsed.data as Partial<MemoryFrontmatter>;
   // gray-matter 会把 YAML `title: 123` / `title: true` 解成 number/boolean;
   // 只检 truthy 再强转后, 清理扫描对 title.trim() 会 TypeError 中止整个

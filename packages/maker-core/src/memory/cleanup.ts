@@ -1004,13 +1004,7 @@ export async function runMemoryCleanup(
           // (Greptile P1 on #2561 第十五/十六轮: 恢复失败后活动分片不能缺失)。
           // 错误信息必须如实区分 restored / restore failed (Greptile P1 on
           // #2561 第十八轮: 恢复失败仍声称已恢复 — src 缺失时不能误导)。
-          const restored = await restoreRetained(retained, src);
-          result.failed.push({
-            filename: item.filename,
-            error: restored
-              ? 'source written during archive; restored to active shard (retained kept reachable in .archive)'
-              : 'source written during archive; restore failed — src not restored, retained kept reachable in .archive for manual recovery',
-          });
+          await restoreRetainedAndRecord(retained, src, item, result);
           continue;
         }
         // 三次确认 (Codex P1 on #2561 第十六轮: keep active shards until live
@@ -1019,13 +1013,7 @@ export async function runMemoryCleanup(
         // 校验同样处理 (恢复 src + failed), 绝不标成功。
         const finalContent = await fs.readFile(retained).catch(() => null);
         if (finalContent === null || !finalContent.equals(srcContent)) {
-          const restored = await restoreRetained(retained, src);
-          result.failed.push({
-            filename: item.filename,
-            error: restored
-              ? 'source written during archive; restored to active shard (retained kept reachable in .archive)'
-              : 'source written during archive; restore failed — src not restored, retained kept reachable in .archive for manual recovery',
-          });
+          await restoreRetainedAndRecord(retained, src, item, result);
           continue;
         }
         // quiesce 重试确认 (Codex P1 on #2561 第二十四轮: keep live-writer
@@ -1053,13 +1041,7 @@ export async function runMemoryCleanup(
           }
         }
         if (!quiesced) {
-          const restored = await restoreRetained(retained, src);
-          result.failed.push({
-            filename: item.filename,
-            error: restored
-              ? 'source written during archive; restored to active shard (retained kept reachable in .archive)'
-              : 'source written during archive; restore failed — src not restored, retained kept reachable in .archive for manual recovery',
-          });
+          await restoreRetainedAndRecord(retained, src, item, result);
           continue;
         }
         result.archived.push(item);
@@ -1474,6 +1456,36 @@ async function restoreTrash(
       });
     }
   }
+}
+
+/**
+ * retained 恢复失败且规范 src 仍缺失时跳过 rebuildIndex: list() 看不见
+ * `.archive` 内的 retained 名, 会把仍有效的记忆从 MEMORY.md/FTS 踢掉
+ * (Codex P1 on #2561: Preserve the index when retained restoration fails)。
+ */
+async function restoreRetainedAndRecord(
+  retained: string,
+  src: string,
+  item: { filename: string },
+  result: CleanupRunResult,
+): Promise<void> {
+  const restored = await restoreRetained(retained, src);
+  if (restored) {
+    result.failed.push({
+      filename: item.filename,
+      error:
+        'source written during archive; restored to active shard (retained kept reachable in .archive)',
+    });
+    return;
+  }
+  if (!(await pathExists(src))) {
+    result.skipIndexRebuild = true;
+  }
+  result.failed.push({
+    filename: item.filename,
+    error:
+      'source written during archive; restore failed — src not restored, retained kept reachable in .archive for manual recovery',
+  });
 }
 
 /**

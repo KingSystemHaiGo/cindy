@@ -1503,6 +1503,63 @@ describe('runMemoryCleanup', () => {
     }
   });
 
+  it('skips MEMORY.md rebuild when retained restore cannot recreate src', async () => {
+    await shard('feedback_a.md', 'feedback', 'Same', 'hook', 'same', '2026-01-01T00:00:00.000Z');
+    await shard('feedback_b.md', 'feedback', 'Same', 'hook', 'same', '2026-02-01T00:00:00.000Z');
+    const storage = new MemoryStorage(dir);
+    await storage.rebuildIndex();
+    const before = await readFile(path.join(dir, 'MEMORY.md'), 'utf8');
+    expect(before).toContain('feedback_a.md');
+
+    const plan = await planMemoryCleanup(dir);
+    const realReadFile = fs.readFile.bind(fs);
+    const realCopy = fs.copyFile.bind(fs);
+    const realLink = fs.link.bind(fs);
+    let retainedReads = 0;
+    const isRetainedRestore = (src: unknown, dst: unknown): boolean =>
+      String(src).includes(ARCHIVE_DIR_NAME) && String(dst).endsWith('feedback_a.md');
+    const readSpy = vi.spyOn(fs, 'readFile').mockImplementation(async (p, ...rest) => {
+      const str = String(p);
+      if (str.includes(ARCHIVE_DIR_NAME) && !str.endsWith('.archive')) {
+        retainedReads += 1;
+        if (retainedReads === 1) {
+          await writeFile(String(p), 'WRITTEN DURING RETAINED CHECK', 'utf8');
+        }
+      }
+      return realReadFile(p as string, ...rest);
+    });
+    const copySpy = vi.spyOn(fs, 'copyFile').mockImplementation(async (src, dst, mode) => {
+      if (isRetainedRestore(src, dst)) {
+        throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+      }
+      return realCopy(src as string, dst as string, mode as number);
+    });
+    const linkSpy = vi.spyOn(fs, 'link').mockImplementation(async (src, dst) => {
+      if (isRetainedRestore(src, dst)) {
+        throw Object.assign(new Error('hard links unsupported'), { code: 'ENOTSUP' });
+      }
+      return realLink(src as string, dst as string);
+    });
+    const rebuildSpy = vi.spyOn(MemoryStorage.prototype, 'rebuildIndex');
+
+    try {
+      const result = await runMemoryCleanup(plan);
+      expect(result.skipIndexRebuild).toBe(true);
+      expect(result.archived.some((a) => a.filename === 'feedback_a.md')).toBe(false);
+      expect(result.failed.some((f) => f.filename === 'feedback_a.md')).toBe(true);
+      await expect(readFile(path.join(dir, 'feedback_a.md'), 'utf8')).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+      expect(rebuildSpy).not.toHaveBeenCalled();
+      await expect(readFile(path.join(dir, 'MEMORY.md'), 'utf8')).resolves.toBe(before);
+    } finally {
+      readSpy.mockRestore();
+      copySpy.mockRestore();
+      linkSpy.mockRestore();
+      rebuildSpy.mockRestore();
+    }
+  });
+
   it('does not unlink parked when src already exists after a transient identity failure', async () => {
     await shard('feedback_a.md', 'feedback', 'Same', 'hook', 'same', '2026-01-01T00:00:00.000Z');
     await shard('feedback_b.md', 'feedback', 'Same', 'hook', 'same', '2026-02-01T00:00:00.000Z');
@@ -1894,6 +1951,28 @@ describe('storage list I/O vs corrupt shards (Codex P1 on #2561)', () => {
         'body',
         '',
       ].join('\n'),
+      'utf8',
+    );
+    const storage = new MemoryStorage(dir);
+    const recs = await storage.list();
+    expect(recs.map((r) => r.filename)).toEqual(['project_ok.md']);
+    const withRaw = await storage.listWithRaw();
+    expect(withRaw.map((x) => x.rec.filename)).toEqual(['project_ok.md']);
+    await expect(planMemoryCleanup(dir)).resolves.toMatchObject({
+      records: [{ filename: 'project_ok.md' }],
+    });
+  });
+
+  it('skips null YAML frontmatter roots as corrupt instead of TypeError', async () => {
+    await shard('project_ok.md', 'project', 'Ok', 'hook', 'body', '2026-01-01T00:00:00.000Z');
+    await writeFile(
+      path.join(dir, 'project_nullroot.md'),
+      ['---', 'null', '---', 'body', ''].join('\n'),
+      'utf8',
+    );
+    await writeFile(
+      path.join(dir, 'project_tilderoot.md'),
+      ['---', '~', '---', 'body', ''].join('\n'),
       'utf8',
     );
     const storage = new MemoryStorage(dir);
