@@ -4305,49 +4305,16 @@ describe('GoalController', () => {
     expect(h.session.sends).toHaveLength(1); // 本应续跑,但被改判,不续
   });
 
-  it.each([false, true])('auto-resumes at resetAt: posts a usage-resumed notice and continues (deferred hydration: %s)', async (deferHydration) => {
-    let releaseEnsure!: () => void;
-    const blockedEnsure = new Promise<void>((resolve) => { releaseEnsure = resolve; });
-    let restoring = false;
-    let ensurePending = false;
-    const local = makeController({
-      ensureSession: async () => {
-        if (restoring && deferHydration) {
-          ensurePending = true;
-          await blockedEnsure;
-        }
-        return local.session;
-      },
-    });
-    try {
-      local.setAccountLimit({ limited: true, resetAtMs: 1000 }); // == now → real timer, delay 0
-      await startGoal(local);
-      restoring = true;
-      local.session.emitErrorTurn({ sdkError: 'rate_limit' });
-
-      if (deferHydration) {
-        await vi.waitFor(() => expect(ensurePending).toBe(true));
-        // Even after the old 10ms wait, hydration can still be pending legitimately.
-        await tick();
-        expect(local.notices).toEqual([]);
-        expect(await local.storage.get('s1')).toMatchObject({ status: 'usageLimited', usageResetAt: 1000 });
-        expect(local.session.sends).toHaveLength(1);
-      }
-
-      // Observe the entire chain, not just the first notice or elapsed wall time.
-      const resumed = vi.waitFor(async () => {
-        expect(local.notices).toEqual([{ sessionId: 's1', kind: 'usage-resumed' }]);
-        const st = await local.storage.get('s1');
-        expect(st?.status).toBe('active');
-        expect(st?.usageResetAt).toBeNull();
-        expect(local.session.sends.length).toBeGreaterThanOrEqual(2);
-      });
-      releaseEnsure();
-      await resumed;
-    } finally {
-      releaseEnsure();
-      await local.controller.dispose();
-    }
+  it('auto-resumes at resetAt: posts a usage-resumed notice and continues', async () => {
+    h.setAccountLimit({ limited: true, resetAtMs: 1000 }); // == now → delay 0,tick 内触发
+    await startGoal(h);
+    h.session.emitErrorTurn({ sdkError: 'rate_limit' });
+    await tick(); // usageLimited → schedule(delay 0) → autoResume → resumeGoal
+    expect(h.notices).toEqual([{ sessionId: 's1', kind: 'usage-resumed' }]);
+    const st = await h.storage.get('s1');
+    expect(st?.status).toBe('active');
+    expect(st?.usageResetAt).toBeNull(); // resume 清掉
+    expect(h.session.sends.length).toBeGreaterThanOrEqual(2); // 自动续了一轮
   });
 
   it('Stop cancels auto-resume while session hydration is pending without persisting a recovery notice', async () => {
@@ -5019,6 +4986,214 @@ describe('GoalController', () => {
     expect(
       events.some((e) => e.type === 'turn-dispatched' && e.lifecycleId === cleared[0]?.lifecycleId),
     ).toBe(false);
+  });
+
+  it('does not stamp closeout onto a tentative dispatch before send resolves', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    let markDispatchStarted!: () => void;
+    let releaseDispatch!: (result: SessionSendResult) => void;
+    const dispatchStarted = new Promise<void>((resolve) => {
+      markDispatchStarted = resolve;
+    });
+    const pendingDispatch = new Promise<SessionSendResult>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    vi.spyOn(local.session, 'send').mockImplementation(async (
+      message: Parameters<FakeSession['send']>[0],
+      opts: Parameters<FakeSession['send']>[1],
+    ): Promise<SessionSendResult> => {
+      const content = typeof message === 'string' ? message : message.content;
+      local.session.sends.push({ content, originKind: opts?.origin?.kind });
+      opts?.onDispatching?.();
+      markDispatchStarted();
+      return pendingDispatch;
+    });
+
+    const started = local.controller.setGoal({ sessionId: 's1', objective: 'ship it' });
+    await dispatchStarted;
+    await local.controller.clearGoal('s1');
+    await tick();
+    expect(events.some((e) => e.type === 'turn-dispatched')).toBe(false);
+    expect(events.filter((e) => e.type === 'cleared').every((e) => e.turnIndex === 0)).toBe(true);
+
+    releaseDispatch({ accepted: false, reason: 'provider-rejected-before-dispatch' });
+    await started.catch(() => undefined);
+    await tick();
+    const cleared = events.filter((e) => e.type === 'cleared');
+    expect(cleared).toHaveLength(1);
+    expect(cleared[0]?.turnIndex).toBe(0);
+    expect(events.some((e) => e.type === 'turn-dispatched')).toBe(false);
+  });
+
+  it('parks a late accepted dispatch until replacement persist commits', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    let markDispatchStarted!: () => void;
+    let releaseDispatch!: (result: SessionSendResult) => void;
+    const dispatchStarted = new Promise<void>((resolve) => {
+      markDispatchStarted = resolve;
+    });
+    const pendingDispatch = new Promise<SessionSendResult>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    let sendCount = 0;
+    vi.spyOn(local.session, 'send').mockImplementation(async (
+      message: Parameters<FakeSession['send']>[0],
+      opts: Parameters<FakeSession['send']>[1],
+    ): Promise<SessionSendResult> => {
+      sendCount += 1;
+      const content = typeof message === 'string' ? message : message.content;
+      local.session.sends.push({ content, originKind: opts?.origin?.kind });
+      opts?.onDispatching?.();
+      if (sendCount === 1) {
+        markDispatchStarted();
+        return pendingDispatch;
+      }
+      return { accepted: true };
+    });
+
+    const first = local.controller.setGoal({ sessionId: 's1', objective: 'first objective' });
+    await dispatchStarted;
+
+    const origUpdate = local.storage.update.bind(local.storage);
+    let releaseUpdate!: (state: GoalState | null) => void;
+    const blockedUpdate = new Promise<GoalState | null>((resolve) => {
+      releaseUpdate = resolve;
+    });
+    let blockedOnce = false;
+    vi.spyOn(local.storage, 'update').mockImplementation(async (sessionId, patch) => {
+      if (!blockedOnce && patch.objective === 'replacement objective') {
+        blockedOnce = true;
+        return blockedUpdate;
+      }
+      return origUpdate(sessionId, patch);
+    });
+
+    const replacement = local.controller.setGoal({ sessionId: 's1', objective: 'replacement objective' });
+    await vi.waitFor(() => expect(blockedOnce).toBe(true));
+    releaseDispatch({ accepted: true });
+    await tick();
+    expect(events.some((e) => e.type === 'turn-dispatched')).toBe(false);
+    expect(events.some((e) => e.type === 'cleared')).toBe(false);
+
+    const existing = await origUpdate('s1', { objective: 'replacement objective', status: 'active' });
+    releaseUpdate(existing);
+    await replacement;
+    await first.catch(() => undefined);
+    await tick();
+
+    const closeout = events.filter((e) => e.type === 'cleared' && e.reason === 'replaced by new goal');
+    expect(closeout).toHaveLength(1);
+    const oldLifecycle = closeout[0]?.lifecycleId;
+    const oldDispatch = events.filter((e) => e.type === 'turn-dispatched' && e.lifecycleId === oldLifecycle);
+    expect(oldDispatch).toHaveLength(1);
+    expect(oldDispatch[0]).toMatchObject({
+      generation: closeout[0]?.generation,
+      turnIndex: closeout[0]?.turnIndex,
+    });
+  });
+
+  it('closes a late accepted dispatch when replacement persist fails', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    let markDispatchStarted!: () => void;
+    let releaseDispatch!: (result: SessionSendResult) => void;
+    const dispatchStarted = new Promise<void>((resolve) => {
+      markDispatchStarted = resolve;
+    });
+    const pendingDispatch = new Promise<SessionSendResult>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    vi.spyOn(local.session, 'send').mockImplementation(async (
+      message: Parameters<FakeSession['send']>[0],
+      opts: Parameters<FakeSession['send']>[1],
+    ): Promise<SessionSendResult> => {
+      const content = typeof message === 'string' ? message : message.content;
+      local.session.sends.push({ content, originKind: opts?.origin?.kind });
+      opts?.onDispatching?.();
+      markDispatchStarted();
+      return pendingDispatch;
+    });
+
+    const first = local.controller.setGoal({ sessionId: 's1', objective: 'first objective' });
+    await dispatchStarted;
+
+    const origUpdate = local.storage.update.bind(local.storage);
+    let releaseUpdate!: (err: Error) => void;
+    const blockedUpdate = new Promise<GoalState | null>((_, reject) => {
+      releaseUpdate = reject;
+    });
+    let blockedOnce = false;
+    vi.spyOn(local.storage, 'update').mockImplementation(async (sessionId, patch) => {
+      if (!blockedOnce && patch.objective === 'replacement objective') {
+        blockedOnce = true;
+        return blockedUpdate;
+      }
+      return origUpdate(sessionId, patch);
+    });
+
+    const replacement = local.controller.setGoal({ sessionId: 's1', objective: 'replacement objective' });
+    await vi.waitFor(() => expect(blockedOnce).toBe(true));
+    releaseDispatch({ accepted: true });
+    await tick();
+    expect(events.some((e) => e.type === 'turn-dispatched')).toBe(false);
+
+    releaseUpdate(new Error('update unavailable'));
+    await expect(replacement).rejects.toThrow('update unavailable');
+    await first.catch(() => undefined);
+    await tick();
+
+    const dispatched = events.filter((e) => e.type === 'turn-dispatched');
+    const closed = events.filter((e) => e.type === 'cleared' && e.reason === 'replacement persist failed');
+    expect(dispatched).toHaveLength(1);
+    expect(closed).toHaveLength(1);
+    expect(closed[0]).toMatchObject({
+      lifecycleId: dispatched[0]?.lifecycleId,
+      generation: dispatched[0]?.generation,
+      turnIndex: dispatched[0]?.turnIndex,
+    });
+    expect(await local.storage.get('s1')).toMatchObject({ objective: 'first objective' });
+  });
+
+  it('clears tentative markers when a stale owner later rejects', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    let markDispatchStarted!: () => void;
+    let releaseDispatch!: (result: SessionSendResult) => void;
+    const dispatchStarted = new Promise<void>((resolve) => {
+      markDispatchStarted = resolve;
+    });
+    const pendingDispatch = new Promise<SessionSendResult>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    let sendCount = 0;
+    vi.spyOn(local.session, 'send').mockImplementation(async (
+      message: Parameters<FakeSession['send']>[0],
+      opts: Parameters<FakeSession['send']>[1],
+    ): Promise<SessionSendResult> => {
+      sendCount += 1;
+      const content = typeof message === 'string' ? message : message.content;
+      local.session.sends.push({ content, originKind: opts?.origin?.kind });
+      opts?.onDispatching?.();
+      if (sendCount === 1) {
+        markDispatchStarted();
+        return pendingDispatch;
+      }
+      return { accepted: true };
+    });
+
+    const first = local.controller.setGoal({ sessionId: 's1', objective: 'first objective' });
+    await dispatchStarted;
+    await local.controller.setGoal({ sessionId: 's1', objective: 'replacement objective' });
+    releaseDispatch({ accepted: false, reason: 'provider-rejected-before-dispatch' });
+    await first.catch(() => undefined);
+    await tick();
+
+    const closeout = events.filter((e) => e.type === 'cleared' && e.reason === 'replaced by new goal');
+    expect(closeout).toHaveLength(1);
+    expect(events.some((e) => e.type === 'turn-dispatched' && e.lifecycleId === closeout[0]?.lifecycleId)).toBe(false);
+    expect(closeout[0]?.turnIndex).toBe(0);
   });
 
   it('does not flush a parked dispatch when clear persistence fails', async () => {

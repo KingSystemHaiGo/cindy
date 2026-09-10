@@ -374,6 +374,22 @@ interface TurnAccumulator {
   /** onDispatching 时的 1-based 派发序号(turnsUsed+1)。clear/pause/replace
    * 的 closeout 用它,不依赖随后可能失败的 storage.get 快照。 */
   dispatchTurnIndex?: number;
+  /**
+   * send 尚未返回前的派发只是 tentative。clear/pause/replace 不得把
+   * closeout 绑到未确认 send;accepted:false 时还要清掉已停的 markers
+   * (Codex #2107 P1)。
+   */
+  dispatchAcceptance?: 'pending' | 'accepted' | 'rejected';
+  /** 接管 persist 成功但 send 仍 tentative 时,挂起 closeout 等 acceptance。 */
+  pendingTakeoverCloseout?: {
+    type: 'cleared' | 'state-transition';
+    reason: string;
+    from?: GoalStatus;
+    to?: GoalStatus;
+    state: GoalRunEventStateSnapshot | GoalState | null;
+  };
+  /** 替换 persist 失败:迟到 accepted 必须显式 close,避免孤儿 turn-dispatched。 */
+  takeoverAbandoned?: boolean;
   /** 被中断派发的 owner。cancelled 边界继承它,重叠 Stop 仍能 closeout
    * 原 dispatch 而不是新 lifecycle (Codex #2107 P1)。 */
   interruptedDispatch?: {
@@ -628,6 +644,9 @@ export class GoalController {
    * 未收口的派发:onDispatching 之后、finalizeTurn 审计写完之前。
    * done 会先摘掉 goalTurnsInFlight,不能只靠 in-flight 集合判断
    * (Codex #2107 P2: preserve dispatch owner after done)。
+   *
+   * send 未返回前 ownership 保持 tentative,不得把 clear/pause/replace
+   * 的 closeout 提前钉到未确认 dispatch 上 (Codex #2107 P1)。
    */
   private unfinishedDispatch(
     sessionId: string,
@@ -637,9 +656,13 @@ export class GoalController {
     // 重叠 Stop:前一次 pause/clear 已换成 cancelled owner,二次 Stop 必须
     // 继承原 dispatch,不能因 cancelled 直接丢 (Codex #2107 P1)。
     if (boundary.cancelled) return boundary.interruptedDispatch ?? null;
+    if (boundary.dispatchAcceptance === 'rejected' || boundary.dispatchAcceptance === 'pending') {
+      return null;
+    }
     const inFlight = this.goalTurnsInFlight.has(sessionId);
     const dispatchedUnclosed = boundary.auditFinalized === false;
     if (!inFlight && !dispatchedUnclosed) return null;
+    // pending 是 tentative,不绑 closeout;accepted 或已派发未收口才绑。
     return {
       lifecycleId: boundary.lifecycleId,
       generation: boundary.generation,
@@ -647,6 +670,107 @@ export class GoalController {
       // (Codex #2107 P1)。
       turnIndex: boundary.dispatchTurnIndex ?? 1,
     };
+  }
+
+  private clearTentativeDispatchMarkers(boundary: TurnAccumulator | undefined): void {
+    if (!boundary) return;
+    boundary.dispatchAcceptance = 'rejected';
+    boundary.auditFinalized = undefined;
+    boundary.dispatchTurnIndex = undefined;
+    boundary.pendingDispatch = undefined;
+    boundary.pendingTakeoverCloseout = undefined;
+    boundary.takeoverAbandoned = false;
+  }
+
+  private emitTakeoverCloseout(
+    sessionId: string,
+    closeout: NonNullable<TurnAccumulator['pendingTakeoverCloseout']>,
+    owner: { lifecycleId: string; generation: number; turnIndex: number },
+  ): void {
+    if (closeout.type === 'cleared') {
+      this.recordRunEvent('cleared', sessionId, closeout.state, {
+        from: closeout.from,
+        reason: closeout.reason,
+        lifecycleId: owner.lifecycleId,
+        generation: owner.generation,
+        turnIndex: owner.turnIndex,
+      });
+      return;
+    }
+    this.recordRunEvent('state-transition', sessionId, closeout.state, {
+      from: closeout.from,
+      to: closeout.to,
+      reason: closeout.reason,
+      lifecycleId: owner.lifecycleId,
+      generation: owner.generation,
+      turnIndex: owner.turnIndex,
+    });
+  }
+
+  /** persist 成功后再绑 closeout;send 仍 tentative 则挂起等 acceptance。 */
+  private settleTakeoverCloseout(
+    sessionId: string,
+    previous: TurnAccumulator | undefined,
+    closeout: NonNullable<TurnAccumulator['pendingTakeoverCloseout']>,
+  ): void {
+    this.flushRetiredPendingDispatch(sessionId, previous);
+    const owner = this.unfinishedDispatch(sessionId, previous);
+    if (owner) {
+      this.emitTakeoverCloseout(sessionId, closeout, owner);
+      if (previous) previous.pendingTakeoverCloseout = undefined;
+      return;
+    }
+    if (previous?.dispatchAcceptance === 'rejected') {
+      this.emitUnboundTakeoverCloseout(sessionId, closeout);
+      return;
+    }
+    if (previous?.auditFinalized === false) {
+      previous.pendingTakeoverCloseout = closeout;
+      return;
+    }
+    this.emitUnboundTakeoverCloseout(sessionId, closeout);
+  }
+
+  private emitUnboundTakeoverCloseout(
+    sessionId: string,
+    closeout: NonNullable<TurnAccumulator['pendingTakeoverCloseout']>,
+    identity?: { lifecycleId: string; generation: number },
+  ): void {
+    if (closeout.type === 'cleared') {
+      this.recordRunEvent('cleared', sessionId, closeout.state, {
+        from: closeout.from,
+        reason: closeout.reason,
+        ...identity,
+      });
+      return;
+    }
+    this.recordRunEvent('state-transition', sessionId, closeout.state, {
+      from: closeout.from,
+      to: closeout.to,
+      reason: closeout.reason,
+      ...identity,
+    });
+  }
+
+  private closeAbandonedReplacement(
+    sessionId: string,
+    previous: TurnAccumulator | undefined,
+    state: GoalRunEventStateSnapshot | GoalState | null,
+  ): void {
+    if (!previous || previous.dispatchAcceptance !== 'accepted') return;
+    if (previous.pendingTakeoverCloseout === undefined && !previous.pendingDispatch && previous.auditFinalized === true) {
+      return;
+    }
+    this.flushPendingDispatch(sessionId, previous);
+    this.recordRunEvent('cleared', sessionId, state, {
+      from: 'active',
+      reason: 'replacement persist failed',
+      lifecycleId: previous.lifecycleId,
+      generation: previous.generation,
+      turnIndex: previous.dispatchTurnIndex ?? 1,
+    });
+    previous.pendingTakeoverCloseout = undefined;
+    previous.auditFinalized = true;
   }
 
   /** finalizeTurn 写收口事件后补发挂起的派发(保证 dispatch 与收口配对)。 */
@@ -833,20 +957,27 @@ export class GoalController {
         );
         if (this.turns.get(sessionId) !== editBoundary) return null;
         if (!updated) {
+          if (previousBoundary) {
+            previousBoundary.takeoverAbandoned = true;
+            if (previousBoundary.dispatchAcceptance === 'accepted') {
+              this.closeAbandonedReplacement(sessionId, previousBoundary, existing);
+            }
+          }
           this.turns.delete(sessionId);
           return null;
         }
         updatedState = updated;
-        if (interruptedDispatch) {
-          // in-flight 替换必须给旧派发显式 closeout,否则审计仍把旧 lifecycle
-          // 当成悬挂 turn (Codex #2107 P2)。
-          this.flushRetiredPendingDispatch(sessionId, previousBoundary);
-          this.recordRunEvent('cleared', sessionId, existing, {
-            from: existing.status,
+        if (
+          interruptedDispatch ||
+          previousBoundary?.auditFinalized === false ||
+          previousBoundary?.pendingDispatch ||
+          previousBoundary?.dispatchAcceptance === 'pending'
+        ) {
+          this.settleTakeoverCloseout(sessionId, previousBoundary, {
+            type: 'cleared',
             reason: 'replaced by new goal',
-            lifecycleId: interruptedDispatch.lifecycleId,
-            generation: interruptedDispatch.generation,
-            turnIndex: interruptedDispatch.turnIndex,
+            from: existing.status,
+            state: existing,
           });
         }
         this.resetTurn(sessionId);
@@ -858,6 +989,12 @@ export class GoalController {
         }
       } catch (error) {
         if (this.turns.get(sessionId) === editBoundary) {
+          if (!editObjectivePersisted && previousBoundary) {
+            previousBoundary.takeoverAbandoned = true;
+            if (previousBoundary.dispatchAcceptance === 'accepted') {
+              this.closeAbandonedReplacement(sessionId, previousBoundary, existing);
+            }
+          }
           if (rejectionTakeover) {
             // Keep the persisted active Goal live after either half of the edit
             // fails. Before objective commit, resume the old rejection budget;
@@ -1393,17 +1530,11 @@ export class GoalController {
     if (this.turns.get(sessionId) !== clearBoundary) return;
     await this.trackPersistence(clearBoundary, this.deps.storage.clear(sessionId));
     if (this.turns.get(sessionId) !== clearBoundary) return;
-    this.flushRetiredPendingDispatch(sessionId, previousBoundary);
-    this.recordRunEvent('cleared', sessionId, auditSnapshot, {
-      from: auditSnapshot?.status,
+    this.settleTakeoverCloseout(sessionId, previousBoundary, {
+      type: 'cleared',
       reason: 'cleared by user',
-      ...(interruptedDispatch
-        ? {
-            lifecycleId: interruptedDispatch.lifecycleId,
-            generation: interruptedDispatch.generation,
-            turnIndex: interruptedDispatch.turnIndex,
-          }
-        : {}),
+      from: auditSnapshot?.status,
+      state: auditSnapshot,
     });
     this.deps.emitStatus({ sessionId, goal: null });
     this.turns.delete(sessionId);
@@ -1452,18 +1583,12 @@ export class GoalController {
       );
       if (this.turns.get(sessionId) !== pauseBoundary) return;
       if (updated) {
-        this.flushRetiredPendingDispatch(sessionId, previousBoundary);
-        this.recordRunEvent('state-transition', sessionId, updated, {
+        this.settleTakeoverCloseout(sessionId, previousBoundary, {
+          type: 'state-transition',
+          reason: updated.lastReason ?? 'paused by user',
           from: state.status,
           to: 'paused',
-          reason: updated.lastReason,
-          ...(interruptedDispatch
-            ? {
-                lifecycleId: interruptedDispatch.lifecycleId,
-                generation: interruptedDispatch.generation,
-                turnIndex: interruptedDispatch.turnIndex,
-              }
-            : {}),
+          state: updated,
         });
         this.emit(updated);
       }
@@ -1480,18 +1605,12 @@ export class GoalController {
     );
     if (this.turns.get(sessionId) !== pauseBoundary) return;
     if (updated) {
-      this.flushRetiredPendingDispatch(sessionId, previousBoundary);
-      this.recordRunEvent('state-transition', sessionId, updated, {
+      this.settleTakeoverCloseout(sessionId, previousBoundary, {
+        type: 'state-transition',
+        reason: updated.lastReason ?? 'paused by user',
         from: state.status,
         to: 'paused',
-        reason: updated.lastReason,
-        ...(interruptedDispatch
-          ? {
-              lifecycleId: interruptedDispatch.lifecycleId,
-              generation: interruptedDispatch.generation,
-              turnIndex: interruptedDispatch.turnIndex,
-            }
-          : {}),
+        state: updated,
       });
       this.emit(updated);
     }
@@ -2923,6 +3042,7 @@ export class GoalController {
             if (dispatchBoundary) {
               dispatchBoundary.auditFinalized = false;
               dispatchBoundary.dispatchTurnIndex = (state.turnsUsed ?? 0) + 1;
+              dispatchBoundary.dispatchAcceptance = 'pending';
             }
             // signal 只负责取消 dispatch 前的 gate。跨过这个边界后由 coordinator Stop
             // 负责 active turn；否则快速终态的 stopSession 会把真实已派发轮次误报为
@@ -2947,15 +3067,24 @@ export class GoalController {
           this.deps.onUndispatchedUserTurn?.(sessionId);
           baselineStarted = false;
         }
+        // takeover 已换 owner 时 isCurrentDispatch 为 false,仍必须清 tentative
+        // markers / suppress closeout,否则 auditFinalized=false 会把未接受
+        // send 钉成 interrupted (Codex #2107 P1)。
+        if (dispatchBoundary) {
+          const parkedCloseout = dispatchBoundary.pendingTakeoverCloseout;
+          // 钉到退休 lifecycle,但不带 dispatch turnIndex(unstamped)。
+          // 否则 recordRunEvent 会落到新 live owner,和下一轮 dispatch 撞号。
+          const retiredLifecycle = {
+            lifecycleId: dispatchBoundary.lifecycleId,
+            generation: dispatchBoundary.generation,
+          };
+          this.clearTentativeDispatchMarkers(dispatchBoundary);
+          if (parkedCloseout) {
+            this.emitUnboundTakeoverCloseout(sessionId, parkedCloseout, retiredLifecycle);
+          }
+        }
         if (!isCurrentDispatch()) return;
         this.goalTurnsInFlight.delete(sessionId);
-        // onDispatching 已把 auditFinalized=false / dispatchTurnIndex 钉上,但
-        // rejected send 没有 turn-dispatched。不在此清掉,pause/clear/replace
-        // 会把 closeout 戳到无派发的 lifecycle 上 (Codex #2107 P1)。
-        if (dispatchBoundary) {
-          dispatchBoundary.auditFinalized = undefined;
-          dispatchBoundary.dispatchTurnIndex = undefined;
-        }
 
         if (result.reason === 'provider-rejected-before-dispatch') {
           const rejectedAt = this.now();
@@ -3014,6 +3143,7 @@ export class GoalController {
         if (isCurrentDispatch()) {
           this.dispatchRejectionRetries.delete(sessionId);
         }
+        if (dispatchBoundary) dispatchBoundary.dispatchAcceptance = 'accepted';
         // onDispatching 是归属登记的唯一边界。不能在 await send 后再次 add：极快的
         // turn 可能已经发出终态并同步释放归属，重新登记会把后续用户 turn 误认成 Goal。
         baselineStarted = false;
@@ -3029,7 +3159,21 @@ export class GoalController {
           currentOwner !== dispatchBoundary &&
           !currentOwner.cancelled;
         if (this.disposed) return;
-        if (replacedByNewLiveOwner) {
+        const parkOrEmitAccepted = (): void => {
+          if (
+            currentOwner === dispatchBoundary &&
+            dispatchBoundary?.finalized === true &&
+            dispatchBoundary?.auditFinalized !== true
+          ) {
+            dispatchBoundary.pendingDispatch = {
+              generation: dispatchGeneration,
+              lifecycleId: dispatchBoundary?.lifecycleId,
+              at: dispatchAt ?? this.now(),
+              resumeReason: dispatchResumeReason,
+              state: state as GoalRunEventStateSnapshot,
+            };
+            return;
+          }
           this.emitDispatchEvents(
             sessionId,
             state,
@@ -3038,34 +3182,50 @@ export class GoalController {
             dispatchAt ?? this.now(),
             dispatchResumeReason,
           );
-          return;
-        }
-        // 只有当前 owner 仍是本派发 boundary 时才挂起等 finalizeTurn flush。
-        // pause/clear 已换成 cancelled owner 后,finalizer 会 isCurrentTurn 失败,
-        // 挂在退休 boundary 上的 pendingDispatch 永远不会 flush
-        // (Codex #2107 P1: flush late accepted after cancellation)。
-        if (
-          currentOwner === dispatchBoundary &&
-          dispatchBoundary?.finalized === true &&
-          dispatchBoundary?.auditFinalized !== true
-        ) {
+        };
+        const parkAcceptedForTakeover = (): void => {
+          if (!dispatchBoundary) return;
           dispatchBoundary.pendingDispatch = {
             generation: dispatchGeneration,
-            lifecycleId: dispatchBoundary?.lifecycleId,
+            lifecycleId: dispatchBoundary.lifecycleId,
             at: dispatchAt ?? this.now(),
             resumeReason: dispatchResumeReason,
             state: state as GoalRunEventStateSnapshot,
           };
+        };
+        const flushAcceptedTakeover = (): boolean => {
+          if (!dispatchBoundary) return false;
+          if (dispatchBoundary.takeoverAbandoned) {
+            parkOrEmitAccepted();
+            this.closeAbandonedReplacement(sessionId, dispatchBoundary, state);
+            return true;
+          }
+          const parkedCloseout = dispatchBoundary.pendingTakeoverCloseout;
+          if (!parkedCloseout) return false;
+          parkOrEmitAccepted();
+          this.flushRetiredPendingDispatch(sessionId, dispatchBoundary);
+          this.emitTakeoverCloseout(sessionId, parkedCloseout, {
+            lifecycleId: dispatchBoundary.lifecycleId,
+            generation: dispatchBoundary.generation,
+            turnIndex: dispatchBoundary.dispatchTurnIndex ?? 1,
+          });
+          dispatchBoundary.pendingTakeoverCloseout = undefined;
+          return true;
+        };
+        if (flushAcceptedTakeover()) return;
+        // persist 尚未 commit:迟到 accepted 转 takeover,等 commit 后再 flush,
+        // 避免 replacement write 失败留下孤儿 turn-dispatched (Codex #2107 P1)。
+        // pause/clear 已换成 cancelled owner 后,finalizer 会 isCurrentTurn 失败,
+        // 挂在退休 boundary 上的 pendingDispatch 永远不会 flush
+        // (Codex #2107 P1: flush late accepted after cancellation)。
+        if (
+          replacedByNewLiveOwner ||
+          (currentOwner != null && currentOwner !== dispatchBoundary)
+        ) {
+          parkAcceptedForTakeover();
           return;
         }
-        this.emitDispatchEvents(
-          sessionId,
-          state,
-          dispatchBoundary,
-          dispatchGeneration,
-          dispatchAt ?? this.now(),
-          dispatchResumeReason,
-        );
+        parkOrEmitAccepted();
         if (!isCurrentDispatch()) return;
       }
     } catch (e) {

@@ -104,9 +104,9 @@ export function createRunEventRecorder(limit = 200, sink?: RunEventSink): GoalRu
       //     同代不证明同生命周期;新 run 的 turnIndex 小于旧 run 的 terminal,
       //     不得把"新 run 开始"排到"旧 run 结束"之前);
       //  3. 同 at 且仍相等时,派发类(resumed/turn-dispatched)在收口类之前;
-      //  4. 同 at 先按 session 组(该 timestamp 下该 session 最早插入序)全序,
-      //     组内再按 lifecycle 序号;禁止 pairwise 混用 lifecycle/插入序
-      //     (否则 A:g3,B,A:g1 会成环,V8 可能把新 A 排到旧 terminal 前)。
+      //  4. 同 at 默认保持插入序;仅当同 session 的旧 lifecycle closeout 落在
+      //     新 lifecycle dispatch 之后时,把该 closeout 提到那次 dispatch 前
+      //     (Codex #2107 P1: 不要按 session 首事件把整段 session 提前)。
       //  5. 其余按显式插入序号(不依赖引擎 sort 稳定性,插入序 = 落环序)。
       const dispatchGroup = new Set(['resumed', 'turn-dispatched']);
       // 收口类:所有派发后的终态/迁移/停滞事件都排在派发类之后(同毫秒全序,
@@ -136,31 +136,39 @@ export function createRunEventRecorder(limit = 200, sink?: RunEventSink): GoalRu
         evt.type === 'state-transition' ? evt.to !== 'active' : closeoutGroup.has(evt.type);
       const indexed = ring.map((evt, idx) => ({
         _seq: idx,
+        _key: idx,
         ...evt,
         budget: evt.budget ? { ...evt.budget } : undefined,
       }));
-      // 每个 timestamp 一份全序:session 组秩 = 该 at 下该 session 最早 _seq。
-      // 先比组秩再比 lifecycle,传递、无环 (Codex #2107 P1)。
-      const sessionRankAt = new Map<string, number>();
+      // 只移动冲突的 same-session lifecycle 边:旧 closeout 若插在新 dispatch
+      // 之后,提到该 dispatch 前。不得按 session 首事件把整段 session 提前,
+      // 否则 A dispatch, B dispatch, A finalized 会变成 A,A,B (Codex #2107 P1)。
+      const groups = new Map<string, typeof indexed>();
       for (const evt of indexed) {
         const key = `${evt.at ?? 0}\0${evt.goalSessionId}`;
-        const prev = sessionRankAt.get(key);
-        if (prev === undefined || evt._seq < prev) sessionRankAt.set(key, evt._seq);
+        const group = groups.get(key);
+        if (group) group.push(evt);
+        else groups.set(key, [evt]);
+      }
+      for (const group of groups.values()) {
+        const dispatches = group.filter((e) => dispatchGroup.has(e.type));
+        for (const closeout of group) {
+          if (!isCloseout(closeout)) continue;
+          const closeLife = lifecycleSeqOf(closeout.lifecycleId);
+          for (const dispatch of dispatches) {
+            if (lifecycleSeqOf(dispatch.lifecycleId) <= closeLife) continue;
+            if (dispatch._seq >= closeout._seq) continue;
+            closeout._key = Math.min(closeout._key, dispatch._seq - 0.5);
+          }
+        }
       }
       return indexed
         .sort((a, b) => {
           const byAt = (a.at ?? 0) - (b.at ?? 0);
           if (byAt !== 0) return byAt;
-          const aRank = sessionRankAt.get(`${a.at ?? 0}\0${a.goalSessionId}`) ?? a._seq;
-          const bRank = sessionRankAt.get(`${b.at ?? 0}\0${b.goalSessionId}`) ?? b._seq;
-          if (aRank !== bRank) return aRank - bRank;
-          const byLifecycle = lifecycleSeqOf(a.lifecycleId) - lifecycleSeqOf(b.lifecycleId);
-          if (byLifecycle !== 0) return byLifecycle;
-          // 同 at 且同 lifecycleId(同生命周期)用 turnIndex 与派发/收口类型次序。
           if (a.lifecycleId && a.lifecycleId === b.lifecycleId) {
             const byTurn = a.turnIndex - b.turnIndex;
             if (byTurn !== 0) return byTurn;
-            // 仅派发类 vs 收口类跨组时用类型次序,其余保持插入序。
             const aD = dispatchGroup.has(a.type);
             const bD = dispatchGroup.has(b.type);
             const aF = isCloseout(a);
@@ -168,10 +176,10 @@ export function createRunEventRecorder(limit = 200, sink?: RunEventSink): GoalRu
             if (aD && bF) return -1;
             if (aF && bD) return 1;
           }
-          // 显式插入序号作最终 tie-breaker(规范不保证 sort 稳定)。
+          if (a._key !== b._key) return a._key - b._key;
           return a._seq - b._seq;
         })
-        .map(({ _seq: _omit, ...evt }) => evt);
+        .map(({ _seq: _omit, _key: _omitKey, ...evt }) => evt);
     },
     clear() {
       ring.length = 0;

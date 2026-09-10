@@ -152,4 +152,34 @@ describe('createRunEventRecorder', () => {
     expect(rec.snapshot().map((e) => e.lifecycleId)).toEqual(['g1', 'g3', 'g2']);
     expect(rec.snapshot().map((e) => e.goalSessionId)).toEqual(['a', 'a', 'b']);
   });
+
+  it('does not pull a later session B dispatch in front of an earlier A closeout pair', () => {
+    const rec = createRunEventRecorder();
+    rec.record(evt({
+      type: 'turn-dispatched',
+      goalSessionId: 'a',
+      lifecycleId: 'g1',
+      turnIndex: 1,
+      at: 1000,
+    }));
+    rec.record(evt({
+      type: 'turn-dispatched',
+      goalSessionId: 'b',
+      lifecycleId: 'g2',
+      turnIndex: 1,
+      at: 1000,
+    }));
+    rec.record(evt({
+      type: 'turn-finalized',
+      goalSessionId: 'a',
+      lifecycleId: 'g1',
+      turnIndex: 1,
+      at: 1000,
+    }));
+    expect(rec.snapshot().map((e) => `${e.goalSessionId}:${e.type}`)).toEqual([
+      'a:turn-dispatched',
+      'b:turn-dispatched',
+      'a:turn-finalized',
+    ]);
+  });
 });
