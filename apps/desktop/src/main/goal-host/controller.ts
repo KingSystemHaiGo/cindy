@@ -1154,6 +1154,18 @@ export class GoalController {
             });
           },
         );
+        if (updated) {
+          // persist 已提交就必须入队,覆盖 editBoundary 的 pause/clear
+          // 不能跳过 replacement closeout (Codex #2107 P1: settle replacement
+          // before honoring a newer owner).
+          this.settleCommittedReplacementCloseout(
+            sessionId,
+            previousBoundary,
+            editBoundary,
+            existing,
+          );
+        }
+        // 审计已入队;入口仍对覆盖方返回 null(dispose/pause/clear 的调用契约)。
         if (this.turns.get(sessionId) !== editBoundary) return null;
         if (!updated) {
           const abandoned = this.takeoverDispatchTarget(previousBoundary);
@@ -1167,12 +1179,6 @@ export class GoalController {
           return null;
         }
         updatedState = updated;
-        this.settleCommittedReplacementCloseout(
-          sessionId,
-          previousBoundary,
-          editBoundary,
-          existing,
-        );
         // 旧派发 closeout 已入队/兑现,不能让后续 pause 再把新目标的
         // 迁移钉到已收口的旧 accepted owner 上。
         editBoundary.interruptedDispatch = undefined;
@@ -1447,7 +1453,7 @@ export class GoalController {
         this.turns.set(sessionId, limitBoundary);
         await this.awaitPendingLifecycle(limitBoundary);
         if (this.turns.get(sessionId) !== limitBoundary) return reconcileLifecycleChange();
-        changed = await this.trackPersistence(
+        const limitedWrite = await this.trackPersistenceWithMarkerFailure(
           limitBoundary,
           this.deps.storage.update(sessionId, {
             ...normalized,
@@ -1457,16 +1463,21 @@ export class GoalController {
           }),
           persistObjectiveMarker,
         );
+        changed = limitedWrite.value;
         if (!changed) {
           if (this.turns.get(sessionId) === limitBoundary) this.turns.delete(sessionId);
+          if (limitedWrite.markerError) throw limitedWrite.markerError;
           return null;
         }
         // persist 已提交就必须入队,哪怕后来的 pause/clear 已换 owner
         // (Codex #2107 P2: settle committed budget closeout before stale-owner return)。
+        // marker 失败也要 settle:trackPersistence 整体 reject 进不了这里
+        // (Codex #2107 P1: settle budget events when the objective marker fails)。
         this.settleBudgetLimitCloseout(sessionId, previousBoundary, changed, state.status);
+        if (limitedWrite.markerError) throw limitedWrite.markerError;
         if (this.turns.get(sessionId) !== limitBoundary) return reconcileLifecycleChange();
       } else {
-        changed = await this.trackPersistence(
+        const updatedWrite = await this.trackPersistenceWithMarkerFailure(
           operationBoundary,
           this.deps.storage.update(sessionId, {
             ...normalized,
@@ -1474,6 +1485,8 @@ export class GoalController {
           }),
           persistObjectiveMarker,
         );
+        changed = updatedWrite.value;
+        if (updatedWrite.markerError) throw updatedWrite.markerError;
         if (entryChanged()) return reconcileLifecycleChange();
       }
       if (!changed) return null;
@@ -2325,6 +2338,40 @@ export class GoalController {
     return committed;
   }
 
+  /**
+   * 登记 Goal 状态写入,并把 secondary marker 失败从 storage 提交中拆开。
+   * afterPersist reject 时仍 resolve 已提交的行,让调用方 settle 审计事件
+   * (Codex #2107 P1: settle committed budget / turn closeouts after marker failure)。
+   */
+  private trackPersistenceWithMarkerFailure<T>(
+    turn: TurnAccumulator,
+    operation: Promise<T>,
+    afterPersist?: (value: T) => void | Promise<void>,
+  ): Promise<{ value: T; markerError?: unknown }> {
+    const committed = operation.then(async (value) => {
+      if (this.disposed) return { value };
+      try {
+        await afterPersist?.(value);
+        return { value };
+      } catch (markerError) {
+        return { value, markerError };
+      }
+    });
+    const settled = committed.then(
+      () => undefined,
+      () => undefined,
+    );
+    const previous = turn.pendingPersistence;
+    const barrier = previous
+      ? Promise.all([previous, settled]).then(() => undefined)
+      : settled;
+    turn.pendingPersistence = barrier;
+    void barrier.then(() => {
+      if (turn.pendingPersistence === barrier) turn.pendingPersistence = null;
+    });
+    return committed;
+  }
+
   private async awaitPendingPersistence(turn: TurnAccumulator | undefined): Promise<void> {
     while (turn?.pendingPersistence) {
       const pending = turn.pendingPersistence;
@@ -2691,7 +2738,7 @@ export class GoalController {
         : null;
 
     if (!isCurrentTurn()) return;
-    const updated = await this.trackPersistence(
+    const turnWrite = await this.trackPersistenceWithMarkerFailure(
       turn,
       this.deps.storage.update(sessionId, {
         // active 是保持态，不是 transition；省略它可让迟到 continuation 写在任何
@@ -2715,6 +2762,7 @@ export class GoalController {
         }
       },
     );
+    const updated = turnWrite.value;
     if (updated && isCurrentTurn()) this.emit(updated);
 
     const finalizeIdentity = {
@@ -2769,6 +2817,16 @@ export class GoalController {
       });
       turn.auditFinalized = true;
       this.flushPendingDispatch(sessionId, turn);
+    }
+
+    // 计数/目标已落盘就必须记收口,不能因 secondary marker 失败退出
+    // (Codex #2107 P1: finalize committed turns after marker-write failures)。
+    // finalizeTurn 由 onEvent `void` 调用,不能把 markerError 再抛成 unhandled rejection。
+    if (turnWrite.markerError) {
+      this.deps.logger.warn('[goal] persistUserMessage failed after committed turn finalize', {
+        sessionId,
+        error: String(turnWrite.markerError),
+      });
     }
 
     if (!isCurrentTurn()) return;
