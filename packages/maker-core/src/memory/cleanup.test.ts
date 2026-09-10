@@ -104,6 +104,44 @@ describe('planMemoryCleanup', () => {
     expect(plan.duplicates[0].archive).toEqual(['feedback_lex.md']);
   });
 
+  it('ranks unquoted YAML Date updatedAt from raw frontmatter not scan-time now', async () => {
+    // gray-matter 把未加引号的 ISO 解析成 Date; parseRawShard 会写成 now。
+    // 排名必须读 raw frontmatter, 否则后扫描的旧分片会被当成更新。
+    await writeFile(
+      path.join(dir, 'feedback_newer.md'),
+      [
+        '---',
+        'title: Same',
+        'description: same hook',
+        'type: feedback',
+        'updatedAt: 2026-03-01T00:00:00.000Z',
+        '---',
+        'same body',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFile(
+      path.join(dir, 'feedback_older.md'),
+      [
+        '---',
+        'title: Same',
+        'description: same hook',
+        'type: feedback',
+        'updatedAt: 2026-01-01T00:00:00.000Z',
+        '---',
+        'same body',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+
+    const plan = await planMemoryCleanup(dir);
+    expect(plan.duplicates).toHaveLength(1);
+    expect(plan.duplicates[0].keep).toBe('feedback_newer.md');
+    expect(plan.duplicates[0].archive).toEqual(['feedback_older.md']);
+  });
+
   it('binds expectedHash to the same classified bytes including updatedAt', async () => {
     await shard('feedback_rule_a.md', 'feedback', 'PR polling rule', 'same hook', 'same body',
       '2026-01-01T00:00:00.000Z');

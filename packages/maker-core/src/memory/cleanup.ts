@@ -295,7 +295,11 @@ export async function planMemoryCleanup(
     // 用纪元时间而不是 ISO 字符串字典序: `...T09:00:00-08:00` 比
     // `...T12:00:00Z` 更新, 但 `>` 会把 Z 排在前 (Codex P1 on #2561:
     // compare duplicate timestamps chronologically)。无效时间戳视为最旧。
-    const keep = group.reduce((a, b) => (compareRecordsByUpdatedAt(b, a) < 0 ? b : a));
+    const keep = group.reduce((a, b) =>
+      compareRecordsByUpdatedAt(b, a, rawByName.get(b.filename), rawByName.get(a.filename)) < 0
+        ? b
+        : a,
+    );
     const archive = group.filter((r) => r.filename !== keep.filename).map((r) => r.filename);
     plan.duplicates.push({
       hash: contentHash(keep),
@@ -545,10 +549,19 @@ function parseUpdatedAtMs(value: string | undefined): number | null {
   return Number.isNaN(ts) ? null : ts;
 }
 
-/** 按绝对时间比较: 更新的在前; 无效时间戳视为最旧; 并列按 filename。 */
-function compareRecordsByUpdatedAt(a: MemoryRecord, b: MemoryRecord): number {
-  const ta = parseUpdatedAtMs(a.frontmatter.updatedAt);
-  const tb = parseUpdatedAtMs(b.frontmatter.updatedAt);
+/** 按绝对时间比较: 更新的在前; 无效时间戳视为最旧; 并列按 filename。
+ * 优先 raw frontmatter 的 updatedAt (YAML 未加引号的 ISO 会被 gray-matter
+ * 解析成 Date, parseRawShard 再写成 now — 字典序/扫描序会归档真正更新的那份;
+ * Codex P1 on #2561: Preserve YAML Date values when ranking duplicates)。
+ */
+function compareRecordsByUpdatedAt(
+  a: MemoryRecord,
+  b: MemoryRecord,
+  rawA?: string,
+  rawB?: string,
+): number {
+  const ta = parseFrontmatterUpdatedAt(rawA) ?? parseUpdatedAtMs(a.frontmatter.updatedAt);
+  const tb = parseFrontmatterUpdatedAt(rawB) ?? parseUpdatedAtMs(b.frontmatter.updatedAt);
   if (ta !== tb) {
     if (ta === null) return 1;
     if (tb === null) return -1;
