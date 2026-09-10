@@ -490,4 +490,14 @@ describe('settings changes preserve independently joined capabilities', () => {
     });
     expect(botSettingsChanges(before, payload({ name: 'Updated' }), true)).toEqual({ name: 'Updated' });
   });
+  it('omits styleBaseline when restoring the whole style override to default', () => {
+    expect(botSettingsChanges(
+      payload({ style: { tone: 'warm', addressUserAs: 'Chris' } }),
+      payload({ style: null }),
+      true,
+    )).toEqual({ style: null });
+    expect(botSettingsChanges(payload({ style: { selfName: '小满' } }), payload({ style: null }), true)).toEqual({
+      style: null,
+    });
+  });
 });

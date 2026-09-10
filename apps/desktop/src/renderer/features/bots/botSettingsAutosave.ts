@@ -160,7 +160,12 @@ export function botSettingsChanges(previous: BotSettingsPayload, next: BotSettin
     ...changed,
     ...(Object.keys(capabilityChanges).length ? { capabilities: capabilityChanges } : {}),
     ...(includeCapabilityBaseline && Object.keys(capabilityBaseline).length ? { capabilityBaseline } : {}),
-    ...(includeCapabilityBaseline && 'style' in changed ? { styleBaseline: previous.style ?? null } : {}),
+    // Group restore-default sends style:null to delete the whole override.
+    // A field-merge baseline would keep concurrent remote keys that were unset
+    // in this window (e.g. another window just added selfName).
+    ...(includeCapabilityBaseline && 'style' in changed && changed.style != null
+      ? { styleBaseline: previous.style ?? null }
+      : {}),
   };
 }
 

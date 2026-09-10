@@ -618,8 +618,12 @@ describe('Bot settings unified autosave', () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
     });
-    const lastPatch = mocks.updateBotProfile.mock.calls.at(-1)?.[1] as { style?: unknown };
+    const lastPatch = mocks.updateBotProfile.mock.calls.at(-1)?.[1] as {
+      style?: unknown;
+      styleBaseline?: unknown;
+    };
     expect(lastPatch.style).toBeNull();
+    expect(lastPatch).not.toHaveProperty('styleBaseline');
   });
 
   it('clears every style field with the group restore-default action', async () => {
@@ -661,8 +665,12 @@ describe('Bot settings unified autosave', () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
     });
-    const lastPatch = mocks.updateBotProfile.mock.calls.at(-1)?.[1] as { style?: unknown };
+    const lastPatch = mocks.updateBotProfile.mock.calls.at(-1)?.[1] as {
+      style?: unknown;
+      styleBaseline?: unknown;
+    };
     expect(lastPatch.style).toBeNull();
+    expect(lastPatch).not.toHaveProperty('styleBaseline');
   });
 
   it('changes the avatar through the host-owned image picker', async () => {
