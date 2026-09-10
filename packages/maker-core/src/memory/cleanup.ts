@@ -869,7 +869,16 @@ async function reserveTrashTarget(
       // rebuildIndex 也看不到 .cleanup-parked-* (Codex P1 on #2561:
       // restore parked source before retrying reservation)。
       if (err.parkedPath) {
-        await restoreParkedSource(src, err.parkedPath);
+        const restored = await restoreParkedSource(src, err.parkedPath);
+        if (!restored) {
+          await fs.unlink(candidate).catch(() => {});
+          throw Object.assign(
+            new Error(
+              'unable to restore parked source without clobbering src; parked kept for recovery',
+            ),
+            { code: 'CLEANUP_SOURCE_LOCKED' },
+          );
+        }
       }
       await fs.unlink(candidate).catch(() => {});
       continue;
@@ -956,18 +965,26 @@ async function detachReservedSource(
   );
 }
 
-async function restoreParkedSource(src: string, parked: string): Promise<void> {
+/**
+ * Put parked back on src without clobbering a concurrent recreate.
+ * POSIX rename overwrites an existing src (TOCTOU after pathExists, or when
+ * stat EACCES is treated as missing). Use exclusive link / COPYFILE_EXCL;
+ * if the name cannot be reserved, leave parked and return false
+ * (Codex P1 on #2561: no-clobber parked restore).
+ */
+async function restoreParkedSource(src: string, parked: string): Promise<boolean> {
   try {
-    if (await pathExists(src)) {
-      // src already names an inode (host rewrite / concurrent recreate).
-      // parked may be the only copy of an unreviewed replacement moved off
-      // src after trash reservation — never unlink it just because src exists
-      // (Codex P1 on #2561: do not delete an unidentified parked shard).
-      return;
+    await fs.link(parked, src);
+    await fs.unlink(parked).catch(() => {});
+    return true;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    try {
+      await fs.copyFile(parked, src, fs.constants.COPYFILE_EXCL);
+      return true;
+    } catch {
+      return false;
     }
-    await fs.rename(parked, src);
-  } catch {
-    // Leave parked reachable if restore fails; do not unlink it.
   }
 }
 
@@ -975,8 +992,10 @@ async function pathExists(p: string): Promise<boolean> {
   try {
     await fs.stat(p);
     return true;
-  } catch {
-    return false;
+  } catch (e) {
+    // Only ENOENT is absence. EACCES/EPERM must not look missing or a later
+    // rename would clobber an unreadable live shard.
+    return (e as NodeJS.ErrnoException).code !== 'ENOENT';
   }
 }
 

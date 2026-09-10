@@ -1204,6 +1204,69 @@ describe('runMemoryCleanup', () => {
     }
   });
 
+  it('does not rename-clobber src recreated during parked restore', async () => {
+    await shard('feedback_a.md', 'feedback', 'Same', 'hook', 'same', '2026-01-01T00:00:00.000Z');
+    await shard('feedback_b.md', 'feedback', 'Same', 'hook', 'same', '2026-02-01T00:00:00.000Z');
+
+    const plan = await planMemoryCleanup(dir);
+    const realLstat = fs.lstat.bind(fs);
+    const realLink = fs.link.bind(fs);
+    const realCopy = fs.copyFile.bind(fs);
+    const realRename = fs.rename.bind(fs);
+    let failedOnce = false;
+    const lstatSpy = vi.spyOn(fs, 'lstat').mockImplementation(async (p) => {
+      if (!failedOnce && String(p).includes('cleanup-parked')) {
+        failedOnce = true;
+        throw Object.assign(new Error('transient lock'), { code: 'EACCES' });
+      }
+      return realLstat(p as string);
+    });
+    const renameSpy = vi.spyOn(fs, 'rename').mockImplementation(async (src, dst) => {
+      if (String(src).includes('cleanup-parked') && String(dst).endsWith('feedback_a.md')) {
+        throw new Error('parked restore must not POSIX-rename over src');
+      }
+      return realRename(src as string, dst as string);
+    });
+    const linkSpy = vi.spyOn(fs, 'link').mockImplementation(async (src, dst) => {
+      if (String(src).includes('cleanup-parked') && String(dst).endsWith('feedback_a.md')) {
+        await writeFile(
+          dst as string,
+          "---\ntitle: Recreated\ndescription: host\ntype: feedback\nupdatedAt: '2026-03-01T00:00:00.000Z'\n---\nTOCTOU SRC\n",
+          'utf8',
+        );
+        throw Object.assign(new Error('exists'), { code: 'EEXIST' });
+      }
+      return realLink(src as string, dst as string);
+    });
+    const copySpy = vi.spyOn(fs, 'copyFile').mockImplementation(async (src, dst, mode) => {
+      if (String(src).includes('cleanup-parked') && String(dst).endsWith('feedback_a.md')) {
+        throw Object.assign(new Error('exists'), { code: 'EEXIST' });
+      }
+      return realCopy(src as string, dst as string, mode as number);
+    });
+
+    try {
+      const result = await runMemoryCleanup(plan);
+      expect(failedOnce).toBe(true);
+      expect(result.archived.some((a) => a.filename === 'feedback_a.md')).toBe(false);
+      await expect(readFile(path.join(dir, 'feedback_a.md'), 'utf8')).resolves.toContain(
+        'TOCTOU SRC',
+      );
+      const names = await readdir(dir);
+      const parked = names.filter((n) => n.includes('cleanup-parked'));
+      expect(parked.length).toBeGreaterThan(0);
+      const parkedRaws = await Promise.all(
+        parked.map((n) => readFile(path.join(dir, n), 'utf8')),
+      );
+      expect(parkedRaws.some((raw) => raw.includes('same'))).toBe(true);
+    } finally {
+      lstatSpy.mockRestore();
+      renameSpy.mockRestore();
+      linkSpy.mockRestore();
+      copySpy.mockRestore();
+    }
+  });
+
   it('restores src when a write lands during the quiesce window', async () => {
     await shard('feedback_a.md', 'feedback', 'Same', 'hook', 'same', '2026-01-01T00:00:00.000Z');
     await shard('feedback_b.md', 'feedback', 'Same', 'hook', 'same', '2026-02-01T00:00:00.000Z');
