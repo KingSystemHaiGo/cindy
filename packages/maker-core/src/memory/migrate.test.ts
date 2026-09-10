@@ -216,6 +216,52 @@ describe('planLegacyShardMigration — 计划生成', () => {
     expect(await fs.readFile(path.join(outside, 'feedback_a.md'), 'utf8')).toContain('secret');
   });
 
+  it('分片文件是 symlink → skipped, 不跟随读入 canonical (Codex 3974674258)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const worktree = path.join(tmpRoot, 'repo-wt');
+    const wtDir = sanitizeWorkdir(worktree);
+    const dir = await makeShard(wtDir, { absPath: worktree });
+    const outside = path.join(tmpRoot, 'outside-secret.md');
+    await fs.writeFile(outside, 'secret-outside', 'utf8');
+    try {
+      await fs.symlink(outside, path.join(dir, 'project_secret.md'));
+    } catch {
+      return;
+    }
+    const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+    expect(plan.skipped.find((s) => s.dir === dir)?.skipReason).toBe('symlink-shard-file');
+    expect(plan.mergeCandidates).toHaveLength(0);
+    expect(plan.emptyToDelete).toHaveLength(0);
+    expect(plan.all).toHaveLength(0);
+    const result = await runLegacyShardMigration(plan);
+    expect(result.results).toHaveLength(0);
+    expect((await fs.lstat(path.join(dir, 'project_secret.md'))).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(outside, 'utf8')).toBe('secret-outside');
+  });
+
+  it('过期 plan 含 symlink 分片文件 → apply 拒绝 (Codex 3974674258)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const worktree = path.join(tmpRoot, 'repo-wt');
+    const wtDir = sanitizeWorkdir(worktree);
+    const dir = await makeShard(wtDir, { absPath: worktree, files: { 'feedback_a.md': 'keep' } });
+    const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+    expect(plan.mergeCandidates).toHaveLength(1);
+    const outside = path.join(tmpRoot, 'outside-stale-file.md');
+    await fs.writeFile(outside, 'secret-outside', 'utf8');
+    await fs.rm(path.join(dir, 'feedback_a.md'));
+    try {
+      await fs.symlink(outside, path.join(dir, 'feedback_a.md'));
+    } catch {
+      return;
+    }
+    const result = await runLegacyShardMigration(plan);
+    expect(result.results).toHaveLength(1);
+    expect(result.results[0].action).toBe('skipped');
+    expect(result.results[0].error).toBe('symlink-shard-file');
+    expect((await fs.lstat(path.join(dir, 'feedback_a.md'))).isSymbolicLink()).toBe(true);
+    expect(summarizeApplyMigration(plan, result).ok).toBe(false);
+  });
+
   it('过期 plan 把 symlink 当分片 → apply 仍拒绝 rename (Codex 3974113763)', async () => {
     const mainRepo = path.join(tmpRoot, 'repo');
     const worktree = path.join(tmpRoot, 'repo-wt');
@@ -946,6 +992,32 @@ describe('runLegacyShardMigration — 执行', () => {
     expect(plan.mergeCandidates).toHaveLength(1);
     expect(plan.mergeCandidates[0].dir.endsWith(wtDir)).toBe(true);
     expect(plan.failed).toHaveLength(0);
+  });
+
+  it('普通 linked worktree 文件形态 .git 解析回落 → failed (Codex 3974674280)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const liveWt = path.join(tmpRoot, 'plain-linked-wt');
+    await fs.mkdir(liveWt, { recursive: true });
+    await fs.writeFile(path.join(liveWt, '.git'), 'gitdir: ../repo/.git/worktrees/feat-x\n', 'utf8');
+    const liveDir = sanitizeWorkdir(liveWt);
+    await makeShard(liveDir, { absPath: liveWt, files: { 'feedback_a.md': 'X' } });
+    const otherWt = path.join(tmpRoot, 'other-wt');
+    const otherDir = sanitizeWorkdir(otherWt);
+    await makeShard(otherDir, { absPath: otherWt, files: { 'feedback_b.md': 'Y' } });
+
+    const plan = await planLegacyShardMigration(memoryRoot, {
+      resolveScopeKey: async (wd: string) => {
+        if (fwd(wd) === fwd(liveWt)) return wd;
+        if (fwd(wd) === fwd(otherWt)) return fwd(mainRepo);
+        return wd;
+      },
+    });
+    expect(plan.failed).toHaveLength(1);
+    expect(plan.failed[0].dir.endsWith(liveDir)).toBe(true);
+    expect(plan.failed[0].skipReason).toBe('worktree-resolve-failure');
+    expect(plan.mergeCandidates).toHaveLength(1);
+    expect(plan.mergeCandidates[0].dir.endsWith(otherDir)).toBe(true);
+    expect(plan.all.some((s) => s.dir.endsWith(liveDir))).toBe(false);
   });
 
   it('活托管 worktree 解析回落原路径 → failed, 计划不 abort (Codex 第十八轮)', async () => {

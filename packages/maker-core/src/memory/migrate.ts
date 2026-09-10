@@ -82,7 +82,7 @@ export interface LegacyShardMigrationPlan {
   emptyToDelete: LegacyShardInfo[];
   /** 有内容需合并的 legacy 分片。 */
   mergeCandidates: LegacyShardInfo[];
-  /** 无 meta.json / SSH / 相对 absPath / symlink 分片或 canonical 目标等不处理的分片。 */
+  /** 无 meta.json / SSH / 相对 absPath / symlink 分片、分片文件或 canonical 目标等不处理的分片。 */
   skipped: LegacyShardInfo[];
   /** 活 worktree 解析失败等需 surface 的分片 (不 abort 整份计划)。 */
   failed: LegacyShardInfo[];
@@ -135,13 +135,31 @@ export interface ApplyMigrationSummary {
   ok: boolean;
 }
 
-/** 规划/执行都不跟随 symlink 分片目录 (Codex #2519 3974113763)。 */
-async function isSymlinkShardDir(dir: string): Promise<boolean> {
+async function isSymlinkPath(p: string): Promise<boolean> {
   try {
-    return (await fs.lstat(dir)).isSymbolicLink();
+    return (await fs.lstat(p)).isSymbolicLink();
   } catch {
     return false;
   }
+}
+
+/** 规划/执行都不跟随 symlink 分片目录 (Codex #2519 3974113763)。 */
+async function isSymlinkShardDir(dir: string): Promise<boolean> {
+  return isSymlinkPath(dir);
+}
+
+/** 合法分片文件名是 symlink — 不跟随读/复制 (Codex #2519 3974674258)。 */
+async function shardHasSymlinkShardFile(dir: string): Promise<boolean> {
+  try {
+    const files = await fs.readdir(dir);
+    for (const f of files) {
+      if (!parseFilename(f)) continue;
+      if (await isSymlinkPath(path.join(dir, f))) return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
 }
 
 function isExecutionFailure(r: ShardMigrationResult): boolean {
@@ -309,7 +327,12 @@ export async function planLegacyShardMigration(
       // 活 Cindy worktree 仍有 `.git/worktrees/<name>` 登记, 但 resolver 回落
       // 原路径 (超时/git 失败) → 不能当 non-legacy 静默吞掉。碰巧同名的
       // 独立仓库没有登记, 回落原路径是正确结果, 不进 failed。
-      if (live && (await hasGitWorktreeRegistration(rawAbs))) {
+      if (
+        live &&
+        ((await hasGitWorktreeRegistration(rawAbs)) || (await hasFileFormGitdir(rawAbs)))
+      ) {
+        // 托管登记 或 祖先文件形态 `.git` (普通 linked worktree / submodule):
+        // resolver 回落原路径不得当 non-legacy 静默吞掉 (Codex 3974674280)。
         plan.failed.push(
           await buildSkippedInfo(dir, entry, 'worktree-resolve-failure', rawAbs),
         );
@@ -375,12 +398,23 @@ export async function planLegacyShardMigration(
       files = [];
     }
     let hasUnrecognizedContent = false;
+    let hasSymlinkShardFile = false;
     for (const f of files) {
       if (parseFilename(f)) {
+        if (await isSymlinkPath(path.join(dir, f))) {
+          hasSymlinkShardFile = true;
+          continue;
+        }
         info.recordCount += 1;
       } else if (f !== 'MEMORY.md' && f !== 'meta.json' && f !== 'fts.db') {
         hasUnrecognizedContent = true;
       }
+    }
+    if (hasSymlinkShardFile) {
+      // 合法分片文件名若是 symlink, readFile/copyFile/rebuildIndex 会跟随到根外
+      // (Codex #2519 3974674258)。与 copyLegacyMemoryShardsSync 的 lstatSync 同款。
+      plan.skipped.push(await buildSkippedInfo(dir, entry, 'symlink-shard-file', canonicalScopeKey));
+      continue;
     }
 
     plan.all.push(info);
@@ -580,6 +614,12 @@ export async function runLegacyShardMigration(
         result.results.push(r);
         continue;
       }
+      if (await shardHasSymlinkShardFile(shard.dir)) {
+        r.action = 'skipped';
+        r.error = 'symlink-shard-file';
+        result.results.push(r);
+        continue;
+      }
       if (
         sameMigrationDirName(
           path.basename(shard.dir),
@@ -640,6 +680,12 @@ export async function runLegacyShardMigration(
       if (await isSymlinkShardDir(shard.dir)) {
         r.action = 'skipped';
         r.error = 'symlink-shard';
+        result.results.push(r);
+        continue;
+      }
+      if (await shardHasSymlinkShardFile(shard.dir)) {
+        r.action = 'skipped';
+        r.error = 'symlink-shard-file';
         result.results.push(r);
         continue;
       }
@@ -795,6 +841,7 @@ async function mergeFilesInto(
   for (const filename of files) {
     const src = path.join(shard.dir, filename);
     const dst = path.join(targetDir, filename);
+    if (await isSymlinkPath(src)) continue;
     const srcBuf = await fs.readFile(src);
     const dstExists = await pathExists(dst);
 
@@ -976,6 +1023,23 @@ async function hasManagedWorktreeEvidence(absPath: string): Promise<boolean> {
     // 归档 worktree 通常已无 .git, 继续看主仓登记
   }
   return hasGitWorktreeRegistration(absPath);
+}
+
+/** 祖先是否有文件形态 `.git` (普通 linked worktree / submodule gitdir 指针)。 */
+async function hasFileFormGitdir(absPath: string): Promise<boolean> {
+  let cur = absPath;
+  for (;;) {
+    try {
+      const s = await fs.lstat(path.join(cur, '.git'));
+      if (s.isFile()) return true;
+      if (s.isDirectory()) return false;
+    } catch {
+      // 继续向上
+    }
+    const parent = path.dirname(cur);
+    if (parent === cur) return false;
+    cur = parent;
+  }
 }
 
 /** 主仓是否仍登记该托管 worktree (`.git/worktrees/<name>`)。 */
