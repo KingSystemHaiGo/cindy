@@ -6886,6 +6886,86 @@ describe('GoalController committed-write closeouts', () => {
     });
   });
 
+  it('settles a committed replacement when the marker fails after a later pause supersedes the edit owner', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    let releaseMarker!: (error: Error) => void;
+    const blockedMarker = new Promise<void>((_, reject) => {
+      releaseMarker = reject;
+    });
+    let markerStarted = false;
+    const local = makeController({
+      recordRunEvent: (e) => void events.push(e),
+      persistUserMessage: async (_sessionId, content, opts) => {
+        if (opts?.goalObjective?.updated && content === 'replacement objective') {
+          markerStarted = true;
+          await blockedMarker;
+        }
+      },
+    });
+    let markDispatchStarted!: () => void;
+    let releaseDispatch!: (result: SessionSendResult) => void;
+    const dispatchStarted = new Promise<void>((resolve) => {
+      markDispatchStarted = resolve;
+    });
+    const pendingDispatch = new Promise<SessionSendResult>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    let sendCount = 0;
+    vi.spyOn(local.session, 'send').mockImplementation(async (
+      message: Parameters<FakeSession['send']>[0],
+      opts: Parameters<FakeSession['send']>[1],
+    ): Promise<SessionSendResult> => {
+      sendCount += 1;
+      const content = typeof message === 'string' ? message : message.content;
+      local.session.sends.push({ content, originKind: opts?.origin?.kind });
+      opts?.onDispatching?.();
+      if (sendCount === 1) {
+        markDispatchStarted();
+        return pendingDispatch;
+      }
+      return { accepted: true };
+    });
+
+    const first = local.controller.setGoal({ sessionId: 's1', objective: 'first objective' });
+    await dispatchStarted;
+
+    const replacement = local.controller.setGoal({
+      sessionId: 's1',
+      objective: 'replacement objective',
+    });
+    await vi.waitFor(() => expect(markerStarted).toBe(true));
+    const pausePromise = local.controller.pauseGoal('s1');
+    releaseMarker(new Error('marker unavailable'));
+    await expect(replacement).rejects.toThrow('marker unavailable');
+    await pausePromise;
+    await tick();
+    expect(events.some((e) => e.type === 'turn-dispatched')).toBe(false);
+    expect(events.some((e) => e.type === 'cleared')).toBe(false);
+
+    releaseDispatch({ accepted: true });
+    await first.catch(() => undefined);
+    await tick();
+
+    const dispatched = events.filter((e) => e.type === 'turn-dispatched');
+    expect(dispatched).toHaveLength(1);
+    const owner = {
+      lifecycleId: dispatched[0]?.lifecycleId,
+      generation: dispatched[0]?.generation,
+      turnIndex: dispatched[0]?.turnIndex,
+    };
+    const replaced = events.filter((e) => e.type === 'cleared' && e.reason === 'replaced by new goal');
+    expect(replaced).toHaveLength(1);
+    expect(replaced[0]).toMatchObject(owner);
+    expect(events.find((e) => e.type === 'state-transition' && e.to === 'paused')).toMatchObject({
+      ...owner,
+      from: 'active',
+    });
+    expect(await local.storage.get('s1')).toMatchObject({
+      status: 'paused',
+      objective: 'replacement objective',
+    });
+  });
+
   it('settles a committed budget closeout when the objective marker fails', async () => {
     const events: Array<import('../runEvents').GoalRunEvent> = [];
     const local = makeController({

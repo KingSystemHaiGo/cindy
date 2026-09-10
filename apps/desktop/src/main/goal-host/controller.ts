@@ -1127,6 +1127,7 @@ export class GoalController {
       this.inheritTakeoverOwner(sessionId, editBoundary, previousBoundary);
       this.turns.set(sessionId, editBoundary);
       let editObjectivePersisted = false;
+      let replacementCloseoutSettled = false;
       let updatedState: GoalState | null = null;
       try {
         if (sessionWasBusy) {
@@ -1167,6 +1168,7 @@ export class GoalController {
             editBoundary,
             existing,
           );
+          replacementCloseoutSettled = true;
         }
         // 审计已入队;入口仍对覆盖方返回 null(dispose/pause/clear 的调用契约)。
         if (this.turns.get(sessionId) !== editBoundary) return null;
@@ -1193,17 +1195,19 @@ export class GoalController {
           await this.fireTurn(sessionId, { throwOnRestoreFailure: true });
         }
       } catch (error) {
+        // marker 失败时 editBoundary 可能已被 pause/clear 换走;只要 objective
+        // 已提交,仍要补 replaced-by-new-goal (Codex #2107 P1: settle committed
+        // replacements after supersession)。成功路径已 settle 的不重复入队。
+        if (editObjectivePersisted && !replacementCloseoutSettled) {
+          this.settleCommittedReplacementCloseout(
+            sessionId,
+            previousBoundary,
+            editBoundary,
+            existing,
+          );
+        }
         if (this.turns.get(sessionId) === editBoundary) {
-          if (editObjectivePersisted) {
-            // 目标已提交,标记写入失败仍要给旧派发补 replacement closeout
-            // (Codex #2107 P1)。
-            this.settleCommittedReplacementCloseout(
-              sessionId,
-              previousBoundary,
-              editBoundary,
-              existing,
-            );
-          } else {
+          if (!editObjectivePersisted) {
             const abandoned = this.takeoverDispatchTarget(previousBoundary);
             if (abandoned) {
               abandoned.takeoverAbandoned = true;
