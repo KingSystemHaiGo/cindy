@@ -350,6 +350,14 @@ export function decideNextGoalState(prev: GoalCounters, outcome: TurnOutcome): G
 
 // ── 每轮事件累计状态 ─────────────────────────────────────────────────────────
 
+interface PendingTakeoverCloseout {
+  type: 'cleared' | 'state-transition' | 'budget-limited';
+  reason: string;
+  from?: GoalStatus;
+  to?: GoalStatus;
+  state: GoalRunEventStateSnapshot | GoalState | null;
+}
+
 interface TurnAccumulator {
   text: string;
   sawToolUse: boolean;
@@ -380,14 +388,10 @@ interface TurnAccumulator {
    * markers (Codex #2107 P1 / P2)。
    */
   dispatchAcceptance?: 'pending' | 'accepted' | 'rejected';
-  /** 接管 persist 成功但 send 仍 tentative 时,挂起 closeout 等 acceptance。 */
-  pendingTakeoverCloseout?: {
-    type: 'cleared' | 'state-transition' | 'budget-limited';
-    reason: string;
-    from?: GoalStatus;
-    to?: GoalStatus;
-    state: GoalRunEventStateSnapshot | GoalState | null;
-  };
+  /** 接管 persist 成功但 send 仍 tentative 时,按提交顺序挂起 closeout 等 acceptance。
+   * 多个已落盘接管不得共用一个槽,否则后写会丢掉先提交的 pause/预算终态
+   * (Codex #2107 P2)。 */
+  pendingTakeoverCloseouts?: PendingTakeoverCloseout[];
   /** 替换 persist 失败:迟到 accepted 必须显式 close,避免孤儿 turn-dispatched。 */
   takeoverAbandoned?: boolean;
   /** 被中断派发的 owner。cancelled 边界继承它,重叠 Stop 仍能 closeout
@@ -704,13 +708,51 @@ export class GoalController {
     return previous;
   }
 
+  private parkedTakeoverCloseouts(boundary: TurnAccumulator | undefined): PendingTakeoverCloseout[] {
+    return boundary?.pendingTakeoverCloseouts ?? [];
+  }
+
+  private enqueueTakeoverCloseout(
+    boundary: TurnAccumulator | undefined,
+    closeout: PendingTakeoverCloseout,
+  ): void {
+    if (!boundary) return;
+    const queued = boundary.pendingTakeoverCloseouts ?? [];
+    queued.push(closeout);
+    boundary.pendingTakeoverCloseouts = queued;
+  }
+
+  private takeParkedTakeoverCloseouts(boundary: TurnAccumulator | undefined): PendingTakeoverCloseout[] {
+    const queued = this.parkedTakeoverCloseouts(boundary);
+    if (boundary) boundary.pendingTakeoverCloseouts = undefined;
+    return queued;
+  }
+
+  private emitParkedTakeoverCloseouts(
+    sessionId: string,
+    closeouts: readonly PendingTakeoverCloseout[],
+    owner: { lifecycleId: string; generation: number; turnIndex: number },
+  ): void {
+    for (const closeout of closeouts) this.emitTakeoverCloseout(sessionId, closeout, owner);
+  }
+
+  private emitUnboundParkedTakeoverCloseouts(
+    sessionId: string,
+    closeouts: readonly PendingTakeoverCloseout[],
+    identity?: { lifecycleId: string; generation: number },
+  ): void {
+    for (const closeout of closeouts) {
+      this.emitUnboundTakeoverCloseout(sessionId, closeout, identity);
+    }
+  }
+
   private clearTentativeDispatchMarkers(boundary: TurnAccumulator | undefined): void {
     if (!boundary) return;
     boundary.dispatchAcceptance = 'rejected';
     boundary.auditFinalized = undefined;
     boundary.dispatchTurnIndex = undefined;
     boundary.pendingDispatch = undefined;
-    boundary.pendingTakeoverCloseout = undefined;
+    boundary.pendingTakeoverCloseouts = undefined;
     boundary.takeoverAbandoned = false;
   }
 
@@ -722,20 +764,18 @@ export class GoalController {
     dispatchBoundary: TurnAccumulator | undefined,
   ): void {
     if (!dispatchBoundary) return;
-    const parkedCloseout = dispatchBoundary.pendingTakeoverCloseout;
+    const parkedCloseouts = this.parkedTakeoverCloseouts(dispatchBoundary);
     const retiredLifecycle = {
       lifecycleId: dispatchBoundary.lifecycleId,
       generation: dispatchBoundary.generation,
     };
     this.clearTentativeDispatchMarkers(dispatchBoundary);
-    if (parkedCloseout) {
-      this.emitUnboundTakeoverCloseout(sessionId, parkedCloseout, retiredLifecycle);
-    }
+    this.emitUnboundParkedTakeoverCloseouts(sessionId, parkedCloseouts, retiredLifecycle);
   }
 
   private emitTakeoverCloseout(
     sessionId: string,
-    closeout: NonNullable<TurnAccumulator['pendingTakeoverCloseout']>,
+    closeout: PendingTakeoverCloseout,
     owner: { lifecycleId: string; generation: number; turnIndex: number },
   ): void {
     if (closeout.type === 'cleared') {
@@ -766,7 +806,7 @@ export class GoalController {
    * budget-consumed/terminal 掉到新 lifecycle (Codex #2107 P2)。 */
   private emitBudgetLimitCloseout(
     sessionId: string,
-    closeout: NonNullable<TurnAccumulator['pendingTakeoverCloseout']>,
+    closeout: PendingTakeoverCloseout,
     identity?: { lifecycleId: string; generation: number; turnIndex?: number },
   ): void {
     this.recordRunEvent('state-transition', sessionId, closeout.state, {
@@ -792,22 +832,28 @@ export class GoalController {
   private settleTakeoverCloseout(
     sessionId: string,
     previous: TurnAccumulator | undefined,
-    closeout: NonNullable<TurnAccumulator['pendingTakeoverCloseout']>,
+    closeout: PendingTakeoverCloseout,
   ): void {
     const target = this.takeoverDispatchTarget(previous);
     this.flushRetiredPendingDispatch(sessionId, target);
     const owner = this.unfinishedDispatch(sessionId, target);
     if (owner) {
-      this.emitTakeoverCloseout(sessionId, closeout, owner);
-      if (target) target.pendingTakeoverCloseout = undefined;
+      this.emitParkedTakeoverCloseouts(
+        sessionId,
+        [...this.takeParkedTakeoverCloseouts(target), closeout],
+        owner,
+      );
       return;
     }
     if (target?.dispatchAcceptance === 'rejected') {
-      this.emitUnboundTakeoverCloseout(sessionId, closeout);
+      this.emitUnboundParkedTakeoverCloseouts(
+        sessionId,
+        [...this.takeParkedTakeoverCloseouts(target), closeout],
+      );
       return;
     }
     if (target?.auditFinalized === false) {
-      target.pendingTakeoverCloseout = closeout;
+      this.enqueueTakeoverCloseout(target, closeout);
       return;
     }
     this.emitUnboundTakeoverCloseout(sessionId, closeout);
@@ -815,7 +861,7 @@ export class GoalController {
 
   private emitUnboundTakeoverCloseout(
     sessionId: string,
-    closeout: NonNullable<TurnAccumulator['pendingTakeoverCloseout']>,
+    closeout: PendingTakeoverCloseout,
     identity?: { lifecycleId: string; generation: number },
   ): void {
     if (closeout.type === 'cleared') {
@@ -860,7 +906,11 @@ export class GoalController {
     state: GoalRunEventStateSnapshot | GoalState | null,
   ): void {
     if (!previous || previous.dispatchAcceptance !== 'accepted') return;
-    if (previous.pendingTakeoverCloseout === undefined && !previous.pendingDispatch && previous.auditFinalized === true) {
+    if (
+      this.parkedTakeoverCloseouts(previous).length === 0
+      && !previous.pendingDispatch
+      && previous.auditFinalized === true
+    ) {
       return;
     }
     this.flushPendingDispatch(sessionId, previous);
@@ -871,7 +921,7 @@ export class GoalController {
       generation: previous.generation,
       turnIndex: previous.dispatchTurnIndex ?? 1,
     });
-    previous.pendingTakeoverCloseout = undefined;
+    previous.pendingTakeoverCloseouts = undefined;
     previous.auditFinalized = true;
   }
 
@@ -3242,16 +3292,15 @@ export class GoalController {
             this.closeAbandonedReplacement(sessionId, dispatchBoundary, state);
             return true;
           }
-          const parkedCloseout = dispatchBoundary.pendingTakeoverCloseout;
-          if (!parkedCloseout) return false;
+          const parkedCloseouts = this.takeParkedTakeoverCloseouts(dispatchBoundary);
+          if (parkedCloseouts.length === 0) return false;
           parkOrEmitAccepted();
           this.flushRetiredPendingDispatch(sessionId, dispatchBoundary);
-          this.emitTakeoverCloseout(sessionId, parkedCloseout, {
+          this.emitParkedTakeoverCloseouts(sessionId, parkedCloseouts, {
             lifecycleId: dispatchBoundary.lifecycleId,
             generation: dispatchBoundary.generation,
             turnIndex: dispatchBoundary.dispatchTurnIndex ?? 1,
           });
-          dispatchBoundary.pendingTakeoverCloseout = undefined;
           return true;
         };
         if (flushAcceptedTakeover()) return;

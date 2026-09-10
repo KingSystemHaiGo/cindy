@@ -213,4 +213,35 @@ describe('createRunEventRecorder', () => {
       'b:turn-dispatched',
     ]);
   });
+
+  it('keeps same-lifecycle dispatch before closeout after a cross-lifecycle key move', () => {
+    const rec = createRunEventRecorder();
+    rec.record(evt({
+      type: 'turn-dispatched',
+      goalSessionId: 's1',
+      lifecycleId: 'g2',
+      turnIndex: 1,
+      at: 1000,
+    }));
+    rec.record(evt({
+      type: 'turn-dispatched',
+      goalSessionId: 's1',
+      lifecycleId: 'g1',
+      turnIndex: 1,
+      at: 1000,
+    }));
+    rec.record(evt({
+      type: 'terminal',
+      goalSessionId: 's1',
+      lifecycleId: 'g1',
+      turnIndex: 1,
+      to: 'complete',
+      at: 1000,
+    }));
+    expect(rec.snapshot().map((e) => `${e.lifecycleId}:${e.type}`)).toEqual([
+      'g1:turn-dispatched',
+      'g1:terminal',
+      'g2:turn-dispatched',
+    ]);
+  });
 });

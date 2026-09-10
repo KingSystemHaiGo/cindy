@@ -5489,6 +5489,66 @@ describe('GoalController', () => {
     expect(await local.storage.get('s1')).toMatchObject({ status: 'paused' });
   });
 
+  it('emits committed pause and clear closeouts in order after send is accepted', async () => {
+    const events: Array<import('../runEvents').GoalRunEvent> = [];
+    const local = makeController({ recordRunEvent: (e) => void events.push(e) });
+    let markDispatchStarted!: () => void;
+    let releaseDispatch!: (result: SessionSendResult) => void;
+    const dispatchStarted = new Promise<void>((resolve) => {
+      markDispatchStarted = resolve;
+    });
+    const pendingDispatch = new Promise<SessionSendResult>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    vi.spyOn(local.session, 'send').mockImplementation(async (
+      message: Parameters<FakeSession['send']>[0],
+      opts: Parameters<FakeSession['send']>[1],
+    ): Promise<SessionSendResult> => {
+      const content = typeof message === 'string' ? message : message.content;
+      local.session.sends.push({ content, originKind: opts?.origin?.kind });
+      opts?.onDispatching?.();
+      markDispatchStarted();
+      return pendingDispatch;
+    });
+
+    const started = local.controller.setGoal({ sessionId: 's1', objective: 'ship it' });
+    await dispatchStarted;
+    await local.controller.pauseGoal('s1');
+    await tick();
+    expect(await local.storage.get('s1')).toMatchObject({ status: 'paused' });
+    expect(events.some((e) => e.type === 'turn-dispatched')).toBe(false);
+    expect(events.some((e) => e.type === 'state-transition' && e.to === 'paused')).toBe(false);
+
+    await local.controller.clearGoal('s1');
+    await tick();
+    expect(await local.storage.get('s1')).toBeNull();
+    expect(events.some((e) => e.type === 'cleared')).toBe(false);
+
+    releaseDispatch({ accepted: true });
+    await started.catch(() => undefined);
+    await tick();
+
+    const dispatched = events.filter((e) => e.type === 'turn-dispatched');
+    expect(dispatched).toHaveLength(1);
+    const owner = {
+      lifecycleId: dispatched[0]?.lifecycleId,
+      generation: dispatched[0]?.generation,
+      turnIndex: dispatched[0]?.turnIndex,
+    };
+    const paused = events.filter((e) => e.type === 'state-transition' && e.to === 'paused');
+    const cleared = events.filter((e) => e.type === 'cleared');
+    expect(paused).toHaveLength(1);
+    expect(cleared).toHaveLength(1);
+    expect(paused[0]).toMatchObject(owner);
+    expect(cleared[0]).toMatchObject({ ...owner, reason: 'cleared by user' });
+    const pausedAt = events.findIndex((e) => e.type === 'state-transition' && e.to === 'paused');
+    const clearedAt = events.findIndex((e) => e.type === 'cleared');
+    const dispatchedAt = events.findIndex((e) => e.type === 'turn-dispatched');
+    expect(dispatchedAt).toBeGreaterThanOrEqual(0);
+    expect(pausedAt).toBeGreaterThan(dispatchedAt);
+    expect(clearedAt).toBeGreaterThan(pausedAt);
+  });
+
   it('records stall-detected when noProgressLimit is hit (no tool use)', async () => {
     const events: Array<import('../runEvents').GoalRunEvent> = [];
     const local = makeController({ recordRunEvent: (e) => void events.push(e) });

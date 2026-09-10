@@ -159,9 +159,10 @@ export function createRunEventRecorder(limit = 200, sink?: RunEventSink): GoalRu
           }
         }
       }
-      // 同 lifecycle 的派发/收口约束写进 _key:迟到 dispatch 提到已落环 closeout 前。
-      // 比较器若 pairwise 绕过 _key,A finalized < B < A dispatched 会与
-      // A dispatched < A finalized 成环 (Codex #2107 P1)。
+      // 同 lifecycle 的派发/收口约束写进 _key:派发必须排在同生命周期收口前。
+      // 用调整后的 _key,不能看原始 _seq——跨 lifecycle 移动可能把 closeout
+      // 提到更早的 dispatch 前,此时旧 dispatch 虽先插入,排序位已落后
+      // (Codex #2107 P2)。比较器若 pairwise 绕过 _key 会成环。
       const byLifecycle = new Map<string, typeof indexed>();
       for (const evt of indexed) {
         const key = `${evt.at ?? 0}\0${evt.lifecycleId}`;
@@ -174,7 +175,7 @@ export function createRunEventRecorder(limit = 200, sink?: RunEventSink): GoalRu
         const closeouts = group.filter((e) => isCloseout(e));
         for (const dispatch of dispatches) {
           for (const closeout of closeouts) {
-            if (dispatch._seq <= closeout._seq) continue;
+            if (dispatch._key < closeout._key) continue;
             dispatch._key = Math.min(dispatch._key, closeout._key - 0.5);
           }
         }
