@@ -680,15 +680,19 @@ export class GoalController {
     };
   }
 
-  /** cancelled 边界上的 tentative send owner(重叠 Stop 穿透)。 */
+  /** tentative send owner：cancelled 与 live replacement 都要穿透到真正 pending 派发。 */
   private tentativeDispatchOwner(boundary: TurnAccumulator | undefined): TurnAccumulator | undefined {
     if (!boundary) return undefined;
-    if (boundary.cancelled) return boundary.tentativeDispatch;
     if (boundary.dispatchAcceptance === 'pending') return boundary;
-    return undefined;
+    const inherited = boundary.tentativeDispatch;
+    if (!inherited || inherited === boundary) return undefined;
+    // live setGoal 替换边界不是 cancelled、也没有 own-pending,
+    // 仍要跟着继承来的 owner, 否则 pause/clear 再接管会把
+    // late accepted 钉在不可达的旧边界 (Codex #2107 P1)。
+    return this.tentativeDispatchOwner(inherited) ?? inherited;
   }
 
-  /** 重叠 pause/clear 换 cancelled owner 时带走 interrupted + tentative 前任。 */
+  /** 重叠 pause/clear/live replacement 换 owner 时带走 interrupted + tentative 前任。 */
   private inheritTakeoverOwner(
     sessionId: string,
     next: TurnAccumulator,
@@ -701,11 +705,10 @@ export class GoalController {
     if (tentative) next.tentativeDispatch = tentative;
   }
 
-  /** persist closeout 要钉回真实派发 owner,不能钉在中间 cancelled 边界上。 */
+  /** persist closeout 要钉回真实派发 owner,不能钉在中间 cancelled / live replacement 边界上。 */
   private takeoverDispatchTarget(previous: TurnAccumulator | undefined): TurnAccumulator | undefined {
     if (!previous) return undefined;
-    if (previous.cancelled) return previous.tentativeDispatch ?? previous;
-    return previous;
+    return this.tentativeDispatchOwner(previous) ?? previous;
   }
 
   private parkedTakeoverCloseouts(boundary: TurnAccumulator | undefined): PendingTakeoverCloseout[] {

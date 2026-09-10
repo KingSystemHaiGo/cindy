@@ -166,7 +166,12 @@ export function createRunEventRecorder(limit = 200, sink?: RunEventSink): GoalRu
             const closeLife = lifecycleSeqOf(closeout.lifecycleId);
             for (const dispatch of dispatches) {
               if (lifecycleSeqOf(dispatch.lifecycleId) <= closeLife) continue;
-              if (dispatch._key >= closeout._key) continue;
+              // equal _key 不能当已有序:sort 会回落到 _seq,
+              // 把后插入的新 dispatch 排到旧 closeout 前 (Codex #2107 P1)。
+              const alreadyBefore =
+                closeout._key < dispatch._key ||
+                (closeout._key === dispatch._key && closeout._seq < dispatch._seq);
+              if (alreadyBefore) continue;
               const next = dispatch._key - 0.5;
               if (next < closeout._key) {
                 closeout._key = next;

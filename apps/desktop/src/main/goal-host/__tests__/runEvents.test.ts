@@ -283,4 +283,52 @@ describe('createRunEventRecorder', () => {
       'g2:turn-finalized',
     ]);
   });
+
+  it('moves an old closeout before a newer dispatch when keys are equal', () => {
+    const rec = createRunEventRecorder();
+    rec.record(evt({
+      type: 'turn-dispatched',
+      lifecycleId: 'g1',
+      turnIndex: 1,
+      at: 1000,
+    }));
+    rec.record(evt({
+      type: 'turn-dispatched',
+      lifecycleId: 'g2',
+      turnIndex: 1,
+      at: 1000,
+    }));
+    rec.record(evt({
+      type: 'turn-finalized',
+      lifecycleId: 'g3',
+      turnIndex: 1,
+      at: 1000,
+    }));
+    rec.record(evt({
+      type: 'turn-finalized',
+      lifecycleId: 'g1',
+      turnIndex: 1,
+      at: 1000,
+    }));
+    rec.record(evt({
+      type: 'turn-finalized',
+      lifecycleId: 'g2',
+      turnIndex: 1,
+      at: 1000,
+    }));
+    rec.record(evt({
+      type: 'turn-dispatched',
+      lifecycleId: 'g3',
+      turnIndex: 1,
+      at: 1000,
+    }));
+    expect(rec.snapshot().map((e) => `${e.lifecycleId}:${e.type}`)).toEqual([
+      'g1:turn-dispatched',
+      'g1:turn-finalized',
+      'g2:turn-dispatched',
+      'g2:turn-finalized',
+      'g3:turn-dispatched',
+      'g3:turn-finalized',
+    ]);
+  });
 });
