@@ -792,6 +792,112 @@ describe('runLegacyShardMigration — 执行', () => {
     expect(summarizeApplyMigration(plan, result).ok).toBe(false);
   });
 
+  it('Windows 仅大小写不同的 shard 名视为同一 scope (Codex 3974544919)', async () => {
+    const stored = 'C:/Repo';
+    const resolved = 'C:/repo';
+    const storedDir = sanitizeWorkdir(stored);
+    const resolvedDir = sanitizeWorkdir(resolved);
+    expect(storedDir).toBe('C--Repo');
+    expect(resolvedDir).toBe('C--repo');
+    expect(storedDir.toLowerCase()).toBe(resolvedDir.toLowerCase());
+    await makeShard(storedDir, { absPath: stored, files: { 'feedback_a.md': 'keep' } });
+    const plan = await planLegacyShardMigration(memoryRoot, {
+      resolveScopeKey: async (wd) => (fwd(wd) === fwd(stored) ? resolved : wd),
+    });
+    expect(plan.mergeCandidates).toHaveLength(0);
+    expect(plan.emptyToDelete).toHaveLength(0);
+    expect(plan.skipped).toHaveLength(0);
+    expect(plan.all).toHaveLength(1);
+    expect(plan.all[0].isLegacy).toBe(false);
+    expect(plan.all[0].canonicalDirName).toBe(resolvedDir);
+    expect(plan.all[0].canonicalScopeKey).toBe(resolved);
+    const result = await runLegacyShardMigration(plan);
+    expect(result.results).toHaveLength(0);
+    expect(await fs.readFile(path.join(memoryRoot, storedDir, 'feedback_a.md'), 'utf8')).toContain(
+      'keep',
+    );
+  });
+
+  it('过期 plan 仅大小写不同 → apply 拒绝 rename (Codex 3974544919)', async () => {
+    const stored = 'C:/Repo';
+    const dir = await makeShard(sanitizeWorkdir(stored), {
+      absPath: stored,
+      files: { 'feedback_a.md': 'keep' },
+    });
+    const plan = await planLegacyShardMigration(memoryRoot, {
+      resolveScopeKey: async (wd) => wd,
+    });
+    expect(plan.mergeCandidates).toHaveLength(0);
+    expect(plan.all[0].isLegacy).toBe(false);
+    plan.all[0].isLegacy = true;
+    plan.all[0].canonicalScopeKey = 'C:/repo';
+    plan.all[0].canonicalDirName = sanitizeWorkdir('C:/repo');
+    plan.mergeCandidates.push(plan.all[0]);
+    const result = await runLegacyShardMigration(plan);
+    expect(result.results).toHaveLength(1);
+    expect(result.results[0].action).toBe('skipped');
+    expect(result.results[0].error).toBe('case-only-alias');
+    expect(await fs.readFile(path.join(dir, 'feedback_a.md'), 'utf8')).toContain('keep');
+    expect(summarizeApplyMigration(plan, result).ok).toBe(false);
+  });
+
+  it('canonical 目标是 symlink → skipped, 不跟随写入 (Codex 3974544925)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const worktree = path.join(tmpRoot, 'repo-wt');
+    const wtDir = sanitizeWorkdir(worktree);
+    const mainDir = sanitizeWorkdir(mainRepo);
+    await makeShard(wtDir, { absPath: worktree, files: { 'feedback_a.md': 'legacy' } });
+    const outside = path.join(tmpRoot, 'outside-canonical');
+    await fs.mkdir(outside, { recursive: true });
+    await fs.writeFile(path.join(outside, 'secret.txt'), 'secret', 'utf8');
+    const linkDir = path.join(memoryRoot, mainDir);
+    try {
+      await fs.symlink(outside, linkDir, 'dir');
+    } catch {
+      return;
+    }
+    const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+    expect(plan.skipped.find((s) => s.dir.endsWith(wtDir))?.skipReason).toBe('symlink-canonical');
+    expect(plan.mergeCandidates).toHaveLength(0);
+    expect(plan.emptyToDelete).toHaveLength(0);
+    const result = await runLegacyShardMigration(plan);
+    expect(result.results).toHaveLength(0);
+    expect((await fs.lstat(linkDir)).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(path.join(outside, 'secret.txt'), 'utf8')).toBe('secret');
+    expect(await fs.readFile(path.join(memoryRoot, wtDir, 'feedback_a.md'), 'utf8')).toContain(
+      'legacy',
+    );
+  });
+
+  it('过期 plan 的 canonical 目标 symlink → apply 拒绝 (Codex 3974544925)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const worktree = path.join(tmpRoot, 'repo-wt');
+    const wtDir = sanitizeWorkdir(worktree);
+    const mainDir = sanitizeWorkdir(mainRepo);
+    await makeShard(wtDir, { absPath: worktree, files: { 'feedback_a.md': 'legacy' } });
+    const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+    expect(plan.mergeCandidates).toHaveLength(1);
+    const outside = path.join(tmpRoot, 'outside-stale-canonical');
+    await fs.mkdir(outside, { recursive: true });
+    await fs.writeFile(path.join(outside, 'secret.txt'), 'secret', 'utf8');
+    const linkDir = path.join(memoryRoot, mainDir);
+    try {
+      await fs.symlink(outside, linkDir, 'dir');
+    } catch {
+      return;
+    }
+    const result = await runLegacyShardMigration(plan);
+    expect(result.results).toHaveLength(1);
+    expect(result.results[0].action).toBe('skipped');
+    expect(result.results[0].error).toBe('symlink-canonical');
+    expect((await fs.lstat(linkDir)).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(path.join(outside, 'secret.txt'), 'utf8')).toBe('secret');
+    expect(await fs.readFile(path.join(memoryRoot, wtDir, 'feedback_a.md'), 'utf8')).toContain(
+      'legacy',
+    );
+    expect(summarizeApplyMigration(plan, result).ok).toBe(false);
+  });
+
   it('相对盘符 C:foo / 裸 C: 规划阶段 skipped (Codex 第十九轮 / 3972854297)', async () => {
     const mainRepo = path.join(tmpRoot, 'repo');
     const worktree = path.join(tmpRoot, 'repo-wt');

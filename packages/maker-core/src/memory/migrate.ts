@@ -82,7 +82,7 @@ export interface LegacyShardMigrationPlan {
   emptyToDelete: LegacyShardInfo[];
   /** 有内容需合并的 legacy 分片。 */
   mergeCandidates: LegacyShardInfo[];
-  /** 无 meta.json / SSH / 相对 absPath / symlink 分片目录等不处理的分片。 */
+  /** 无 meta.json / SSH / 相对 absPath / symlink 分片或 canonical 目标等不处理的分片。 */
   skipped: LegacyShardInfo[];
   /** 活 worktree 解析失败等需 surface 的分片 (不 abort 整份计划)。 */
   failed: LegacyShardInfo[];
@@ -340,7 +340,20 @@ export async function planLegacyShardMigration(
       );
       continue;
     }
-    const isLegacy = canonicalDirName !== entry;
+    // Windows 文件系统大小写不敏感: Desktop `C:/Repo` 与 git `C:/repo`
+    // sanitize 后仅大小写不同, 仍是同一分片。大小写比较不改存储形态
+    // (Codex #2519 3974544919)。
+    const windowsFs =
+      windowsFsIdentity(rawAbs) || windowsFsIdentity(canonicalScopeKey);
+    const isLegacy = !sameMigrationDirName(canonicalDirName, entry, windowsFs);
+    if (isLegacy && (await isSymlinkShardDir(path.join(memoryRoot, canonicalDirName)))) {
+      // 规划已把同名 symlink 条目跳过, 但 canonical 目标仍可能是链接;
+      // 跟随写入会打到 memoryRoot 外 (Codex #2519 3974544925)。
+      plan.skipped.push(
+        await buildSkippedInfo(dir, entry, 'symlink-canonical', canonicalScopeKey),
+      );
+      continue;
+    }
 
     const info: LegacyShardInfo = {
       dir,
@@ -432,6 +445,16 @@ function isUnsafeMigrationTargetDirName(name: string): boolean {
   if (!name || name === '.' || name === '..') return true;
   if (name.includes('/') || name.includes('\\')) return true;
   return pathHasParentDirSegment(name);
+}
+
+function windowsFsIdentity(p: string): boolean {
+  return process.platform === 'win32' || looksLikeWindowsLocalPath(p);
+}
+
+/** Windows 分片目录名按文件系统身份比较, 不改 sanitize 存储形态。 */
+function sameMigrationDirName(a: string, b: string, windowsFs: boolean): boolean {
+  if (windowsFs) return a.toLowerCase() === b.toLowerCase();
+  return a === b;
 }
 
 function errnoCode(e: unknown): string {
@@ -557,6 +580,18 @@ export async function runLegacyShardMigration(
         result.results.push(r);
         continue;
       }
+      if (
+        sameMigrationDirName(
+          path.basename(shard.dir),
+          shard.canonicalDirName,
+          windowsFsIdentity(shard.canonicalScopeKey),
+        )
+      ) {
+        r.action = 'skipped';
+        r.error = 'case-only-alias';
+        result.results.push(r);
+        continue;
+      }
       // 竞态防御 (Greptile on #2519): 计划基于扫描快照, 删除前重新校验目录
       // 仍无任何内容 — 若扫描后新增了分片文件或未识别 .md, 跳过删除并报告,
       // 绝不让过期快照删掉新写入的数据。rename-then-remove 把复查与删除之间
@@ -617,7 +652,25 @@ export async function runLegacyShardMigration(
         result.results.push(r);
         continue;
       }
+      if (
+        sameMigrationDirName(
+          path.basename(shard.dir),
+          shard.canonicalDirName,
+          windowsFsIdentity(shard.canonicalScopeKey),
+        )
+      ) {
+        r.action = 'skipped';
+        r.error = 'case-only-alias';
+        result.results.push(r);
+        continue;
+      }
       const targetDir = path.join(path.dirname(shard.dir), shard.canonicalDirName);
+      if (await isSymlinkShardDir(targetDir)) {
+        r.action = 'skipped';
+        r.error = 'symlink-canonical';
+        result.results.push(r);
+        continue;
+      }
       const targetExists = await dirExists(targetDir);
 
       if (!targetExists) {
