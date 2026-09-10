@@ -875,11 +875,17 @@ async function reserveTrashTarget(
       // restore parked source before retrying reservation)。
       if (err.parkedPath) {
         const restored = await restoreParkedSource(src, err.parkedPath);
-        if (!restored) {
+        if (restored !== 'link') {
+          // copy 成功也停止重试: src 只是 detached copy, parked inode 上仍可能
+          // 有 open writer; 再当 cleanup 源会归档副本、后续写入只落在非规范
+          // .cleanup-parked-* (Codex P1 on #2561: Stop retrying after restoring
+          // parked data by copy)。copy 失败同样 fail/replan, parked 保留。
           await fs.unlink(candidate).catch(() => {});
           throw Object.assign(
             new Error(
-              'unable to restore parked source without clobbering src; parked kept for recovery',
+              restored === 'copy'
+                ? 'parked restored by exclusive copy; replan required (open writer may still target parked inode)'
+                : 'unable to restore parked source without clobbering src; parked kept for recovery',
             ),
             { code: 'CLEANUP_SOURCE_LOCKED' },
           );
@@ -978,23 +984,30 @@ async function detachReservedSource(
   );
 }
 
+type ParkedRestoreKind = 'link' | 'copy' | false;
+
 /**
  * Put parked back on src without clobbering a concurrent recreate.
  * POSIX rename overwrites an existing src (TOCTOU after pathExists, or when
  * stat EACCES is treated as missing). Use exclusive link / COPYFILE_EXCL;
  * if the name cannot be reserved, leave parked and return false
  * (Codex P1 on #2561: no-clobber parked restore).
+ *
+ * `'link'` = src 与 parked 同一 inode, 调用方可删 reservation 后重试。
+ * `'copy'` = 只把字节写回 src, parked inode 仍可能被 open writer 使用 —
+ * 不得当完整恢复去重试 cleanup (Codex P1 on #2561: Stop retrying after
+ * restoring parked data by copy)。
  */
-async function restoreParkedSource(src: string, parked: string): Promise<boolean> {
+async function restoreParkedSource(src: string, parked: string): Promise<ParkedRestoreKind> {
   try {
     await fs.link(parked, src);
     await fs.unlink(parked).catch(() => {});
-    return true;
+    return 'link';
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === 'EEXIST') return false;
     try {
       await fs.copyFile(parked, src, fs.constants.COPYFILE_EXCL);
-      return true;
+      return 'copy';
     } catch {
       return false;
     }

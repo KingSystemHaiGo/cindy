@@ -1283,6 +1283,47 @@ describe('runMemoryCleanup', () => {
     }
   });
 
+  it('does not retry cleanup after restoring parked by exclusive copy', async () => {
+    await shard('feedback_a.md', 'feedback', 'Same', 'hook', 'same', '2026-01-01T00:00:00.000Z');
+    await shard('feedback_b.md', 'feedback', 'Same', 'hook', 'same', '2026-02-01T00:00:00.000Z');
+
+    const plan = await planMemoryCleanup(dir);
+    const realLstat = fs.lstat.bind(fs);
+    const realLink = fs.link.bind(fs);
+    let failedOnce = false;
+    const lstatSpy = vi.spyOn(fs, 'lstat').mockImplementation(async (p) => {
+      if (!failedOnce && String(p).includes('cleanup-parked')) {
+        failedOnce = true;
+        throw Object.assign(new Error('transient lock'), { code: 'EACCES' });
+      }
+      return realLstat(p as string);
+    });
+    const linkSpy = vi.spyOn(fs, 'link').mockImplementation(async (src, dst) => {
+      if (String(src).includes('cleanup-parked') && String(dst).endsWith('feedback_a.md')) {
+        throw Object.assign(new Error('hard links unsupported'), { code: 'ENOTSUP' });
+      }
+      return realLink(src as string, dst as string);
+    });
+
+    try {
+      const result = await runMemoryCleanup(plan);
+      expect(failedOnce).toBe(true);
+      expect(result.archived.some((a) => a.filename === 'feedback_a.md')).toBe(false);
+      expect(result.failed.some((f) => f.filename === 'feedback_a.md')).toBe(true);
+      await expect(readFile(path.join(dir, 'feedback_a.md'), 'utf8')).resolves.toContain('same');
+      const names = await readdir(dir);
+      const parked = names.filter((n) => n.includes('cleanup-parked'));
+      expect(parked.length).toBeGreaterThan(0);
+      const parkedRaws = await Promise.all(
+        parked.map((n) => readFile(path.join(dir, n), 'utf8')),
+      );
+      expect(parkedRaws.some((raw) => raw.includes('same'))).toBe(true);
+    } finally {
+      lstatSpy.mockRestore();
+      linkSpy.mockRestore();
+    }
+  });
+
   it('does not unlink parked when src already exists after a transient identity failure', async () => {
     await shard('feedback_a.md', 'feedback', 'Same', 'hook', 'same', '2026-01-01T00:00:00.000Z');
     await shard('feedback_b.md', 'feedback', 'Same', 'hook', 'same', '2026-02-01T00:00:00.000Z');
