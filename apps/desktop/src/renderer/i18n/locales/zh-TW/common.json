@@ -7186,7 +7186,8 @@
         },
         "bannedPhrases": "不要說的話",
         "bannedPhrasesHint": "每行或用逗號分隔，最多 40 條；超出部分會截斷儲存。",
-        "languageHabits": "其他語言習慣"
+        "languageHabits": "其他語言習慣",
+        "restoreDefault": "恢復預設"
       }
     },
     "nameLabel": "怎麼稱呼",

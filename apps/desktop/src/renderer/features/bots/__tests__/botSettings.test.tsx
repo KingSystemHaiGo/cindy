@@ -622,6 +622,49 @@ describe('Bot settings unified autosave', () => {
     expect(lastPatch.style).toBeNull();
   });
 
+  it('clears every style field with the group restore-default action', async () => {
+    vi.useFakeTimers();
+    renderSettings({
+      style: {
+        tone: 'custom',
+        customTone: '像老朋友',
+        addressUserAs: 'Chris',
+        selfName: '小满',
+        replyLength: 'short',
+        emojiDensity: 'sparse',
+        bannedPhrases: '亲爱的',
+        languageHabits: '先结论',
+      },
+    });
+    expect(screen.getByLabelText('bots.profile.style.customTone')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'bots.profile.style.restoreDefault' }));
+    expect(screen.queryByLabelText('bots.profile.style.customTone')).toBeNull();
+    expect((screen.getByLabelText('bots.profile.style.addressUserAs') as HTMLInputElement).value).toBe('');
+    expect((screen.getByLabelText('bots.profile.style.selfName') as HTMLInputElement).value).toBe('');
+    expect((screen.getByLabelText('bots.profile.style.bannedPhrases') as HTMLTextAreaElement).value).toBe('');
+    expect((screen.getByLabelText('bots.profile.style.languageHabits') as HTMLTextAreaElement).value).toBe('');
+    expect(
+      within(screen.getByRole('radiogroup', { name: 'bots.profile.style.tone' })).getByRole('radio', {
+        name: 'bots.profile.style.tones.followDefault',
+      }),
+    ).toHaveAttribute('aria-checked', 'true');
+    expect(
+      within(screen.getByRole('radiogroup', { name: 'bots.profile.style.replyLength' })).getByRole('radio', {
+        name: 'bots.profile.style.replyLengths.followDefault',
+      }),
+    ).toHaveAttribute('aria-checked', 'true');
+    expect(
+      within(screen.getByRole('radiogroup', { name: 'bots.profile.style.emojiDensity' })).getByRole('radio', {
+        name: 'bots.profile.style.emojiDensities.followDefault',
+      }),
+    ).toHaveAttribute('aria-checked', 'true');
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const lastPatch = mocks.updateBotProfile.mock.calls.at(-1)?.[1] as { style?: unknown };
+    expect(lastPatch.style).toBeNull();
+  });
+
   it('changes the avatar through the host-owned image picker', async () => {
     vi.useFakeTimers();
     renderSettings();

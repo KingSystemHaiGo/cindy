@@ -7186,7 +7186,8 @@
         },
         "bannedPhrases": "使わない言い回し",
         "bannedPhrasesHint": "改行またはカンマ区切り。最大 40 件。超えた分は保存時に切り詰めます。",
-        "languageHabits": "その他の話し方"
+        "languageHabits": "その他の話し方",
+        "restoreDefault": "既定に戻す"
       }
     },
     "nameLabel": "呼び名",

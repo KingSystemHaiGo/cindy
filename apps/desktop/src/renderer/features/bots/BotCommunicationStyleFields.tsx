@@ -52,11 +52,20 @@ export function BotCommunicationStyleFields({
   const { t } = useBotTranslation();
   // 草稿保持原文:normalizeBotStyle 会 trim,打字时空格/换行不能在 onChange 里吃掉。
   const style = value ?? {};
+  const hasOverride = Object.keys(style).some((key) => {
+    const field = style[key as keyof BotCommunicationStyle];
+    return field != null && field !== '';
+  });
   const patch = (next: BotCommunicationStyle, kind: 'text' | 'instant') => {
     onChange(kind === 'instant' ? (normalizeBotStyle(next) ?? undefined) : next, kind);
   };
   const commitTrimmed = (next: BotCommunicationStyle = style) => {
     onChange(normalizeBotStyle(next), 'text');
+  };
+  const restoreDefault = () => {
+    if (!hasOverride) return;
+    // Empty object / undefined both normalize to unset; autosave sends style: null.
+    onChange(undefined, 'instant');
   };
 
   return (
@@ -65,6 +74,16 @@ export function BotCommunicationStyleFields({
       title={t('bots.profile.style.title')}
       hint={t('bots.profile.style.hint')}
       testId="bot-communication-style"
+      action={
+        <button
+          type="button"
+          disabled={!hasOverride}
+          onClick={restoreDefault}
+          className="h-8 rounded-full px-3 text-12 text-[var(--text-secondary)] hover:bg-[var(--surface-hover)] disabled:opacity-40"
+        >
+          {t('bots.profile.style.restoreDefault')}
+        </button>
+      }
     >
       <div className="flex flex-col gap-4">
         <FormField label={t('bots.profile.style.tone')} hint={t('bots.profile.style.toneHint')}>

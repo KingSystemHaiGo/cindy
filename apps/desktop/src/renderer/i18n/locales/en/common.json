@@ -7188,7 +7188,8 @@
         },
         "bannedPhrases": "Phrases to avoid",
         "bannedPhrasesHint": "One phrase per line or comma. Up to 40 phrases; extras are truncated when saved.",
-        "languageHabits": "Other language habits"
+        "languageHabits": "Other language habits",
+        "restoreDefault": "Restore default"
       }
     },
     "nameLabel": "What Should We Call Them?",
