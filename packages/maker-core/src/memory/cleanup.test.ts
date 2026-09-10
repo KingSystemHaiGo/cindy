@@ -142,6 +142,46 @@ describe('planMemoryCleanup', () => {
     expect(plan.duplicates[0].archive).toEqual(['feedback_older.md']);
   });
 
+  it('ranks YAML Date updatedAt with an inline comment via the YAML parser', async () => {
+    // `updatedAt: 2026-01-01T00:00:00Z # verified` 合法 YAML, gray-matter
+    // 解成 Date; raw-line regex 因注释失败后会回落到 scan-time now,
+    // 后扫描的旧分片会被当成更新 (Codex P1 on #2561: Parse commented
+    // timestamps with the YAML parser)。
+    await writeFile(
+      path.join(dir, 'feedback_newer.md'),
+      [
+        '---',
+        'title: Same',
+        'description: same hook',
+        'type: feedback',
+        'updatedAt: 2026-03-01T00:00:00Z',
+        '---',
+        'same body',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFile(
+      path.join(dir, 'feedback_older.md'),
+      [
+        '---',
+        'title: Same',
+        'description: same hook',
+        'type: feedback',
+        'updatedAt: 2026-01-01T00:00:00Z # verified',
+        '---',
+        'same body',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+
+    const plan = await planMemoryCleanup(dir);
+    expect(plan.duplicates).toHaveLength(1);
+    expect(plan.duplicates[0].keep).toBe('feedback_newer.md');
+    expect(plan.duplicates[0].archive).toEqual(['feedback_older.md']);
+  });
+
   it('binds expectedHash to the same classified bytes including updatedAt', async () => {
     await shard('feedback_rule_a.md', 'feedback', 'PR polling rule', 'same hook', 'same body',
       '2026-01-01T00:00:00.000Z');
@@ -253,6 +293,29 @@ describe('planMemoryCleanup', () => {
       deps: { now: () => '2026-06-01T00:00:00.000Z' },
     });
     const hit = plan.staleCandidates.find((c) => c.filename === 'project_oldunquoted.md');
+    expect(hit?.reason).toBe('age');
+    expect(plan.archiveItems).toHaveLength(0);
+  });
+
+  it('classifies YAML Date updatedAt with an inline comment as age-stale', async () => {
+    await writeFile(
+      path.join(dir, 'project_oldcomment.md'),
+      [
+        '---',
+        'title: Old',
+        'description: hook',
+        'type: project',
+        'updatedAt: 2020-01-01T00:00:00Z # verified',
+        '---',
+        'no signal',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    const plan = await planMemoryCleanup(dir, {
+      deps: { now: () => '2026-06-01T00:00:00.000Z' },
+    });
+    const hit = plan.staleCandidates.find((c) => c.filename === 'project_oldcomment.md');
     expect(hit?.reason).toBe('age');
     expect(plan.archiveItems).toHaveLength(0);
   });
@@ -1489,6 +1552,54 @@ describe('runMemoryCleanup', () => {
     } finally {
       spy.mockRestore();
     }
+  });
+
+  it('re-reads after the final quiescence delay before marking archived', async () => {
+    await shard('feedback_a.md', 'feedback', 'Same', 'hook', 'same', '2026-01-01T00:00:00.000Z');
+    await shard('feedback_b.md', 'feedback', 'Same', 'hook', 'same', '2026-02-01T00:00:00.000Z');
+
+    const plan = await planMemoryCleanup(dir);
+    // 二次校验 + 三次确认 + quiesce 三轮读都通过; 最后一次 10ms sleep
+    // 期间写入。必须再读一次, 否则会标 archived, 新内容只留在 archive 名下
+    // (Codex P1 on #2561: Re-read after the final quiescence delay)。
+    const realReadFile = fs.readFile.bind(fs);
+    let retainedReads = 0;
+    const spy = vi.spyOn(fs, 'readFile').mockImplementation(async (p, ...rest) => {
+      const str = String(p);
+      if (str.includes(ARCHIVE_DIR_NAME) && !str.endsWith('.archive')) {
+        retainedReads += 1;
+        if (retainedReads === 6) {
+          await writeFile(String(p), 'WRITTEN AFTER FINAL QUIESCE DELAY', 'utf8');
+        }
+      }
+      return realReadFile(p as string, ...rest);
+    });
+
+    try {
+      const result = await runMemoryCleanup(plan);
+      expect(result.failed.some((f) => f.filename === 'feedback_a.md')).toBe(true);
+      expect(result.archived.some((a) => a.filename === 'feedback_a.md')).toBe(false);
+      await expect(readFile(path.join(dir, 'feedback_a.md'), 'utf8')).resolves.toContain(
+        'WRITTEN AFTER FINAL QUIESCE DELAY',
+      );
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('fails when duplicate keeper ranking timestamp changes after plan', async () => {
+    await shard('feedback_old.md', 'feedback', 'Same', 'hook', 'same', '2026-01-01T00:00:00.000Z');
+    await shard('feedback_keep.md', 'feedback', 'Same', 'hook', 'same', '2026-02-01T00:00:00.000Z');
+
+    const plan = await planMemoryCleanup(dir);
+    expect(plan.duplicates[0].keep).toBe('feedback_keep.md');
+    expect(plan.archiveItems[0].keep?.expectedHash).toMatch(/^[0-9a-f]{64}$/);
+
+    await shard('feedback_keep.md', 'feedback', 'Same', 'hook', 'same', '2026-04-01T00:00:00.000Z');
+    const result = await runMemoryCleanup(plan);
+    expect(result.failed.some((f) => f.filename === 'feedback_old.md')).toBe(true);
+    expect(result.archived).toHaveLength(0);
+    await expect(readFile(path.join(dir, 'feedback_old.md'), 'utf8')).resolves.toContain('same');
   });
 
   it('keeps trash reachable when link and copy restore both fail (no rename clobber)', async () => {

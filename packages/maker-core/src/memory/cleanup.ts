@@ -35,6 +35,8 @@ import { createHash, randomBytes } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
+import matter from 'gray-matter';
+
 import { MemoryStorage, parseFilename } from './storage.js';
 import type { MemoryRecord } from './types.js';
 
@@ -261,11 +263,13 @@ export interface ArchiveItem {
    */
   expectedHash: string | null;
   /**
-   * 重复组保留副本 (reason=duplicate 时) — plan 审阅时点的 contentHash,
-   * run 校验其仍存在且内容一致, 任一变化则失败要求重新规划 (Codex P1 on
-   * #2561 第二十九轮: 同时校验重复组的保留副本)。
+   * 重复组保留副本 (reason=duplicate 时) — plan 审阅时点的
+   * 语义 contentHash + raw sha256。run 校验 keep 仍存在且 raw 一致:
+   * 仅改 updatedAt (排名元数据) 也必须 replan, 否则会归档
+   * 策略现在认为更新的那条 (Codex P1 on #2561: Bind duplicate
+   * keepers to their ranking metadata)。
    */
-  keep?: { filename: string; contentHash: string };
+  keep?: { filename: string; contentHash: string; expectedHash: string };
   /**
    * digest 精简的保留集 (reason=digest-retention 时) — plan 审阅时点
    * 各 keep 文件的 raw sha256, run 在归档前复验仍存在且内容一致,
@@ -454,6 +458,8 @@ export async function planMemoryCleanup(
       keep: keep.filename,
       archive,
     });
+    const keepRawHash = hashOfRaw(rawByName.get(keep.filename));
+    if (keepRawHash === null) continue;
     for (const f of archive) {
       const expectedHash = hashOfRaw(rawByName.get(f));
       if (expectedHash === null) continue;
@@ -462,10 +468,14 @@ export async function planMemoryCleanup(
         reason: 'duplicate',
         detail: `duplicate of ${keep.filename}`,
         expectedHash,
-        // 绑定保留副本的审阅时点内容 hash — run 校验 keep 仍存在且内容一致,
-        // 否则重复组不成立, 归档会让最后一份已审阅内容退出正常路径
-        // (Codex P1 on #2561 第二十九轮)。
-        keep: { filename: keep.filename, contentHash: contentHash(keep) },
+        // 绑定保留副本的审阅时点 raw + 语义 hash: 只改 updatedAt 也必须
+        // replan, 否则会归档策略现在认为更新的那条 (Codex P1 on #2561:
+        // Bind duplicate keepers to their ranking metadata)。
+        keep: {
+          filename: keep.filename,
+          contentHash: contentHash(keep),
+          expectedHash: keepRawHash,
+        },
       });
     }
   }
@@ -735,11 +745,19 @@ function parseFrontmatterUpdatedAt(raw: string | undefined): number | null {
   if (raw === undefined) return null;
   const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
   if (!match) return null;
-  const fm = match[1];
-  const line = fm.match(/^updatedAt\s*:\s*(?:['"]([^'"]+)['"]|(\S+))\s*$/m);
-  if (!line) return null;
-  const value = line[1] ?? line[2];
-  return parseUpdatedAtMs(value);
+  // 走 YAML parser, 不要用 raw-line regex: `updatedAt: 2026-01-01T00:00:00Z # verified`
+  // 合法 YAML 会被 gray-matter 解成 Date, 但行尾注释会让 regex 失败, 随后
+  // parseRawShard 用扫描时间替换, duplicate ranking 可能保留后读到的文件
+  // (Codex P1 on #2561: Parse commented timestamps with the YAML parser)。
+  try {
+    const parsed = matter(`---\n${match[1]}\n---\n`);
+    const value = parsed.data?.updatedAt;
+    if (typeof value === 'string') return parseUpdatedAtMs(value);
+    if (value instanceof Date && !Number.isNaN(value.getTime())) return value.getTime();
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -939,6 +957,15 @@ export async function runMemoryCleanup(
             break;
           }
           await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        // 最后一次 delay 后再读: 循环是先读后睡, 末次 sleep 期间的写入
+        // 否则会标 archived, 新内容只留在 archive 名下
+        // (Codex P1 on #2561: Re-read after the final quiescence delay)。
+        if (quiesced) {
+          const afterDelay = await fs.readFile(retained).catch(() => null);
+          if (afterDelay === null || !afterDelay.equals(srcContent)) {
+            quiesced = false;
+          }
         }
         if (!quiesced) {
           const restored = await restoreRetained(retained, src);
@@ -1205,7 +1232,11 @@ async function verifyBoundKeepers(
   const storage = new MemoryStorage(shardDir);
   if (item.keep) {
     const keepRec = await storage.readWithRaw(item.keep.filename);
-    if (!keepRec || contentHash(keepRec.rec) !== item.keep.contentHash) {
+    if (
+      !keepRec ||
+      contentHash(keepRec.rec) !== item.keep.contentHash ||
+      sha256(Buffer.from(keepRec.raw, 'utf8')) !== item.keep.expectedHash
+    ) {
       return `duplicate keeper ${item.keep.filename} changed since plan; replan required`;
     }
   }
