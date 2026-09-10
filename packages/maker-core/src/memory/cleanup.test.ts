@@ -297,6 +297,36 @@ describe('planMemoryCleanup', () => {
     );
   });
 
+  it('reconciles duplicate digests before binding retention keepers', async () => {
+    // keep=2: 最新两条语义相同 (dup_new/dup_old) + 两条更旧 unique。
+    // 未对账时 digestKeep 含 dup_old, run 先 duplicate 归档它, 后续
+    // retention 会 keeper 失败、更旧 digest 留在活动分片
+    // (Codex P1 on #2561: Reconcile duplicate digests before binding
+    // retention keepers)。
+    await shard('digest_a.md', 'digest', 'A', 'hook', 'a', '2026-01-01T00:00:00.000Z');
+    await shard('digest_b.md', 'digest', 'B', 'hook', 'b', '2026-02-01T00:00:00.000Z');
+    await shard('digest_dup_old.md', 'digest', 'Dup', 'hook', 'same', '2026-03-01T00:00:00.000Z');
+    await shard('digest_dup_new.md', 'digest', 'Dup', 'hook', 'same', '2026-04-01T00:00:00.000Z');
+
+    const plan = await planMemoryCleanup(dir);
+    expect(plan.duplicates).toHaveLength(1);
+    expect(plan.duplicates[0].keep).toBe('digest_dup_new.md');
+    expect(plan.duplicates[0].archive).toEqual(['digest_dup_old.md']);
+    expect(plan.digests.keep).toEqual(['digest_dup_new.md', 'digest_b.md']);
+    expect(plan.digests.archive).toEqual(['digest_a.md']);
+    expect(
+      plan.archiveItems.find((i) => i.reason === 'digest-retention')?.digestKeep?.map((k) => k.filename),
+    ).toEqual(['digest_dup_new.md', 'digest_b.md']);
+
+    const result = await runMemoryCleanup(plan);
+    expect(result.failed).toHaveLength(0);
+    expect(result.archived.map((a) => a.filename).sort()).toEqual(
+      ['digest_a.md', 'digest_dup_old.md'].sort(),
+    );
+    await expect(readFile(path.join(dir, 'digest_dup_new.md'), 'utf8')).resolves.toContain('same');
+    await expect(readFile(path.join(dir, 'digest_b.md'), 'utf8')).resolves.toContain('b');
+  });
+
   it('ranks digest keep by chronological updatedAt not lexicographic ISO', async () => {
     // `...T12:00:00Z` 字典序晚于 `...T09:00:00-08:00`, 但后者实际更新 (17:00Z)。
     await shard('digest_lex.md', 'digest', 'Lex', 'hook', 'lex', '2026-01-01T12:00:00Z');

@@ -33,12 +33,18 @@ import { pathToFileURL } from 'node:url';
 // tsx 运行本脚本, 直接 import maker-core 源码 (同 migrate-maker-memory.mjs)。
 import {
   bindReviewedStaleCandidates,
-  parseKeepDigests,
+  isCindyHostComm,
+  normalizeProcessComm,
+  parseCleanupCliArgs,
   parseReviewedStalePlan,
   planMemoryCleanup,
+  requireFromPlanForArchiveStale,
+  resolveReviewedKeepDigests,
   runMemoryCleanup,
   staleSetFingerprint,
 } from '../packages/maker-core/src/memory/cleanup.ts';
+
+export { isCindyHostComm, normalizeProcessComm };
 
 const HELP = `cleanup-maker-memory — 分片内清理 (P0.5, #2379)
 
@@ -82,81 +88,12 @@ const HELP = `cleanup-maker-memory — 分片内清理 (P0.5, #2379)
 `;
 
 function parseArgs(argv) {
-  const out = {
-    shard: null,
-    dryRun: true,
-    keepDigests: null,
-    backupDir: null,
-    archiveStale: false,
-    force: false,
-    json: false,
-    writePlan: null,
-    fromPlan: null,
-    staleSetHash: null,
-    confirmStaleDiff: false,
-  };
-  for (let i = 0; i < argv.length; i += 1) {
-    const a = argv[i];
-    if (a === '--help' || a === '-h') {
-      process.stdout.write(HELP);
-      process.exit(0);
-    } else if (a === '--shard') {
-      out.shard = requireOperand(argv, ++i, '--shard');
-    } else if (a === '--apply') {
-      out.dryRun = false;
-    } else if (a === '--dry-run') {
-      out.dryRun = true;
-    } else if (a === '--archive-stale') {
-      out.archiveStale = true;
-    } else if (a === '--write-plan') {
-      out.writePlan = requireOperand(argv, ++i, '--write-plan');
-    } else if (a === '--from-plan') {
-      out.fromPlan = requireOperand(argv, ++i, '--from-plan');
-    } else if (a === '--stale-set-hash') {
-      out.staleSetHash = requireOperand(argv, ++i, '--stale-set-hash');
-    } else if (a === '--confirm-stale-diff') {
-      out.confirmStaleDiff = true;
-    } else if (a === '--keep-digests') {
-      const raw = argv[++i];
-      const n = Number(raw);
-      // 边界校验 (Greptile P1 on #2561): 0 / 负数 / 小数 / 非数字都要明确拒绝,
-      // 不能靠 truthy 或 slice 语义静默误解释。0 合法 (全清 digest)。
-      // 与 parseReviewedStalePlan 共用 parseKeepDigests, 避免手改 plan 绕过 CLI。
-      try {
-        if (raw == null || raw === '') throw new Error('missing');
-        out.keepDigests = parseKeepDigests(n);
-      } catch {
-        process.stderr.write(`--keep-digests 必须是 >=0 的整数, 收到 "${raw}"\n`);
-        process.exit(2);
-      }
-    } else if (a === '--backup-dir') {
-      out.backupDir = requireOperand(argv, ++i, '--backup-dir');
-    } else if (a === '--force') {
-      out.force = true;
-    } else if (a === '--json') {
-      out.json = true;
-    } else {
-      process.stderr.write(`未知参数: ${a}\n`);
-      process.stderr.write(HELP);
-      process.exit(2);
-    }
+  const parsed = parseCleanupCliArgs(argv);
+  if (parsed.help) {
+    process.stdout.write(HELP);
+    process.exit(0);
   }
-  return out;
-}
-
-/**
- * 取值型选项的操作数校验 — 拒绝缺失或「把下一个 flag 当值」的情况
- * (Codex P1 on #2561: `--apply --backup-dir --json` 会把 backupRoot 设成
- * `<repo>/--json`, 导致记忆被复制进 Git worktree)。操作数以 `-` 开头且不是
- * 负数即视为 flag, 报错退出。调用处先 `++i` 把索引推进到操作数再传入。
- */
-function requireOperand(argv, idx, flag) {
-  const v = argv[idx];
-  if (v == null || (v.startsWith('-') && Number.isNaN(Number(v)))) {
-    process.stderr.write(`${flag} 缺少参数 (收到 "${v ?? ''}")\n`);
-    process.exit(2);
-  }
-  return v;
+  return parsed.options;
 }
 
 async function main() {
@@ -233,22 +170,16 @@ async function main() {
     }
   }
 
-  const keepDigests =
-    opts.keepDigests !== null
-      ? opts.keepDigests
-      : reviewedPlan && typeof reviewedPlan.keepDigests === 'number'
+  let keepDigests;
+  try {
+    keepDigests = resolveReviewedKeepDigests(
+      opts.keepDigests,
+      reviewedPlan && typeof reviewedPlan.keepDigests === 'number'
         ? reviewedPlan.keepDigests
-        : null;
-  if (
-    opts.keepDigests !== null &&
-    reviewedPlan &&
-    typeof reviewedPlan.keepDigests === 'number' &&
-    opts.keepDigests !== reviewedPlan.keepDigests
-  ) {
-    process.stderr.write(
-      `--keep-digests ${opts.keepDigests} 与 --from-plan 审阅值 ${reviewedPlan.keepDigests} 不一致, 拒绝 apply。\n` +
-        '  请使用审阅过的值, 或重新 --dry-run --keep-digests 后再 --from-plan。\n',
+        : undefined,
     );
+  } catch (e) {
+    process.stderr.write(`${e?.message ?? e}\n`);
     process.exit(2);
   }
 
@@ -390,11 +321,15 @@ async function main() {
     // 审阅文件带 archiveStale, 或 CLI 显式 --archive-stale, 才归档该审阅集。
     archiveStale = opts.archiveStale || reviewedPlan.archiveStale;
   } else if (archiveStale) {
-    process.stderr.write(
-      '--apply --archive-stale 必须提供 --from-plan <dry-run --write-plan 文件>。\n' +
-        '  apply 不得重新扫描终态候选; 新命中须重新 dry-run 审阅后再 apply。\n',
-    );
-    process.exit(2);
+    try {
+      requireFromPlanForArchiveStale(opts);
+    } catch (e) {
+      process.stderr.write(
+        `${e?.message ?? e}\n` +
+          '  apply 不得重新扫描终态候选; 新命中须重新 dry-run 审阅后再 apply。\n',
+      );
+      process.exit(2);
+    }
   }
 
   if (opts.staleSetHash) {
@@ -462,36 +397,6 @@ async function main() {
     warn('  归档已落盘, 但旧索引可能仍引用已归档文件; 请修复索引文件权限/磁盘后重跑。');
     process.exit(4);
   }
-}
-
-/**
- * 宿主 (Cindy 桌面应用) 运行检测 — 与 migrate-maker-memory.mjs 同款逻辑
- * (#2529 行动项 2 排他契约)。归档会移动用户记忆文件, 宿主进程持有
- * MakerMemoryStore 与 SQLite 句柄时不应并发。
- * 检测工具缺失 / 权限拒绝 / 查询失败 → status=unknown, 调用方必须拒绝执行
- * 并要求 --force, 不得 fail-open (Codex P2 on #2561)。
- * macOS `ps -eo comm` 给出可执行路径, 匹配前先收成 basename。
- */
-const HOST_COMM_BASENAMES = new Set(['cindy', 'cindydev', 'desktop', 'electron']);
-
-/**
- * 把 `ps -eo comm` / 路径型 comm 收成 basename。
- * macOS 上 comm 常是 `/Applications/Cindy.app/Contents/MacOS/Cindy`, 不是 `cindy`
- * (Codex P1 on #2561: Normalize macOS ps command paths before matching)。
- */
-export function normalizeProcessComm(comm) {
-  const raw = String(comm ?? '')
-    .trim()
-    .replace(/^["']+|['"]+$/g, '')
-    .replace(/\0/g, '');
-  if (!raw) return '';
-  const segs = raw.split(/[/\\]/).filter(Boolean);
-  const base = segs[segs.length - 1] ?? raw;
-  return base.toLowerCase().replace(/\.exe$/i, '');
-}
-
-export function isCindyHostComm(comm) {
-  return HOST_COMM_BASENAMES.has(normalizeProcessComm(comm));
 }
 
 export async function detectHost() {

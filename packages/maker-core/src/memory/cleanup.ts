@@ -41,6 +41,29 @@ import type { MemoryRecord } from './types.js';
 /** 归档子目录名 — 退出 storage.list()/MEMORY.md/FTS 正常路径的可逆软删除区。 */
 export const ARCHIVE_DIR_NAME = '.archive';
 
+/** Unix `ps -eo comm` / Windows exe basename 中认为 Cindy 宿主的进程名。 */
+const HOST_COMM_BASENAMES = new Set(['cindy', 'cindydev', 'desktop', 'electron']);
+
+/**
+ * 把 `ps -eo comm` / 路径型 comm 收成 basename。
+ * macOS 上 comm 常是 `/Applications/Cindy.app/Contents/MacOS/Cindy`, 不是 `cindy`
+ * (Codex P1 on #2561: Normalize macOS ps command paths before matching)。
+ */
+export function normalizeProcessComm(comm: string | null | undefined): string {
+  const raw = String(comm ?? '')
+    .trim()
+    .replace(/^["']+|['"]+$/g, '')
+    .replace(/\0/g, '');
+  if (!raw) return '';
+  const segs = raw.split(/[/\\]/).filter(Boolean);
+  const base = segs[segs.length - 1] ?? raw;
+  return base.toLowerCase().replace(/\.exe$/i, '');
+}
+
+export function isCindyHostComm(comm: string | null | undefined): boolean {
+  return HOST_COMM_BASENAMES.has(normalizeProcessComm(comm));
+}
+
 /**
  * 强终态信号 — 中文的明确状态短语, 命中 body/description 且 type 为
  * project/reference 时列入**高置信**终态候选 (#2379 正文「4 条已终态项目归档」
@@ -93,6 +116,131 @@ export function parseKeepDigests(value: unknown): number {
     throw new Error(`keepDigests must be a >=0 integer, got ${String(value)}`);
   }
   return value;
+}
+
+/** CLI `--help` 以外的解析失败 (exit 2)。 */
+export class CleanupCliUsageError extends Error {
+  readonly exitCode = 2;
+  constructor(message: string) {
+    super(message);
+    this.name = 'CleanupCliUsageError';
+  }
+}
+
+export interface CleanupCliOptions {
+  shard: string | null;
+  dryRun: boolean;
+  keepDigests: number | null;
+  backupDir: string | null;
+  archiveStale: boolean;
+  force: boolean;
+  json: boolean;
+  writePlan: string | null;
+  fromPlan: string | null;
+  staleSetHash: string | null;
+  confirmStaleDiff: boolean;
+}
+
+export type CleanupCliParseResult =
+  | { help: true }
+  | { help?: false; options: CleanupCliOptions };
+
+function requireCliOperand(argv: string[], idx: number, flag: string): string {
+  const v = argv[idx];
+  if (v == null || (v.startsWith('-') && Number.isNaN(Number(v)))) {
+    throw new CleanupCliUsageError(`${flag} 缺少参数 (收到 "${v ?? ''}")`);
+  }
+  return v;
+}
+
+/**
+ * 解析 cleanup-maker-memory CLI 参数。`--help` 返回 `{ help: true }`,
+ * 非法参数抛 CleanupCliUsageError (exit 2)。供脚本与默认单测 in-process
+ * 共用, 避免每个用例再起 Node+tsx (Codex P1 on #2561: Keep only one CLI
+ * subprocess smoke in the default unit tier)。
+ */
+export function parseCleanupCliArgs(argv: string[]): CleanupCliParseResult {
+  const out: CleanupCliOptions = {
+    shard: null,
+    dryRun: true,
+    keepDigests: null,
+    backupDir: null,
+    archiveStale: false,
+    force: false,
+    json: false,
+    writePlan: null,
+    fromPlan: null,
+    staleSetHash: null,
+    confirmStaleDiff: false,
+  };
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    if (a === '--help' || a === '-h') {
+      return { help: true };
+    }
+    if (a === '--shard') {
+      out.shard = requireCliOperand(argv, ++i, '--shard');
+    } else if (a === '--apply') {
+      out.dryRun = false;
+    } else if (a === '--dry-run') {
+      out.dryRun = true;
+    } else if (a === '--archive-stale') {
+      out.archiveStale = true;
+    } else if (a === '--write-plan') {
+      out.writePlan = requireCliOperand(argv, ++i, '--write-plan');
+    } else if (a === '--from-plan') {
+      out.fromPlan = requireCliOperand(argv, ++i, '--from-plan');
+    } else if (a === '--stale-set-hash') {
+      out.staleSetHash = requireCliOperand(argv, ++i, '--stale-set-hash');
+    } else if (a === '--confirm-stale-diff') {
+      out.confirmStaleDiff = true;
+    } else if (a === '--keep-digests') {
+      const raw = argv[++i];
+      try {
+        if (raw == null || raw === '') throw new Error('missing');
+        out.keepDigests = parseKeepDigests(Number(raw));
+      } catch {
+        throw new CleanupCliUsageError(`--keep-digests 必须是 >=0 的整数, 收到 "${raw}"`);
+      }
+    } else if (a === '--backup-dir') {
+      out.backupDir = requireCliOperand(argv, ++i, '--backup-dir');
+    } else if (a === '--force') {
+      out.force = true;
+    } else if (a === '--json') {
+      out.json = true;
+    } else {
+      throw new CleanupCliUsageError(`未知参数: ${a}`);
+    }
+  }
+  return { options: out };
+}
+
+/** --apply --archive-stale 必须绑 dry-run 审阅集。 */
+export function requireFromPlanForArchiveStale(opts: {
+  dryRun: boolean;
+  archiveStale: boolean;
+  fromPlan: string | null;
+}): void {
+  if (!opts.dryRun && opts.archiveStale && !opts.fromPlan) {
+    throw new CleanupCliUsageError(
+      '--apply --archive-stale 必须提供 --from-plan <dry-run --write-plan 文件>。',
+    );
+  }
+}
+
+/** CLI --keep-digests 与审阅 plan 必须一致; 省略 CLI 时用审阅值。 */
+export function resolveReviewedKeepDigests(
+  cliKeep: number | null,
+  reviewedKeep: number | undefined,
+): number | null {
+  if (cliKeep !== null && typeof reviewedKeep === 'number' && cliKeep !== reviewedKeep) {
+    throw new CleanupCliUsageError(
+      `--keep-digests ${cliKeep} 与 --from-plan 审阅值 ${reviewedKeep} 不一致, 拒绝 apply。`,
+    );
+  }
+  if (cliKeep !== null) return cliKeep;
+  if (typeof reviewedKeep === 'number') return reviewedKeep;
+  return null;
 }
 
 /** 清理工具依赖注入 (测试可替换)。 */
@@ -397,9 +545,17 @@ export async function planMemoryCleanup(
   // 排序用纪元时间 (不是 ISO 字符串字典序): `...T09:00:00-08:00` 比
   // `...T12:00:00Z` 更新, 但 localeCompare 会把 Z 排在前
   // (Codex P1 on #2561: compare digest timestamps chronologically)。
+  // duplicate 通过会先归档语义相同的旧 digest; retention keepers
+  // 必须按归档后仍活跃的集合绑定, 否则 run 先执行 duplicate
+  // 后 digest-retention 会 keeper 校验失败 (Codex P1 on #2561:
+  // Reconcile duplicate digests before binding retention keepers)。
+  const duplicateArchived = new Set(
+    plan.archiveItems.filter((i) => i.reason === 'duplicate').map((i) => i.filename),
+  );
   const digestMeta: Array<{ rec: MemoryRecord; ts: number }> = [];
   for (const r of records) {
     if (r.frontmatter.type !== 'digest') continue;
+    if (duplicateArchived.has(r.filename)) continue;
     const raw = rawByName.get(r.filename);
     const ts = parseFrontmatterUpdatedAt(raw);
     if (ts === null) continue;
