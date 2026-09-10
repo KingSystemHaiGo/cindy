@@ -193,6 +193,15 @@ export interface CleanupRunOptions {
   archiveStale?: boolean;
 }
 
+/** dry-run 审阅过的终态候选 (filename + expectedHash) — apply 绑定集合用。 */
+export interface ReviewedStaleCandidate {
+  filename: string;
+  expectedHash: string | null;
+  reason?: StaleCandidate['reason'];
+  matchedSignal?: string;
+  updatedAt?: string;
+}
+
 export interface CleanupRunResult {
   /** 成功归档的文件。 */
   archived: ArchiveItem[];
@@ -390,6 +399,105 @@ export async function planMemoryCleanup(
 function hashOfRaw(raw: string | undefined): string | null {
   if (raw === undefined) return null;
   return sha256(Buffer.from(raw, 'utf8'));
+}
+
+/**
+ * 终态候选集的稳定指纹 (filename + expectedHash, 排序后 sha256)。
+ * dry-run JSON 带上, 供自动化校验 apply 时集合未变。
+ */
+export function staleSetFingerprint(
+  candidates: Array<{ filename: string; expectedHash: string | null }>,
+): string {
+  const lines = candidates
+    .map((c) => `${c.filename}\t${c.expectedHash ?? ''}`)
+    .sort();
+  return createHash('sha256').update(lines.join('\n'), 'utf8').digest('hex');
+}
+
+/**
+ * 把 apply 时计划的终态候选换成 dry-run 审阅集 (不归档审阅后新出现的 stale)。
+ * 返回 live 扫描多出的候选, 供 CLI 报告; plan.staleCandidates 改写为审阅集。
+ */
+export function bindReviewedStaleCandidates(
+  plan: CleanupPlan,
+  reviewed: ReviewedStaleCandidate[],
+): { extraLive: StaleCandidate[] } {
+  const reviewedNames = new Set<string>();
+  const bound: StaleCandidate[] = [];
+  for (const r of reviewed) {
+    if (reviewedNames.has(r.filename)) continue;
+    reviewedNames.add(r.filename);
+    bound.push({
+      filename: r.filename,
+      reason: r.reason ?? 'signal',
+      matchedSignal: r.matchedSignal,
+      updatedAt: r.updatedAt ?? '',
+      expectedHash: r.expectedHash,
+    });
+  }
+  const extraLive = plan.staleCandidates.filter((c) => !reviewedNames.has(c.filename));
+  plan.staleCandidates = bound;
+  return { extraLive };
+}
+
+/** dry-run --write-plan 落盘格式 (version=1)。 */
+export interface ReviewedStalePlanFile {
+  version: 1;
+  shardDir?: string;
+  keepDigests?: number | null;
+  archiveStale?: boolean;
+  staleFingerprint: string;
+  staleCandidates: ReviewedStaleCandidate[];
+}
+
+/** 校验 --from-plan JSON, 指纹必须与候选集一致。 */
+export function parseReviewedStalePlan(raw: unknown): ReviewedStalePlanFile {
+  if (typeof raw !== 'object' || raw === null) {
+    throw new Error('reviewed plan must be an object');
+  }
+  const obj = raw as Record<string, unknown>;
+  if (obj.version !== 1) {
+    throw new Error(`unsupported reviewed plan version: ${String(obj.version)}`);
+  }
+  if (!Array.isArray(obj.staleCandidates)) {
+    throw new Error('reviewed plan missing staleCandidates');
+  }
+  const staleCandidates: ReviewedStaleCandidate[] = [];
+  for (const item of obj.staleCandidates) {
+    if (typeof item !== 'object' || item === null) {
+      throw new Error('reviewed stale candidate must be an object');
+    }
+    const c = item as Record<string, unknown>;
+    if (typeof c.filename !== 'string' || c.filename.length === 0) {
+      throw new Error('reviewed stale candidate missing filename');
+    }
+    if (c.expectedHash !== null && typeof c.expectedHash !== 'string') {
+      throw new Error(`reviewed stale candidate ${c.filename} has invalid expectedHash`);
+    }
+    const reason =
+      c.reason === 'signal' || c.reason === 'weak-signal' || c.reason === 'age'
+        ? c.reason
+        : undefined;
+    staleCandidates.push({
+      filename: c.filename,
+      expectedHash: c.expectedHash,
+      reason,
+      matchedSignal: typeof c.matchedSignal === 'string' ? c.matchedSignal : undefined,
+      updatedAt: typeof c.updatedAt === 'string' ? c.updatedAt : undefined,
+    });
+  }
+  const fingerprint = staleSetFingerprint(staleCandidates);
+  if (typeof obj.staleFingerprint !== 'string' || obj.staleFingerprint !== fingerprint) {
+    throw new Error('reviewed plan staleFingerprint does not match staleCandidates');
+  }
+  return {
+    version: 1,
+    shardDir: typeof obj.shardDir === 'string' ? obj.shardDir : undefined,
+    keepDigests: typeof obj.keepDigests === 'number' ? obj.keepDigests : null,
+    archiveStale: obj.archiveStale === true,
+    staleFingerprint: fingerprint,
+    staleCandidates,
+  };
 }
 
 /**

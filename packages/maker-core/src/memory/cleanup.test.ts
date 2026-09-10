@@ -15,8 +15,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   ARCHIVE_DIR_NAME,
+  bindReviewedStaleCandidates,
+  parseReviewedStalePlan,
   planMemoryCleanup,
   runMemoryCleanup,
+  staleSetFingerprint,
 } from './cleanup.js';
 import { MemoryStorage } from './storage.js';
 import { MemoryError } from './types.js';
@@ -1201,5 +1204,69 @@ describe('storage list I/O vs corrupt shards (Codex P1 on #2561)', () => {
       spy.mockRestore();
     }
     await expect(readFile(path.join(dir, 'MEMORY.md'), 'utf8')).resolves.toBe(before);
+  });
+});
+
+describe('bindReviewedStaleCandidates (Codex P1 on #2561 apply vs dry-run)', () => {
+  it('archives only the reviewed stale set, not later live hits', async () => {
+    await shard('project_done.md', 'project', 'Done', 'hook', '这个项目已归档',
+      '2026-01-01T00:00:00.000Z');
+
+    const reviewed = await planMemoryCleanup(dir);
+    expect(reviewed.staleCandidates.map((c) => c.filename)).toEqual(['project_done.md']);
+    const fingerprint = staleSetFingerprint(reviewed.staleCandidates);
+
+    await shard('project_later.md', 'project', 'Later', 'hook', '这个项目已结束',
+      '2026-02-01T00:00:00.000Z');
+    const live = await planMemoryCleanup(dir);
+    expect(live.staleCandidates.map((c) => c.filename).sort()).toEqual([
+      'project_done.md',
+      'project_later.md',
+    ]);
+    expect(staleSetFingerprint(live.staleCandidates)).not.toBe(fingerprint);
+
+    const { extraLive } = bindReviewedStaleCandidates(
+      live,
+      reviewed.staleCandidates.map((c) => ({
+        filename: c.filename,
+        expectedHash: c.expectedHash,
+        reason: c.reason,
+        matchedSignal: c.matchedSignal,
+        updatedAt: c.updatedAt,
+      })),
+    );
+    expect(extraLive.map((c) => c.filename)).toEqual(['project_later.md']);
+    expect(live.staleCandidates.map((c) => c.filename)).toEqual(['project_done.md']);
+
+    const result = await runMemoryCleanup(live, { archiveStale: true });
+    expect(result.archived.map((a) => a.filename)).toEqual(['project_done.md']);
+    await expect(readFile(path.join(dir, 'project_later.md'), 'utf8')).resolves.toContain('已结束');
+  });
+
+  it('rejects a reviewed plan whose fingerprint does not match candidates', () => {
+    expect(() =>
+      parseReviewedStalePlan({
+        version: 1,
+        staleFingerprint: 'deadbeef',
+        staleCandidates: [{ filename: 'a.md', expectedHash: 'abc' }],
+      }),
+    ).toThrow(/staleFingerprint/);
+  });
+
+  it('round-trips fingerprint through parseReviewedStalePlan', () => {
+    const staleCandidates = [
+      { filename: 'b.md', expectedHash: 'bbb' },
+      { filename: 'a.md', expectedHash: 'aaa' },
+    ];
+    const staleFingerprint = staleSetFingerprint(staleCandidates);
+    const parsed = parseReviewedStalePlan({
+      version: 1,
+      shardDir: '/tmp/shard',
+      archiveStale: true,
+      staleFingerprint,
+      staleCandidates,
+    });
+    expect(parsed.staleFingerprint).toBe(staleFingerprint);
+    expect(parsed.staleCandidates.map((c) => c.filename)).toEqual(['b.md', 'a.md']);
   });
 });

@@ -17,6 +17,7 @@
  *   - --apply 只归档确定性项 (完全重复 + digest 冗余); 归档进 <shard>/.archive/
  *     不是删除, 可手工找回
  *   - 终态候选默认只报告; --archive-stale 才一并归档 (用户已确认)
+ *   - --apply --archive-stale 必须绑 dry-run 审阅集 (--from-plan), 不重扫新 stale
  *   - --backup-dir 可选真备份; 归档/备份目标循环递增后缀, 绝不覆盖
  *   - 执行前检测宿主进程 (Cindy 桌面应用) — 持有 Store/SQLite 句柄时拒绝;
     检测失败 (缺 tasklist/ps、权限拒绝) 同样拒绝, 须显式 --force
@@ -30,8 +31,11 @@ import process from 'node:process';
 
 // tsx 运行本脚本, 直接 import maker-core 源码 (同 migrate-maker-memory.mjs)。
 import {
+  bindReviewedStaleCandidates,
+  parseReviewedStalePlan,
   planMemoryCleanup,
   runMemoryCleanup,
+  staleSetFingerprint,
 } from '../packages/maker-core/src/memory/cleanup.ts';
 
 const HELP = `cleanup-maker-memory — 分片内清理 (P0.5, #2379)
@@ -46,6 +50,10 @@ const HELP = `cleanup-maker-memory — 分片内清理 (P0.5, #2379)
   --dry-run             只输出清理计划, 不修改任何文件 (默认)
   --apply               执行归档 (进 <shard>/.archive/, 可逆); 只归档确定性项
   --archive-stale       连同终态候选一并归档 — 终态是语义判断, 需你确认后显式开启
+  --write-plan <path>   dry-run 把审阅集 (含 expectedHash) 写到该文件
+  --from-plan <path>    apply 绑定 dry-run 审阅集; --apply --archive-stale 必填
+  --stale-set-hash <hex>  apply 时 live 终态指纹须等于 dry-run RESULT.staleFingerprint
+  --confirm-stale-diff  live 比审阅集多出新终态时仍只归档审阅集 (须显式确认)
   --keep-digests <n>    digest 保留数 (默认 2)
   --backup-dir <path>   归档前先复制到该目录 (可选真备份)
   --force               宿主 (Cindy 桌面应用) 正在运行时也继续执行
@@ -55,6 +63,7 @@ const HELP = `cleanup-maker-memory — 分片内清理 (P0.5, #2379)
 安全:
   - 清理 = 归档 (rename 进 .archive/), 不是删除; 可逆, 用户可手工找回
   - 完全重复 / digest 精简自动执行; 终态候选 + 近似重复只报告
+  - --apply --archive-stale 只归档 --from-plan 里审阅过的终态集, 新命中须重新 dry-run
   - 归档/备份目标循环递增后缀, 同名冲突绝不覆盖
   - SSH 分片 / 无 meta.json 目录不属于本工具范围 (那是 migrate-maker-memory 的活)
   - 执行前检测宿主进程
@@ -62,7 +71,8 @@ const HELP = `cleanup-maker-memory — 分片内清理 (P0.5, #2379)
 示例:
   node --import tsx scripts/cleanup-maker-memory.mjs --shard "%APPDATA%/cindy/maker-memory/E--repo" --dry-run
   node --import tsx scripts/cleanup-maker-memory.mjs --shard "%APPDATA%/cindy/maker-memory/E--repo" --apply
-  node --import tsx scripts/cleanup-maker-memory.mjs --shard "%APPDATA%/cindy/maker-memory/E--repo" --apply --archive-stale
+  node --import tsx scripts/cleanup-maker-memory.mjs --shard "%APPDATA%/cindy/maker-memory/E--repo" --dry-run --archive-stale --write-plan plan.json
+  node --import tsx scripts/cleanup-maker-memory.mjs --shard "%APPDATA%/cindy/maker-memory/E--repo" --apply --from-plan plan.json
   node --import tsx scripts/cleanup-maker-memory.mjs --shard "%APPDATA%/cindy/maker-memory/E--repo" --apply --keep-digests 1
 `;
 
@@ -75,6 +85,10 @@ function parseArgs(argv) {
     archiveStale: false,
     force: false,
     json: false,
+    writePlan: null,
+    fromPlan: null,
+    staleSetHash: null,
+    confirmStaleDiff: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
@@ -89,6 +103,14 @@ function parseArgs(argv) {
       out.dryRun = true;
     } else if (a === '--archive-stale') {
       out.archiveStale = true;
+    } else if (a === '--write-plan') {
+      out.writePlan = requireOperand(argv, ++i, '--write-plan');
+    } else if (a === '--from-plan') {
+      out.fromPlan = requireOperand(argv, ++i, '--from-plan');
+    } else if (a === '--stale-set-hash') {
+      out.staleSetHash = requireOperand(argv, ++i, '--stale-set-hash');
+    } else if (a === '--confirm-stale-diff') {
+      out.confirmStaleDiff = true;
     } else if (a === '--keep-digests') {
       const raw = argv[++i];
       const n = Number(raw);
@@ -196,23 +218,49 @@ async function main() {
     return names;
   };
 
+  const serializeStale = (s) => ({
+    filename: s.filename,
+    reason: s.reason,
+    matchedSignal: s.matchedSignal ?? undefined,
+    updatedAt: s.updatedAt,
+    expectedHash: s.expectedHash,
+  });
+
   const summarize = (p, archiveStale = false) => ({
     shardDir: shard,
     totalRecords: p.records.length,
     duplicates: p.duplicates.map((d) => ({ keep: d.keep, archive: d.archive })),
     nearDuplicates: p.nearDuplicates,
-    staleCandidates: p.staleCandidates.map((s) => ({
-      filename: s.filename,
-      reason: s.reason,
-      matchedSignal: s.matchedSignal ?? undefined,
-      updatedAt: s.updatedAt,
-    })),
+    staleCandidates: p.staleCandidates.map(serializeStale),
+    staleFingerprint: staleSetFingerprint(p.staleCandidates),
     digests: p.digests,
     archiveCount: uniqueArchiveFilenames(p, archiveStale).size,
   });
 
   if (opts.dryRun) {
     const summary = summarize(plan, opts.archiveStale);
+    if (opts.writePlan) {
+      const planPath = path.resolve(opts.writePlan);
+      await fs.writeFile(
+        planPath,
+        JSON.stringify(
+          {
+            version: 1,
+            shardDir: shard,
+            keepDigests: opts.keepDigests,
+            archiveStale: opts.archiveStale,
+            staleFingerprint: summary.staleFingerprint,
+            staleCandidates: summary.staleCandidates,
+          },
+          null,
+          2,
+        ) + '\n',
+        'utf8',
+      );
+      if (!opts.json) {
+        process.stdout.write(`已写入审阅计划: ${planPath}\n`);
+      }
+    }
     if (!opts.json) {
       const staleSignal = summary.staleCandidates.filter((s) => s.reason === 'signal');
       const staleWeak = summary.staleCandidates.filter((s) => s.reason === 'weak-signal');
@@ -279,9 +327,64 @@ async function main() {
     }
   }
 
+  // --apply --archive-stale 必须绑 dry-run 审阅集, 不得 live 重扫后把新 stale
+  // 一并归档 (Codex P1 on #2561: apply must bind to the reviewed dry-run set)。
+  let extraLive = [];
+  let archiveStale = opts.archiveStale;
+  let boundFingerprint = null;
+  if (opts.fromPlan) {
+    let parsed;
+    try {
+      const raw = JSON.parse(await fs.readFile(path.resolve(opts.fromPlan), 'utf8'));
+      parsed = parseReviewedStalePlan(raw);
+    } catch (e) {
+      process.stderr.write(`--from-plan 无效: ${e?.message ?? e}\n`);
+      process.exit(2);
+    }
+    if (parsed.shardDir && path.resolve(parsed.shardDir) !== shard) {
+      process.stderr.write(
+        `--from-plan 的 shardDir 与 --shard 不一致:\n  plan: ${parsed.shardDir}\n  shard: ${shard}\n`,
+      );
+      process.exit(2);
+    }
+    extraLive = bindReviewedStaleCandidates(plan, parsed.staleCandidates).extraLive;
+    boundFingerprint = parsed.staleFingerprint;
+    // 审阅文件带 archiveStale, 或 CLI 显式 --archive-stale, 才归档该审阅集。
+    archiveStale = opts.archiveStale || parsed.archiveStale;
+  } else if (archiveStale) {
+    process.stderr.write(
+      '--apply --archive-stale 必须提供 --from-plan <dry-run --write-plan 文件>。\n' +
+        '  apply 不得重新扫描终态候选; 新命中须重新 dry-run 审阅后再 apply。\n',
+    );
+    process.exit(2);
+  }
+
+  if (opts.staleSetHash) {
+    const expected = boundFingerprint ?? staleSetFingerprint(plan.staleCandidates);
+    if (opts.staleSetHash !== expected) {
+      process.stderr.write(
+        `--stale-set-hash 与审阅终态集不一致:\n  expected: ${opts.staleSetHash}\n  bound: ${expected}\n` +
+          '  请重新 --dry-run 审阅, 或传入 RESULT.staleFingerprint。\n',
+      );
+      process.exit(2);
+    }
+  }
+  if (archiveStale && extraLive.length > 0 && !opts.confirmStaleDiff) {
+    process.stderr.write(
+      `live 扫描比审阅集多出 ${extraLive.length} 条终态候选, 拒绝归档以免删未审阅分片:\n`,
+    );
+    for (const c of extraLive) {
+      process.stderr.write(`  - ${c.filename} (${c.reason}${c.matchedSignal ? ` "${c.matchedSignal}"` : ''})\n`);
+    }
+    process.stderr.write(
+      '请重新 --dry-run 审阅, 或显式 --confirm-stale-diff 只归档审阅集、跳过上述新命中。\n',
+    );
+    process.exit(6);
+  }
+
   const result = await runMemoryCleanup(plan, {
     ...(opts.backupDir ? { backupRoot: path.resolve(opts.backupDir) } : {}),
-    archiveStale: opts.archiveStale,
+    archiveStale,
   });
 
   if (!opts.json) {
@@ -296,7 +399,9 @@ async function main() {
   process.stdout.write(
     `RESULT ${JSON.stringify({
       mode: 'apply',
-      archiveStale: opts.archiveStale,
+      archiveStale,
+      staleFingerprint: boundFingerprint,
+      skippedUnreviewedStale: extraLive.map((c) => c.filename),
       archived: result.archived,
       failed: result.failed,
       indexRebuildError: result.indexRebuildError ?? null,
