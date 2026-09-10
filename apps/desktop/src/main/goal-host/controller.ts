@@ -894,7 +894,10 @@ export class GoalController {
       );
       return;
     }
-    if (target?.auditFinalized === false) {
+    // 快终态可在 send resolve 前就把 auditFinalized 置位;acceptance 仍 pending
+    // 时不能发 unstamped closeout,一律挂起等 accepted/rejected
+    // (Codex #2107 P1: park closeouts whenever dispatch acceptance is pending)。
+    if (target?.dispatchAcceptance === 'pending' || target?.auditFinalized === false) {
       this.enqueueTakeoverCloseout(target, closeout);
       return;
     }
