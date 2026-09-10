@@ -103,10 +103,13 @@ describe('稳定层:能力必须写进提示词', () => {
     expect(all).toContain('不要在普通一轮里默认记');
     expect(all).toContain('流程已验证且明显可复用');
     expect(all).toContain('已验证且明显可复用');
-    expect(all).toContain('不要等他重复第二次');
-    expect(all).toContain('确认它足够具体且不是临时状态');
+    expect(all).toContain('用户明确要求记住');
+    expect(all).toContain('同一偏好、纠正或长期背景稳定重复出现');
+    expect(all).toContain('不要把一次性表达当成长期记忆');
     expect(all).toContain('拿不准是否长期有效时只问一句');
-    expect(all).not.toContain('同一条稳定偏好/纠正再次出现');
+    expect(all).not.toContain('不要等他重复第二次');
+    expect(all).not.toContain('第一次明确说出');
+    expect(all).not.toContain('就主动记下');
     expect(all).not.toContain('一次性确认的约定本身不触发写入');
     expect(all).not.toContain('询问本身不能扩权');
     expect(all).not.toContain('一条长期有效的约定已经在真实对话里被确认');
