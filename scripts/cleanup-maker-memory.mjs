@@ -75,6 +75,9 @@ const HELP = `cleanup-maker-memory — 分片内清理 (P0.5, #2379)
   node --import tsx scripts/cleanup-maker-memory.mjs --shard "%APPDATA%/cindy/maker-memory/E--repo" --dry-run --archive-stale --write-plan plan.json
   node --import tsx scripts/cleanup-maker-memory.mjs --shard "%APPDATA%/cindy/maker-memory/E--repo" --apply --from-plan plan.json
   node --import tsx scripts/cleanup-maker-memory.mjs --shard "%APPDATA%/cindy/maker-memory/E--repo" --apply --keep-digests 1
+
+  --apply --from-plan 使用审阅文件里的 keepDigests (dry-run --keep-digests N 写入),
+  CLI 省略 --keep-digests 时不得回落到默认 2。
 `;
 
 function parseArgs(argv) {
@@ -201,9 +204,53 @@ async function main() {
     process.exit(2);
   }
 
+  // --from-plan 必须在 planMemoryCleanup 之前读入: dry-run 写入的 keepDigests
+  // 是审阅过的保留窗口, apply 省略 CLI flag 时不得回落到默认 2
+  // (Codex P1 on #2561: Honor the reviewed digest retention setting)。
+  /** @type {import('../packages/maker-core/src/memory/cleanup.ts').ReviewedStalePlanFile | null} */
+  let reviewedPlan = null;
+  if (opts.fromPlan) {
+    if (opts.dryRun) {
+      process.stderr.write('--from-plan 仅用于 --apply, dry-run 请用 --write-plan。\n');
+      process.exit(2);
+    }
+    try {
+      const raw = JSON.parse(await fs.readFile(path.resolve(opts.fromPlan), 'utf8'));
+      reviewedPlan = parseReviewedStalePlan(raw);
+    } catch (e) {
+      process.stderr.write(`--from-plan 无效: ${e?.message ?? e}\n`);
+      process.exit(2);
+    }
+    if (reviewedPlan.shardDir && path.resolve(reviewedPlan.shardDir) !== shard) {
+      process.stderr.write(
+        `--from-plan 的 shardDir 与 --shard 不一致:\n  plan: ${reviewedPlan.shardDir}\n  shard: ${shard}\n`,
+      );
+      process.exit(2);
+    }
+  }
+
+  const keepDigests =
+    opts.keepDigests !== null
+      ? opts.keepDigests
+      : reviewedPlan && typeof reviewedPlan.keepDigests === 'number'
+        ? reviewedPlan.keepDigests
+        : null;
+  if (
+    opts.keepDigests !== null &&
+    reviewedPlan &&
+    typeof reviewedPlan.keepDigests === 'number' &&
+    opts.keepDigests !== reviewedPlan.keepDigests
+  ) {
+    process.stderr.write(
+      `--keep-digests ${opts.keepDigests} 与 --from-plan 审阅值 ${reviewedPlan.keepDigests} 不一致, 拒绝 apply。\n` +
+        '  请使用审阅过的值, 或重新 --dry-run --keep-digests 后再 --from-plan。\n',
+    );
+    process.exit(2);
+  }
+
   const plan = await planMemoryCleanup(shard, {
     // 注意: keepDigests 为 0 是合法值 (全清 digest), 用 !== null 而非 truthy。
-    ...(opts.keepDigests !== null ? { keepDigests: opts.keepDigests } : {}),
+    ...(keepDigests !== null ? { keepDigests } : {}),
   });
 
   // --archive-stale 时 apply 会把全部 staleCandidates 加入归档 — dry-run
@@ -248,7 +295,7 @@ async function main() {
           {
             version: 1,
             shardDir: shard,
-            keepDigests: opts.keepDigests,
+            keepDigests: keepDigests ?? 2,
             archiveStale: opts.archiveStale,
             staleFingerprint: summary.staleFingerprint,
             staleCandidates: summary.staleCandidates,
@@ -333,25 +380,11 @@ async function main() {
   let extraLive = [];
   let archiveStale = opts.archiveStale;
   let boundFingerprint = null;
-  if (opts.fromPlan) {
-    let parsed;
-    try {
-      const raw = JSON.parse(await fs.readFile(path.resolve(opts.fromPlan), 'utf8'));
-      parsed = parseReviewedStalePlan(raw);
-    } catch (e) {
-      process.stderr.write(`--from-plan 无效: ${e?.message ?? e}\n`);
-      process.exit(2);
-    }
-    if (parsed.shardDir && path.resolve(parsed.shardDir) !== shard) {
-      process.stderr.write(
-        `--from-plan 的 shardDir 与 --shard 不一致:\n  plan: ${parsed.shardDir}\n  shard: ${shard}\n`,
-      );
-      process.exit(2);
-    }
-    extraLive = bindReviewedStaleCandidates(plan, parsed.staleCandidates).extraLive;
-    boundFingerprint = parsed.staleFingerprint;
+  if (reviewedPlan) {
+    extraLive = bindReviewedStaleCandidates(plan, reviewedPlan.staleCandidates).extraLive;
+    boundFingerprint = reviewedPlan.staleFingerprint;
     // 审阅文件带 archiveStale, 或 CLI 显式 --archive-stale, 才归档该审阅集。
-    archiveStale = opts.archiveStale || parsed.archiveStale;
+    archiveStale = opts.archiveStale || reviewedPlan.archiveStale;
   } else if (archiveStale) {
     process.stderr.write(
       '--apply --archive-stale 必须提供 --from-plan <dry-run --write-plan 文件>。\n' +

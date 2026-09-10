@@ -35,7 +35,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
-import { MemoryStorage } from './storage.js';
+import { MemoryStorage, parseFilename } from './storage.js';
 import type { MemoryRecord } from './types.js';
 
 /** 归档子目录名 — 退出 storage.list()/MEMORY.md/FTS 正常路径的可逆软删除区。 */
@@ -191,6 +191,26 @@ export interface CleanupRunOptions {
    * 一并归档。
    */
   archiveStale?: boolean;
+}
+
+/**
+ * 审阅计划里的分片文件名必须是本 shard 的 basename:
+ * `<type>_<slug>.md`, 不得含分隔符/穿越/绝对路径
+ * (Codex P1 on #2561: Reject unsafe filenames in reviewed plans)。
+ */
+export function assertSafeReviewedFilename(filename: string): void {
+  if (typeof filename !== 'string' || filename.length === 0) {
+    throw new Error('reviewed stale candidate missing filename');
+  }
+  if (filename !== path.basename(filename) || filename !== path.posix.basename(filename)) {
+    throw new Error(`reviewed plan filename is not a shard basename: ${filename}`);
+  }
+  if (/[\\/]/.test(filename) || filename.includes('\0') || filename.includes('..')) {
+    throw new Error(`reviewed plan filename is not a shard basename: ${filename}`);
+  }
+  if (!parseFilename(filename)) {
+    throw new Error(`reviewed plan filename is not a canonical shard name: ${filename}`);
+  }
 }
 
 /** dry-run 审阅过的终态候选 (filename + expectedHash) — apply 绑定集合用。 */
@@ -471,6 +491,7 @@ export function parseReviewedStalePlan(raw: unknown): ReviewedStalePlanFile {
     if (typeof c.filename !== 'string' || c.filename.length === 0) {
       throw new Error('reviewed stale candidate missing filename');
     }
+    assertSafeReviewedFilename(c.filename);
     if (c.expectedHash !== null && typeof c.expectedHash !== 'string') {
       throw new Error(`reviewed stale candidate ${c.filename} has invalid expectedHash`);
     }

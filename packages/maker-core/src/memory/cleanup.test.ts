@@ -1248,15 +1248,15 @@ describe('bindReviewedStaleCandidates (Codex P1 on #2561 apply vs dry-run)', () 
       parseReviewedStalePlan({
         version: 1,
         staleFingerprint: 'deadbeef',
-        staleCandidates: [{ filename: 'a.md', expectedHash: 'abc' }],
+        staleCandidates: [{ filename: 'project_a.md', expectedHash: 'abc' }],
       }),
     ).toThrow(/staleFingerprint/);
   });
 
   it('round-trips fingerprint through parseReviewedStalePlan', () => {
     const staleCandidates = [
-      { filename: 'b.md', expectedHash: 'bbb' },
-      { filename: 'a.md', expectedHash: 'aaa' },
+      { filename: 'project_b.md', expectedHash: 'bbb' },
+      { filename: 'project_a.md', expectedHash: 'aaa' },
     ];
     const staleFingerprint = staleSetFingerprint(staleCandidates);
     const parsed = parseReviewedStalePlan({
@@ -1267,6 +1267,31 @@ describe('bindReviewedStaleCandidates (Codex P1 on #2561 apply vs dry-run)', () 
       staleCandidates,
     });
     expect(parsed.staleFingerprint).toBe(staleFingerprint);
-    expect(parsed.staleCandidates.map((c) => c.filename)).toEqual(['b.md', 'a.md']);
+    expect(parsed.staleCandidates.map((c) => c.filename)).toEqual([
+      'project_b.md',
+      'project_a.md',
+    ]);
+  });
+
+  it('rejects traversal and non-canonical filenames in reviewed plans', () => {
+    const bad = [
+      '../other-shard/project_x.md',
+      '..\\other-shard\\project_x.md',
+      '/tmp/project_x.md',
+      'C:\\tmp\\project_x.md',
+      'subdir/project_x.md',
+      'MEMORY.md',
+      'a.md',
+      'project_x.md.txt',
+    ];
+    for (const filename of bad) {
+      expect(() =>
+        parseReviewedStalePlan({
+          version: 1,
+          staleFingerprint: staleSetFingerprint([{ filename, expectedHash: 'abc' }]),
+          staleCandidates: [{ filename, expectedHash: 'abc' }],
+        }),
+      ).toThrow(/basename|canonical/);
+    }
   });
 });

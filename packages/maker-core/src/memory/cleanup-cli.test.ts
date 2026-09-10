@@ -141,6 +141,58 @@ describe('cleanup-maker-memory CLI stale binding', () => {
     await expect(readFile(path.join(dir, 'project_later.md'), 'utf8')).resolves.toContain('已结束');
     await expect(readFile(path.join(dir, 'project_done.md'), 'utf8')).rejects.toThrow();
   });
+
+  it('apply --from-plan uses reviewed keep-digests instead of the default 2', async () => {
+    await shard('digest_a.md', 'digest', 'A', 'hook', 'a', '2026-01-01T00:00:00.000Z');
+    await shard('digest_b.md', 'digest', 'B', 'hook', 'b', '2026-02-01T00:00:00.000Z');
+    await shard('digest_c.md', 'digest', 'C', 'hook', 'c', '2026-03-01T00:00:00.000Z');
+    await shard('digest_d.md', 'digest', 'D', 'hook', 'd', '2026-04-01T00:00:00.000Z');
+    await shard('digest_e.md', 'digest', 'E', 'hook', 'e', '2026-05-01T00:00:00.000Z');
+    const planPath = path.join(dir, 'digest-plan.json');
+    const dry = await runCli([
+      '--shard',
+      dir,
+      '--dry-run',
+      '--keep-digests',
+      '5',
+      '--write-plan',
+      planPath,
+      '--json',
+    ]);
+    expect(dry.code).toBe(0);
+    const written = JSON.parse(await readFile(planPath, 'utf8')) as { keepDigests: number };
+    expect(written.keepDigests).toBe(5);
+    const dryJson = resultJson(dry.stdout);
+    const digests = dryJson.digests as { keep: string[]; archive: string[] };
+    expect(digests.keep).toHaveLength(5);
+    expect(digests.archive).toHaveLength(0);
+
+    const applied = await runCli(['--shard', dir, '--apply', '--from-plan', planPath, '--force', '--json']);
+    expect(applied.code).toBe(0);
+    for (const name of ['digest_a.md', 'digest_b.md', 'digest_c.md', 'digest_d.md', 'digest_e.md']) {
+      await expect(readFile(path.join(dir, name), 'utf8')).resolves.toBeTruthy();
+    }
+  });
+
+  it('rejects --from-plan filenames that escape the shard', async () => {
+    const planPath = path.join(dir, 'bad-plan.json');
+    const filename = '../other-shard/project_x.md';
+    await writeFile(
+      planPath,
+      JSON.stringify({
+        version: 1,
+        shardDir: dir,
+        keepDigests: 2,
+        archiveStale: true,
+        staleFingerprint: '00',
+        staleCandidates: [{ filename, expectedHash: 'abc' }],
+      }),
+      'utf8',
+    );
+    const r = await runCli(['--shard', dir, '--apply', '--from-plan', planPath, '--force', '--json']);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toMatch(/basename|canonical|--from-plan/);
+  });
 });
 
 describe('normalizeProcessComm (Codex P1 macOS ps paths)', () => {
