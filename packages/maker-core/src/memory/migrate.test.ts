@@ -737,6 +737,61 @@ describe('runLegacyShardMigration — 执行', () => {
     expect(normalizeWindowsLocalScopeKey('C:')).toBe('C:');
   });
 
+  it('absPath 含父目录段 /.. → skipped, 不迁出 memoryRoot (Codex 3974301309)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const worktree = path.join(tmpRoot, 'repo-wt');
+    const wtDir = sanitizeWorkdir(worktree);
+    await makeShard(wtDir, { absPath: worktree, files: { 'feedback_a.md': 'X' } });
+    await makeShard('dotdot-root', { absPath: '/..', files: { 'feedback_a.md': 'pwn' } });
+    await makeShard('dotdot-mid', { absPath: '/tmp/../etc', files: { 'feedback_a.md': 'pwn' } });
+    await makeShard('dotdot-win', { absPath: 'C:/repo/../Windows', files: { 'feedback_a.md': 'pwn' } });
+    await makeShard('dotdot-enc', {
+      absPath: '/%2e%2e/etc',
+      files: { 'feedback_a.md': 'pwn' },
+    });
+
+    const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+    expect(plan.skipped.find((s) => s.dir.endsWith('dotdot-root'))?.skipReason).toBe(
+      'parent-dir-traversal',
+    );
+    expect(plan.skipped.find((s) => s.dir.endsWith('dotdot-mid'))?.skipReason).toBe(
+      'parent-dir-traversal',
+    );
+    expect(plan.skipped.find((s) => s.dir.endsWith('dotdot-win'))?.skipReason).toBe(
+      'parent-dir-traversal',
+    );
+    expect(plan.skipped.find((s) => s.dir.endsWith('dotdot-enc'))?.skipReason).toBe(
+      'parent-dir-traversal',
+    );
+    expect(plan.mergeCandidates).toHaveLength(1);
+    expect(plan.mergeCandidates[0].dir.endsWith(wtDir)).toBe(true);
+    expect(plan.emptyToDelete).toHaveLength(0);
+    const result = await runLegacyShardMigration(plan);
+    expect(result.results.every((r) => r.shard.dir.endsWith(wtDir) || r.action === 'skipped')).toBe(
+      true,
+    );
+    expect(await fs.readFile(path.join(memoryRoot, 'dotdot-root', 'feedback_a.md'), 'utf8')).toContain(
+      'pwn',
+    );
+  });
+
+  it('过期 plan 的 canonicalDirName=.. → apply 拒绝 (Codex 3974301309)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const worktree = path.join(tmpRoot, 'repo-wt');
+    const wtDir = sanitizeWorkdir(worktree);
+    const dir = await makeShard(wtDir, { absPath: worktree, files: { 'feedback_a.md': 'X' } });
+    const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+    expect(plan.mergeCandidates).toHaveLength(1);
+    plan.mergeCandidates[0].canonicalDirName = '..';
+    plan.mergeCandidates[0].canonicalScopeKey = '/..';
+    const result = await runLegacyShardMigration(plan);
+    expect(result.results).toHaveLength(1);
+    expect(result.results[0].action).toBe('skipped');
+    expect(result.results[0].error).toBe('parent-dir-traversal');
+    expect(await fs.readFile(path.join(dir, 'feedback_a.md'), 'utf8')).toContain('X');
+    expect(summarizeApplyMigration(plan, result).ok).toBe(false);
+  });
+
   it('相对盘符 C:foo / 裸 C: 规划阶段 skipped (Codex 第十九轮 / 3972854297)', async () => {
     const mainRepo = path.join(tmpRoot, 'repo');
     const worktree = path.join(tmpRoot, 'repo-wt');

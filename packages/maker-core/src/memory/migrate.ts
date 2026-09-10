@@ -277,6 +277,12 @@ export async function planLegacyShardMigration(
       plan.skipped.push(await buildSkippedInfo(dir, entry, 'relative-absPath', rawAbs));
       continue;
     }
+    // `/..` 仍是绝对路径, 但 memoryScopeDirName('/..') === '..',
+    // path.join(memoryRoot, '..') 会写到根外 (Codex #2519 3974301309)。
+    if (hasParentDirTraversal(rawAbs)) {
+      plan.skipped.push(await buildSkippedInfo(dir, entry, 'parent-dir-traversal', rawAbs));
+      continue;
+    }
 
     let canonicalScopeKey: string;
     try {
@@ -325,6 +331,15 @@ export async function planLegacyShardMigration(
       }
     }
     const canonicalDirName = memoryScopeDirName(canonicalScopeKey);
+    if (
+      hasParentDirTraversal(canonicalScopeKey) ||
+      isUnsafeMigrationTargetDirName(canonicalDirName)
+    ) {
+      plan.skipped.push(
+        await buildSkippedInfo(dir, entry, 'parent-dir-traversal', canonicalScopeKey),
+      );
+      continue;
+    }
     const isLegacy = canonicalDirName !== entry;
 
     const info: LegacyShardInfo = {
@@ -385,6 +400,38 @@ function isAbsoluteLocalPath(p: string): boolean {
   if (/^[A-Za-z]:\//.test(p)) return true;
   if (p.startsWith('//') && p.length > 2) return true;
   return false;
+}
+
+/** 反复 decodeURIComponent, 挡住 `%2e%2e` / `%252e%252e` 绕过。 */
+function decodePathForTraversalCheck(p: string): string {
+  let cur = p;
+  for (let i = 0; i < 3; i += 1) {
+    try {
+      const next = decodeURIComponent(cur.replace(/\+/g, ' '));
+      if (next === cur) break;
+      cur = next;
+    } catch {
+      break;
+    }
+  }
+  return cur;
+}
+
+function pathHasParentDirSegment(p: string): boolean {
+  const segs = p.replace(/\\/g, '/').split('/');
+  return segs.some((s) => s === '..');
+}
+
+/** 元数据/canonical 路径含父目录段 (含编码绕过)。 */
+function hasParentDirTraversal(p: string): boolean {
+  return pathHasParentDirSegment(p) || pathHasParentDirSegment(decodePathForTraversalCheck(p));
+}
+
+/** path.join(memoryRoot, name) 不得逃出根: `.` / `..` / 空 / 含分隔符。 */
+function isUnsafeMigrationTargetDirName(name: string): boolean {
+  if (!name || name === '.' || name === '..') return true;
+  if (name.includes('/') || name.includes('\\')) return true;
+  return pathHasParentDirSegment(name);
 }
 
 function errnoCode(e: unknown): string {
@@ -558,6 +605,15 @@ export async function runLegacyShardMigration(
       if (await isSymlinkShardDir(shard.dir)) {
         r.action = 'skipped';
         r.error = 'symlink-shard';
+        result.results.push(r);
+        continue;
+      }
+      if (
+        hasParentDirTraversal(shard.canonicalScopeKey) ||
+        isUnsafeMigrationTargetDirName(shard.canonicalDirName)
+      ) {
+        r.action = 'skipped';
+        r.error = 'parent-dir-traversal';
         result.results.push(r);
         continue;
       }
