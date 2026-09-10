@@ -82,7 +82,7 @@ export interface LegacyShardMigrationPlan {
   emptyToDelete: LegacyShardInfo[];
   /** 有内容需合并的 legacy 分片。 */
   mergeCandidates: LegacyShardInfo[];
-  /** 无 meta.json / SSH / 相对 absPath 等不处理的分片。 */
+  /** 无 meta.json / SSH / 相对 absPath / symlink 分片目录等不处理的分片。 */
   skipped: LegacyShardInfo[];
   /** 活 worktree 解析失败等需 surface 的分片 (不 abort 整份计划)。 */
   failed: LegacyShardInfo[];
@@ -133,6 +133,15 @@ export interface ApplyMigrationSummary {
   executionErrors: Array<{ dir: string; action: ShardMigrationResult['action']; error: string }>;
   /** 无解析失败、无执行期错误、无未解决冲突时为 true (Codex 3971991063)。 */
   ok: boolean;
+}
+
+/** 规划/执行都不跟随 symlink 分片目录 (Codex #2519 3974113763)。 */
+async function isSymlinkShardDir(dir: string): Promise<boolean> {
+  try {
+    return (await fs.lstat(dir)).isSymbolicLink();
+  } catch {
+    return false;
+  }
 }
 
 function isExecutionFailure(r: ShardMigrationResult): boolean {
@@ -211,13 +220,20 @@ export async function planLegacyShardMigration(
 
   for (const entry of entries) {
     const dir = path.join(memoryRoot, entry);
-    let stat;
+    let lstat;
     try {
-      stat = await fs.stat(dir);
+      lstat = await fs.lstat(dir);
     } catch {
       continue;
     }
-    if (!stat.isDirectory()) continue;
+    // 不跟随 symlink 分片目录: rename/updateMeta/dropStaleFts 会改到根外
+    // (Codex #2519 3974113763)。与 copyLegacyMemoryShardsSync 的 lstatSync
+    // 同款。junction 在 win32 也是 isSymbolicLink。
+    if (lstat.isSymbolicLink()) {
+      plan.skipped.push(await buildSkippedInfo(dir, entry, 'symlink-shard'));
+      continue;
+    }
+    if (!lstat.isDirectory()) continue;
 
     let meta: ShardMeta | null = null;
     try {
@@ -488,6 +504,12 @@ export async function runLegacyShardMigration(
   for (const shard of plan.emptyToDelete) {
     const r: ShardMigrationResult = { shard, action: 'removed-empty' };
     try {
+      if (await isSymlinkShardDir(shard.dir)) {
+        r.action = 'skipped';
+        r.error = 'symlink-shard';
+        result.results.push(r);
+        continue;
+      }
       // 竞态防御 (Greptile on #2519): 计划基于扫描快照, 删除前重新校验目录
       // 仍无任何内容 — 若扫描后新增了分片文件或未识别 .md, 跳过删除并报告,
       // 绝不让过期快照删掉新写入的数据。rename-then-remove 把复查与删除之间
@@ -533,6 +555,12 @@ export async function runLegacyShardMigration(
   for (const shard of plan.mergeCandidates) {
     const r: ShardMigrationResult = { shard, action: 'merged', mergedFiles: [] };
     try {
+      if (await isSymlinkShardDir(shard.dir)) {
+        r.action = 'skipped';
+        r.error = 'symlink-shard';
+        result.results.push(r);
+        continue;
+      }
       const targetDir = path.join(path.dirname(shard.dir), shard.canonicalDirName);
       const targetExists = await dirExists(targetDir);
 

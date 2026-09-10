@@ -187,6 +187,61 @@ describe('planLegacyShardMigration — 计划生成', () => {
     expect(plan.all[0].isLegacy).toBe(false); // 本地路径, resolver 回落自身 → 非 legacy
   });
 
+  it('symlink 分片目录 → skipped, 不跟随目标 (Codex 3974113763)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const worktree = path.join(tmpRoot, 'repo-wt');
+    const realDir = await makeShard('real-outside', {
+      absPath: worktree,
+      files: { 'feedback_a.md': 'secret' },
+    });
+    // 把真实分片移出 memoryRoot, 在根内放同名 symlink — 跟随则会当 legacy 迁走。
+    const outside = path.join(tmpRoot, 'outside-real');
+    await fs.rename(realDir, outside);
+    const linkName = sanitizeWorkdir(worktree);
+    const linkDir = path.join(memoryRoot, linkName);
+    try {
+      await fs.symlink(outside, linkDir, 'dir');
+    } catch {
+      // Windows 无 privilege / 不支持目录 symlink 时本用例无法构造, 直接返回。
+      return;
+    }
+    const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+    expect(plan.skipped.find((s) => s.dir === linkDir)?.skipReason).toBe('symlink-shard');
+    expect(plan.mergeCandidates).toHaveLength(0);
+    expect(plan.emptyToDelete).toHaveLength(0);
+    expect(plan.all).toHaveLength(0);
+    const apply = await runLegacyShardMigration(plan);
+    expect(apply.results).toHaveLength(0);
+    expect((await fs.lstat(linkDir)).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(path.join(outside, 'feedback_a.md'), 'utf8')).toContain('secret');
+  });
+
+  it('过期 plan 把 symlink 当分片 → apply 仍拒绝 rename (Codex 3974113763)', async () => {
+    const mainRepo = path.join(tmpRoot, 'repo');
+    const worktree = path.join(tmpRoot, 'repo-wt');
+    const realDir = await makeShard(sanitizeWorkdir(worktree), {
+      absPath: worktree,
+      files: { 'feedback_a.md': 'secret' },
+    });
+    const plan = await planLegacyShardMigration(memoryRoot, fakeResolver(mainRepo, worktree));
+    expect(plan.mergeCandidates).toHaveLength(1);
+    const outside = path.join(tmpRoot, 'outside-stale');
+    await fs.rename(realDir, outside);
+    try {
+      await fs.symlink(outside, realDir, 'dir');
+    } catch {
+      return;
+    }
+    const result = await runLegacyShardMigration(plan);
+    expect(result.results).toHaveLength(1);
+    expect(result.results[0].action).toBe('skipped');
+    expect(result.results[0].error).toBe('symlink-shard');
+    expect((await fs.lstat(realDir)).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(path.join(outside, 'feedback_a.md'), 'utf8')).toContain('secret');
+    const summary = summarizeApplyMigration(plan, result);
+    expect(summary.ok).toBe(false);
+  });
+
   it('无 meta.json 的目录 → skipped (不猜不删)', async () => {
     const orphan = path.join(memoryRoot, 'orphan-dir');
     await fs.mkdir(orphan, { recursive: true });
