@@ -28,6 +28,7 @@
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 import process from 'node:process';
+import { pathToFileURL } from 'node:url';
 
 // tsx 运行本脚本, 直接 import maker-core 源码 (同 migrate-maker-memory.mjs)。
 import {
@@ -432,36 +433,45 @@ async function main() {
  * MakerMemoryStore 与 SQLite 句柄时不应并发。
  * 检测工具缺失 / 权限拒绝 / 查询失败 → status=unknown, 调用方必须拒绝执行
  * 并要求 --force, 不得 fail-open (Codex P2 on #2561)。
+ * macOS `ps -eo comm` 给出可执行路径, 匹配前先收成 basename。
  */
-async function detectHost() {
+const HOST_COMM_BASENAMES = new Set(['cindy', 'cindydev', 'desktop', 'electron']);
+
+/**
+ * 把 `ps -eo comm` / 路径型 comm 收成 basename。
+ * macOS 上 comm 常是 `/Applications/Cindy.app/Contents/MacOS/Cindy`, 不是 `cindy`
+ * (Codex P1 on #2561: Normalize macOS ps command paths before matching)。
+ */
+export function normalizeProcessComm(comm) {
+  const raw = String(comm ?? '')
+    .trim()
+    .replace(/^["']+|['"]+$/g, '')
+    .replace(/\0/g, '');
+  if (!raw) return '';
+  const segs = raw.split(/[/\\]/).filter(Boolean);
+  const base = segs[segs.length - 1] ?? raw;
+  return base.toLowerCase().replace(/\.exe$/i, '');
+}
+
+export function isCindyHostComm(comm) {
+  return HOST_COMM_BASENAMES.has(normalizeProcessComm(comm));
+}
+
+export async function detectHost() {
   try {
     const { execFile } = await import('node:child_process');
     const { promisify } = await import('node:util');
     const run = promisify(execFile);
-    let out = '';
     if (process.platform === 'win32') {
       const r = await run('tasklist', ['/FO', 'CSV', '/NH']);
-      out = r.stdout;
-      const names = new Set(out.toLowerCase().match(/"?[a-z0-9_.\- ]+\.exe"?/g) ?? []);
+      const names = new Set(r.stdout.toLowerCase().match(/"?[a-z0-9_.\- ]+\.exe"?/g) ?? []);
       const running = ['cindy.exe', 'cindydev.exe', 'desktop.exe', 'electron.exe'].some((p) =>
         names.has(`"${p}"`),
       );
       return { status: 'ok', running };
     }
     const r = await run('ps', ['-eo', 'comm']);
-    out = r.stdout;
-    const commNames = new Set(
-      out
-        .toLowerCase()
-        .split('\n')
-        .map((s) => s.trim())
-        .filter(Boolean),
-    );
-    const running =
-      commNames.has('cindy') ||
-      commNames.has('cindydev') ||
-      commNames.has('desktop') ||
-      commNames.has('electron');
+    const running = r.stdout.split(/\r?\n/).some((line) => isCindyHostComm(line));
     return { status: 'ok', running };
   } catch (e) {
     const err = /** @type {NodeJS.ErrnoException} */ (e);
@@ -470,7 +480,19 @@ async function detectHost() {
   }
 }
 
-main().catch((e) => {
-  process.stderr.write(`cleanup-maker-memory failed: ${e?.stack ?? e}\n`);
-  process.exit(1);
-});
+function isCliEntry() {
+  const argvPath = process.argv[1];
+  if (!argvPath) return false;
+  try {
+    return pathToFileURL(path.resolve(argvPath)).href === import.meta.url;
+  } catch {
+    return false;
+  }
+}
+
+if (isCliEntry()) {
+  main().catch((e) => {
+    process.stderr.write(`cleanup-maker-memory failed: ${e?.stack ?? e}\n`);
+    process.exit(1);
+  });
+}

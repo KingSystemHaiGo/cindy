@@ -6,7 +6,7 @@
 import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -140,5 +140,73 @@ describe('cleanup-maker-memory CLI stale binding', () => {
     expect(applyJson.skippedUnreviewedStale).toEqual(['project_later.md']);
     await expect(readFile(path.join(dir, 'project_later.md'), 'utf8')).resolves.toContain('已结束');
     await expect(readFile(path.join(dir, 'project_done.md'), 'utf8')).rejects.toThrow();
+  });
+});
+
+describe('normalizeProcessComm (Codex P1 macOS ps paths)', () => {
+  async function evalHost(script: string): Promise<unknown> {
+    const helper = path.join(dir, 'host-comm-helper.mjs');
+    const src =
+      `import { isCindyHostComm, normalizeProcessComm } from ${JSON.stringify(pathToFileURL(cli).href)};\n` +
+      `const out = ${script};\nprocess.stdout.write(JSON.stringify(out));\n`;
+    await writeFile(helper, src, 'utf8');
+    const r = await new Promise<{ code: number; stdout: string; stderr: string }>((resolve, reject) => {
+      const child = spawn(process.execPath, ['--import', 'tsx', helper], {
+        cwd: repoRoot,
+        env: process.env,
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (b) => {
+        stdout += String(b);
+      });
+      child.stderr.on('data', (b) => {
+        stderr += String(b);
+      });
+      child.on('error', reject);
+      child.on('close', (code) => {
+        resolve({ code: code ?? 1, stdout, stderr });
+      });
+    });
+    if (r.code !== 0) {
+      throw new Error(`host helper eval failed: ${r.stderr || r.stdout}`);
+    }
+    return JSON.parse(r.stdout) as unknown;
+  }
+
+  it('matches packaged macOS bundle executables by basename', async () => {
+    const out = await evalHost(`({
+      base: normalizeProcessComm('/Applications/Cindy.app/Contents/MacOS/Cindy'),
+      cindy: isCindyHostComm('/Applications/Cindy.app/Contents/MacOS/Cindy'),
+      cindydev: isCindyHostComm('/Applications/CindyDev.app/Contents/MacOS/CindyDev'),
+      electron: isCindyHostComm('/Applications/Electron.app/Contents/MacOS/Electron'),
+      packaged: isCindyHostComm('out/Cindy-darwin-arm64/Cindy.app/Contents/MacOS/Cindy'),
+    })`);
+    expect(out).toEqual({
+      base: 'cindy',
+      cindy: true,
+      cindydev: true,
+      electron: true,
+      packaged: true,
+    });
+  });
+
+  it('still matches linux-style bare comm names', async () => {
+    const out = await evalHost(`({
+      cindy: isCindyHostComm('cindy'),
+      electron: isCindyHostComm('electron'),
+      padded: isCindyHostComm('  Cindy  '),
+    })`);
+    expect(out).toEqual({ cindy: true, electron: true, padded: true });
+  });
+
+  it('does not treat unrelated apps as the Cindy host', async () => {
+    const out = await evalHost(`({
+      codex: isCindyHostComm('/Applications/Codex.app/Contents/MacOS/Codex'),
+      python: isCindyHostComm('/usr/bin/python3'),
+      header: isCindyHostComm('COMM'),
+      empty: isCindyHostComm(''),
+    })`);
+    expect(out).toEqual({ codex: false, python: false, header: false, empty: false });
   });
 });
