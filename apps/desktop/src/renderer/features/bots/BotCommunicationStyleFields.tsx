@@ -79,7 +79,7 @@ export function BotCommunicationStyleFields({
           type="button"
           disabled={!hasOverride}
           onClick={restoreDefault}
-          className="h-8 rounded-full px-3 text-12 text-[var(--text-secondary)] hover:bg-[var(--surface-hover)] disabled:opacity-40"
+          className="h-8 rounded-full px-3 text-12 text-[var(--text-secondary)] outline-none hover:bg-[var(--surface-hover)] focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)] disabled:opacity-40"
         >
           {t('bots.profile.style.restoreDefault')}
         </button>

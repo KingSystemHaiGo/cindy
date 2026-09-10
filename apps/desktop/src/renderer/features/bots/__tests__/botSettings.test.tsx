@@ -644,20 +644,20 @@ describe('Bot settings unified autosave', () => {
     expect((screen.getByLabelText('bots.profile.style.bannedPhrases') as HTMLTextAreaElement).value).toBe('');
     expect((screen.getByLabelText('bots.profile.style.languageHabits') as HTMLTextAreaElement).value).toBe('');
     expect(
-      within(screen.getByRole('radiogroup', { name: 'bots.profile.style.tone' })).getByRole('radio', {
-        name: 'bots.profile.style.tones.followDefault',
-      }),
-    ).toHaveAttribute('aria-checked', 'true');
+      within(screen.getByRole('radiogroup', { name: 'bots.profile.style.tone' }))
+        .getByRole('radio', { name: 'bots.profile.style.tones.followDefault' })
+        .getAttribute('aria-checked'),
+    ).toBe('true');
     expect(
-      within(screen.getByRole('radiogroup', { name: 'bots.profile.style.replyLength' })).getByRole('radio', {
-        name: 'bots.profile.style.replyLengths.followDefault',
-      }),
-    ).toHaveAttribute('aria-checked', 'true');
+      within(screen.getByRole('radiogroup', { name: 'bots.profile.style.replyLength' }))
+        .getByRole('radio', { name: 'bots.profile.style.replyLengths.followDefault' })
+        .getAttribute('aria-checked'),
+    ).toBe('true');
     expect(
-      within(screen.getByRole('radiogroup', { name: 'bots.profile.style.emojiDensity' })).getByRole('radio', {
-        name: 'bots.profile.style.emojiDensities.followDefault',
-      }),
-    ).toHaveAttribute('aria-checked', 'true');
+      within(screen.getByRole('radiogroup', { name: 'bots.profile.style.emojiDensity' }))
+        .getByRole('radio', { name: 'bots.profile.style.emojiDensities.followDefault' })
+        .getAttribute('aria-checked'),
+    ).toBe('true');
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
     });
