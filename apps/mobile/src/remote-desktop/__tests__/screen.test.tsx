@@ -46,7 +46,7 @@ const fixture = vi.hoisted(() => ({
   lockSupported: true,
   alert: vi.fn(),
   resetUnlockAttempt: vi.fn(),
-  maybeUnlock: vi.fn(async () => {}),
+  maybeUnlock: vi.fn(async (_beforeAuthentication?: () => Promise<void>) => {}),
   hostPlatform: "darwin" as string | undefined,
   deviceId: "computer",
   getHost: (() => undefined) as () => string | undefined,
@@ -68,6 +68,7 @@ const fixture = vi.hoisted(() => ({
   status: "online",
   appState: null as null | ((state: string) => void),
   crashed: null as null | (() => void),
+  webViewProps: null as null | Record<string, unknown>,
   retryPermissions: null as null | (() => void),
 }));
 vi.mock("react-native", async () => {
@@ -278,6 +279,7 @@ vi.mock("../PermissionGuide", () => ({
 }));
 vi.mock("react-native-webview", () => ({
   WebView: forwardRef((p: any, ref) => {
+    fixture.webViewProps = p;
     fixture.message = p.onMessage;
     fixture.crashed = p.onContentProcessDidTerminate;
     useImperativeHandle(ref, () => ({
@@ -308,11 +310,13 @@ beforeEach(() => {
   fixture.deviceId = "computer";
   fixture.securityAutoUnlock = false;
   fixture.securityBusy = false;
+  fixture.maybeUnlock.mockReset().mockResolvedValue(undefined);
   fixture.themeMode = "light";
   fixture.lockOnExit = false;
   fixture.lockSupported = true;
   fixture.views = {};
   fixture.keyboardListeners = {};
+  fixture.webViewProps = null;
   vi.useFakeTimers();
   fixture.focused = true;
   fixture.status = "online";
@@ -334,6 +338,7 @@ beforeEach(() => {
           lockOnExit: fixture.lockSupported,
           trickleIce: fixture.trickleIce,
           automaticReconnect: true,
+          connectionTakeover: true,
           backgroundViewing: true,
           enabled: true,
           canControl: fixture.canControl,
@@ -377,6 +382,76 @@ const connect = async () => {
 };
 
 describe("remote desktop controls", () => {
+  it("retries an initial capabilities timeout normally on a legacy host", async () => {
+    const original = fixture.invoke.getMockImplementation()!;
+    let attempts = 0;
+    fixture.invoke.mockImplementation(async (...args) => {
+      if (args[2][0].op === "capabilities") {
+        attempts++;
+        if (attempts === 1)
+          throw Object.assign(new Error("timeout"), { code: "INVOKE_TIMEOUT" });
+        return { ...(await original(...args)), automaticReconnect: undefined };
+      }
+      return original(...args);
+    });
+    await connect();
+    await act(async () => vi.advanceTimersByTimeAsync(6000));
+    expect(host.textContent).not.toContain("remoteDesktop.upgrade");
+    expect(requests().filter((request) => request.op === "start")).toEqual([
+      { op: "start", displayId: "display" },
+    ]);
+  });
+  it("keeps the video when a fallback input is rejected because control was released", async () => {
+    await connect();
+    const original = fixture.invoke.getMockImplementation()!;
+    fixture.invoke.mockImplementation((...args) =>
+      args[2][0].op === "input"
+        ? Promise.reject(new Error("DESKTOP_VIEW_ONLY"))
+        : original(...args),
+    );
+    await act(async () => {
+      fixture.message!({
+        nativeEvent: {
+          data: JSON.stringify({
+            type: "input",
+            epoch: "lease",
+            sequence: 1,
+            events: [{ kind: "move", x: 0.5, y: 0.5 }],
+          }),
+        },
+      });
+    });
+    expect(sent()).toContainEqual({ type: "control", enabled: false });
+    expect(requests().filter((r) => r.op === "stop")).toHaveLength(0);
+    expect(requests().filter((r) => r.op === "start")).toHaveLength(1);
+  });
+  it("reflects a host-side input failure as view-only without replacing the video lease", async () => {
+    await connect();
+    const original = fixture.invoke.getMockImplementation()!;
+    fixture.invoke.mockImplementation((...args) =>
+      args[2][0].op === "heartbeat"
+        ? Promise.resolve({ controlling: false })
+        : original(...args),
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(3100));
+    expect(
+      fixture.post.mock.calls.map(([json]) => JSON.parse(json)),
+    ).toContainEqual({ type: "control", enabled: false });
+    expect(requests().filter((r) => r.op === "start")).toHaveLength(1);
+    expect(requests().filter((r) => r.op === "stop")).toHaveLength(0);
+    act(() => button("operations").click());
+    expect(visibleInputHint()).toBe("remoteDesktop.viewOnlyHint");
+  });
+  it("keeps iOS data detection disabled without passing its prop to Android", async () => {
+    await act(async () => {});
+    expect(fixture.webViewProps).toMatchObject({ dataDetectorTypes: "none" });
+
+    fixture.platform = "android";
+    await act(async () => root.render(<RemoteDesktopScreen />));
+
+    expect(fixture.webViewProps).not.toHaveProperty("dataDetectorTypes");
+  });
+
   it("fetches ICE configuration only through native auth and sends sanitized short-term credentials", async () => {
     await connect();
     const iceServers = [
@@ -806,6 +881,99 @@ describe("remote desktop controls", () => {
     expect(requests().filter((r) => r.op === "stop")).toEqual([
       { op: "stop", lease: "lease", lockScreen: true },
     ]);
+  });
+  it.each(["framePresented", "streaming"])(
+    "prepares authentication alongside capture and waits for %s before Face ID",
+    async (firstFrame) => {
+      let finishUnlock!: () => void;
+      const prompt = vi.fn();
+      fixture.maybeUnlock.mockImplementationOnce(
+        async (beforeAuthentication) => {
+          await beforeAuthentication!();
+          prompt();
+          await new Promise<void>((resolve) => {
+            finishUnlock = resolve;
+          });
+        },
+      );
+      await act(async () => {
+        fixture.message!({ nativeEvent: { data: '{"type":"ready"}' } });
+      });
+      expect(requests().filter((r) => r.op === "capabilities")).toHaveLength(1);
+      expect(requests().some((r) => r.op === "start")).toBe(true);
+      expect(sent().some((m) => m.type === "init")).toBe(true);
+      expect(fixture.maybeUnlock).toHaveBeenCalledTimes(1);
+      expect(prompt).not.toHaveBeenCalled();
+
+      await act(async () => {
+        fixture.message!({
+          nativeEvent: {
+            data: JSON.stringify({
+              type: firstFrame,
+              epoch: "lease",
+            }),
+          },
+        });
+      });
+      expect(fixture.maybeUnlock).toHaveBeenCalledTimes(1);
+      expect(prompt).toHaveBeenCalledTimes(1);
+      expect(
+        host.querySelector('[data-testid="remoteDesktop.connectingStatus"]'),
+      ).toBeNull();
+      const stops = requests().filter((r) => r.op === "stop").length;
+      await act(async () => {
+        AppState.currentState = "inactive";
+        fixture.appState!("inactive");
+        fixture.message!({
+          nativeEvent: { data: '{"type":"streaming","epoch":"lease"}' },
+        });
+        fixture.message!({
+          nativeEvent: { data: '{"type":"framePresented","epoch":"lease"}' },
+        });
+        await vi.advanceTimersByTimeAsync(3000);
+      });
+      expect(requests().some((r) => r.op === "heartbeat")).toBe(true);
+      expect(requests().filter((r) => r.op === "stop")).toHaveLength(stops);
+      expect(fixture.maybeUnlock).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        finishUnlock();
+        AppState.currentState = "active";
+        fixture.appState!("active");
+      });
+      expect(requests().filter((r) => r.op === "start")).toHaveLength(1);
+      expect(requests().filter((r) => r.op === "stop")).toHaveLength(stops);
+    },
+  );
+  it("does not unlock for a stale frame or a frame arriving after leaving", async () => {
+    const prompt = vi.fn();
+    let outcome!: Promise<string>;
+    fixture.maybeUnlock.mockImplementationOnce(async (beforeAuthentication) => {
+      outcome = beforeAuthentication!().then(
+        () => {
+          prompt();
+          return "shown";
+        },
+        (error: Error) => error.message,
+      );
+      await outcome;
+    });
+    await act(async () => {
+      fixture.message!({ nativeEvent: { data: '{"type":"ready"}' } });
+      fixture.message!({
+        nativeEvent: { data: '{"type":"framePresented","epoch":"old-lease"}' },
+      });
+    });
+    expect(fixture.maybeUnlock).toHaveBeenCalledTimes(1);
+    expect(prompt).not.toHaveBeenCalled();
+    fixture.focused = false;
+    await act(async () => root.render(<RemoteDesktopScreen />));
+    await act(async () => {
+      fixture.message!({
+        nativeEvent: { data: '{"type":"framePresented","epoch":"lease"}' },
+      });
+    });
+    expect(await outcome).toBe("CREDENTIAL_CANCELLED");
+    expect(prompt).not.toHaveBeenCalled();
   });
   it("places optional unlock under Operation Security without gating the desktop", async () => {
     await connect();
@@ -1527,6 +1695,238 @@ describe("remote desktop controls", () => {
     expect(sent().at(-1)).toEqual({ type: "mode", mode: "touch" });
     expect(requests().filter((r) => r.op === "start")).toHaveLength(1);
   });
+  it("keeps the session and the picture when the host refuses an input batch", async () => {
+    await connect();
+    const original = fixture.invoke.getMockImplementation()!;
+    fixture.invoke.mockImplementation((...args) =>
+      args[2][0].op === "input"
+        ? Promise.reject(new Error("DESKTOP_VIEW_ONLY"))
+        : original(...args),
+    );
+    await act(async () => {
+      fixture.message!({
+        nativeEvent: {
+          data: JSON.stringify({
+            type: "input",
+            epoch: "lease",
+            sequence: 1,
+            events: [{ kind: "button", button: 0, down: true, x: 0.5, y: 0.5 }],
+          }),
+        },
+      });
+    });
+    // The host retracted control: view only, no session rebuild.
+    expect(requests().filter((r) => r.op === "stop")).toHaveLength(0);
+    expect(host.textContent).not.toContain("remoteDesktop.reconnecting");
+    expect(sent()).toContainEqual({ type: "control", enabled: false });
+    act(() => button("operations").click());
+    expect(visibleInputHint()).toBe("remoteDesktop.viewOnlyHint");
+  });
+  it("keeps control and the session when an input reply is lost", async () => {
+    await connect();
+    const original = fixture.invoke.getMockImplementation()!;
+    fixture.invoke.mockImplementation((...args) =>
+      args[2][0].op === "input"
+        ? Promise.reject(Object.assign(new Error("timeout"), { code: "INVOKE_TIMEOUT" }))
+        : original(...args),
+    );
+    await act(async () => {
+      fixture.message!({
+        nativeEvent: {
+          data: JSON.stringify({
+            type: "input",
+            epoch: "lease",
+            sequence: 1,
+            events: [{ kind: "key", code: "KeyA", down: true }],
+          }),
+        },
+      });
+    });
+    // The batch may have been injected: releasing here would drop its key-up.
+    expect(sent()).not.toContainEqual({ type: "control", enabled: false });
+    expect(requests().filter((r) => r.op === "stop")).toHaveLength(0);
+    expect(host.textContent).not.toContain("remoteDesktop.reconnecting");
+  });
+  it("follows the host to view only when its heartbeat stops counting this viewer as controlling", async () => {
+    await connect();
+    const original = fixture.invoke.getMockImplementation()!;
+    fixture.invoke.mockImplementation((...args) =>
+      args[2][0].op === "heartbeat"
+        ? Promise.resolve({ controlling: false })
+        : original(...args),
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(3000));
+    expect(sent()).toContainEqual({ type: "control", enabled: false });
+    expect(requests().filter((r) => r.op === "stop")).toHaveLength(0);
+    expect(host.textContent).not.toContain("remoteDesktop.reconnecting");
+    act(() => button("operations").click());
+    expect(visibleInputHint()).toBe("remoteDesktop.viewOnlyHint");
+  });
+  it("releases a stalled input batch instead of rebuilding the session", async () => {
+    await connect();
+    await act(async () => {
+      fixture.message!({
+        nativeEvent: {
+          data: JSON.stringify({ type: "inputOverflow", epoch: "lease" }),
+        },
+      });
+    });
+    expect(sent()).toContainEqual({ type: "control", enabled: false });
+    // The WebView overflow replaces pending with a release, then this handler
+    // posts control:false which clears that release without flushing it. The
+    // host must still drop control so a held key/button cannot stay down.
+    expect(requests()).toContainEqual({
+      op: "control",
+      lease: "lease",
+      enabled: false,
+    });
+    expect(requests().filter((r) => r.op === "stop")).toHaveLength(0);
+    expect(host.textContent).not.toContain("remoteDesktop.reconnecting");
+  });
+  it("retries a timed-out overflow release when the host still reports control", async () => {
+    await connect();
+    const original = fixture.invoke.getMockImplementation()!;
+    fixture.invoke.mockImplementation((...args) => {
+      const req = args[2][0];
+      if (req.op === "control" && req.enabled === false)
+        return Promise.reject(
+          Object.assign(new Error("timeout"), { code: "INVOKE_TIMEOUT" }),
+        );
+      if (req.op === "heartbeat")
+        return Promise.resolve({ controlling: true });
+      return original(...args);
+    });
+    await act(async () => {
+      fixture.message!({
+        nativeEvent: {
+          data: JSON.stringify({ type: "inputOverflow", epoch: "lease" }),
+        },
+      });
+    });
+    const released = requests().filter(
+      (r) => r.op === "control" && r.enabled === false,
+    );
+    expect(released).toHaveLength(1);
+    expect(sent()).toContainEqual({ type: "control", enabled: false });
+    await act(async () => vi.advanceTimersByTimeAsync(3000));
+    // Local view-only is not proof the host dropped control; retry the release
+    // so a held key cannot stay down behind a view-only phone.
+    expect(
+      requests().filter((r) => r.op === "control" && r.enabled === false),
+    ).toHaveLength(2);
+    expect(requests().filter((r) => r.op === "stop")).toHaveLength(0);
+    expect(host.textContent).not.toContain("remoteDesktop.reconnecting");
+  });
+  it("finishes a timed-out overflow release before taking control again", async () => {
+    await connect();
+    const original = fixture.invoke.getMockImplementation()!;
+    let falseAttempts = 0;
+    fixture.invoke.mockImplementation((...args) => {
+      const req = args[2][0];
+      if (req.op === "control" && req.enabled === false) {
+        falseAttempts += 1;
+        if (falseAttempts === 1)
+          return Promise.reject(
+            Object.assign(new Error("timeout"), { code: "INVOKE_TIMEOUT" }),
+          );
+        return Promise.resolve({ controlling: false });
+      }
+      if (req.op === "heartbeat")
+        return Promise.resolve({ controlling: true });
+      return original(...args);
+    });
+    await act(async () => {
+      fixture.message!({
+        nativeEvent: {
+          data: JSON.stringify({ type: "inputOverflow", epoch: "lease" }),
+        },
+      });
+    });
+    expect(
+      requests().filter((r) => r.op === "control" && r.enabled === false),
+    ).toHaveLength(1);
+    act(() => button("operations").click());
+    await act(async () => button("viewOnly").click());
+    const controlOps = requests()
+      .filter((r) => r.op === "control")
+      .map((r) => r.enabled);
+    // Overflow timed out with pending release. Take control must finish that
+    // release (host stopInput) before asking to enable, so the helper restarts.
+    expect(controlOps).toEqual([true, false, false, true]);
+    expect(sent().filter((m) => m.type === "control").at(-1)).toEqual({
+      type: "control",
+      enabled: true,
+    });
+    expect(requests().filter((r) => r.op === "stop")).toHaveLength(0);
+    expect(host.textContent).not.toContain("remoteDesktop.reconnecting");
+  });
+  it("restores control when a take-control reply is lost but the host still holds it", async () => {
+    await connect();
+    act(() => button("operations").click());
+    await act(async () => button("viewOnly").click());
+    const original = fixture.invoke.getMockImplementation()!;
+    fixture.invoke.mockImplementation((...args) => {
+      const req = args[2][0];
+      if (req.op === "control" && req.enabled === true)
+        return Promise.reject(
+          Object.assign(new Error("timeout"), { code: "INVOKE_TIMEOUT" }),
+        );
+      if (req.op === "heartbeat")
+        return Promise.resolve({ controlling: true });
+      return original(...args);
+    });
+    await act(async () => button("viewOnly").click());
+    expect(sent().filter((m) => m.type === "control").at(-1)).toEqual({
+      type: "control",
+      enabled: false,
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(3000));
+    expect(sent().filter((m) => m.type === "control").at(-1)).toEqual({
+      type: "control",
+      enabled: true,
+    });
+    expect(requests().filter((r) => r.op === "stop")).toHaveLength(0);
+    expect(host.textContent).not.toContain("remoteDesktop.reconnecting");
+  });
+  it("keeps a take-control intent when a settling heartbeat still reports view-only", async () => {
+    await connect();
+    act(() => button("operations").click());
+    await act(async () => button("viewOnly").click());
+    const original = fixture.invoke.getMockImplementation()!;
+    let rejectTakeControl: ((cause: unknown) => void) | undefined;
+    let heartbeats = 0;
+    fixture.invoke.mockImplementation((...args) => {
+      const req = args[2][0];
+      if (req.op === "control" && req.enabled === true) {
+        return new Promise((_, reject) => {
+          rejectTakeControl = reject;
+        });
+      }
+      if (req.op === "heartbeat") {
+        heartbeats += 1;
+        // startInput is still settling on the first beat; the host only
+        // reports control after the lost take-control reply.
+        return Promise.resolve({ controlling: heartbeats > 1 });
+      }
+      return original(...args);
+    });
+    act(() => button("viewOnly").click());
+    await act(async () => vi.advanceTimersByTimeAsync(3000));
+    await act(async () => {
+      rejectTakeControl!(
+        Object.assign(new Error("timeout"), { code: "INVOKE_TIMEOUT" }),
+      );
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(3000));
+    // A heartbeat issued while startInput was settling must not consume the
+    // pending take-control; after the reply is lost, host-true still restores.
+    expect(sent().filter((m) => m.type === "control").at(-1)).toEqual({
+      type: "control",
+      enabled: true,
+    });
+    expect(requests().filter((r) => r.op === "stop")).toHaveLength(0);
+    expect(host.textContent).not.toContain("remoteDesktop.reconnecting");
+  });
   it("shows virtual mouse buttons outside the panel and hides them while viewing only", async () => {
     await connect();
     act(() => button("operations").click());
@@ -1593,6 +1993,37 @@ describe("remote desktop controls", () => {
     expect(button("keyboard").disabled).toBe(true);
     await act(async () => button("viewOnly").click());
     expect(button("keyboard").disabled).toBe(false);
+  });
+  it("asks before taking over an existing remote desktop viewer", async () => {
+    const original = fixture.invoke.getMockImplementation()!;
+    let firstStart = true;
+    fixture.invoke.mockImplementation((...args) => {
+      const request = args[2][0];
+      if (request.op === "start" && firstStart) {
+        firstStart = false;
+        return Promise.reject(new Error("DESKTOP_BUSY"));
+      }
+      return original(...args);
+    });
+
+    await connect();
+
+    expect(fixture.alert).toHaveBeenCalledWith(
+      "remoteDesktop.connectionBusy",
+      "remoteDesktop.connectionBusyTakeover",
+      expect.any(Array),
+    );
+    const buttons = fixture.alert.mock.calls.at(-1)![2] as Array<{
+      onPress?: () => void;
+    }>;
+    await act(async () => {
+      buttons[1].onPress?.();
+    });
+    expect(requests()).toContainEqual({
+      op: "start",
+      displayId: "display",
+      takeover: true,
+    });
   });
   it("rotation preserves the viewer and control lease", async () => {
     await connect();

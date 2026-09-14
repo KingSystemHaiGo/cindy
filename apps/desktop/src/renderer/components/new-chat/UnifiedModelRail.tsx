@@ -49,7 +49,8 @@ export function UnifiedModelRail({
   const activeKey = railItemKey(active);
   return (
     // 设计稿 .rail:宽 48(含 6px 侧距 + 1px 右分隔线)、纵向 8px、格间 2px。
-    <div className="flex min-h-0 w-12 shrink-0 flex-col items-center gap-0.5 overflow-y-auto border-r border-[var(--model-dropdown-border)] px-1.5 py-2">
+    // 与侧栏窄图标栏一致：滚动条不占宽度，避免挤压按钮并触发横向溢出。
+    <div className="flex min-h-0 w-12 shrink-0 flex-col items-center gap-0.5 overflow-x-hidden overflow-y-auto scrollbar-hide border-r border-[var(--model-dropdown-border)] px-1.5 py-2">
       {items.map((item) => {
         const key = railItemKey(item);
         const isActive = activeKey === key;
@@ -57,6 +58,13 @@ export function UnifiedModelRail({
         const separatorBefore = item.kind === 'all';
         const engineOption =
           item.kind === 'engine' ? agentOptionOf(engineOfAgentKind(item.agent)) : null;
+        const provider =
+          item.kind === 'provider'
+            ? providers.find((entry) => entry.id === item.providerId)
+            : undefined;
+        const accountIdentity =
+          provider?.openAiAccount?.identity?.trim() ||
+          provider?.subscriptionAccount?.identity?.trim();
         const label =
           item.kind === 'favorites'
             ? t('newChat.modelSelector.unified.railFavorites')
@@ -77,15 +85,12 @@ export function UnifiedModelRail({
             )}
             <RailButton
               label={label}
+              accountIdentity={accountIdentity}
               isActive={isActive}
               itemKey={key}
               onClick={() => onSelect(item)}
               disabled={interactionDisabled}
-              provider={
-                localProviderUsage && item.kind === 'provider'
-                  ? providers.find((provider) => provider.id === item.providerId)
-                  : undefined
-              }
+              provider={localProviderUsage ? provider : undefined}
             >
               {item.kind === 'favorites' ? (
                 // ☆ 未激活与其它格同灰(hover 提亮)—— 常亮金色会在没进收藏视图时也
@@ -110,6 +115,7 @@ export function UnifiedModelRail({
 
 interface RailButtonProps {
   label: string;
+  accountIdentity?: string;
   isActive: boolean;
   itemKey: string;
   onClick: () => void;
@@ -132,8 +138,25 @@ function ProviderQuotaButton(props: RailButtonProps & { provider: ProviderView }
   return <RailButtonView {...props} quota={quota} />;
 }
 
+function accountLabel(label: string, identity?: string): string {
+  if (!identity || label === identity) return label;
+  // Independent logins already name the connection "Provider · identity".
+  // OpenAI also truncates that generated name to 50 characters and may add (2).
+  const baseLabel = label.replace(/ \(\d+\)$/, '');
+  if (baseLabel.endsWith(` · ${identity}`)) return label;
+  const separator = baseLabel.indexOf(' · ');
+  if (
+    separator >= 0 &&
+    baseLabel.length === 50 &&
+    `${baseLabel.slice(0, separator)} · ${identity}`.slice(0, 50) === baseLabel
+  )
+    return label;
+  return `${label} · ${identity}`;
+}
+
 function RailButtonView({
   label,
+  accountIdentity,
   isActive,
   itemKey,
   onClick,
@@ -150,14 +173,15 @@ function RailButtonView({
       ? null
       : `${t('quotaCard.weeklyLabel')} · ${t('quotaCard.remainingPercent', { percent: remaining })}`;
   const reset = formatQuotaResetCountdown(quota?.resetsAt, Date.now(), t);
+  const displayLabel = accountLabel(label, accountIdentity);
   const tooltip = quotaLabel ? (
     <>
-      <div>{label}</div>
-      <div>{quotaLabel}</div>
+      <div>{displayLabel}</div>
+      {quotaLabel && <div>{quotaLabel}</div>}
       {reset && <div>{reset}</div>}
     </>
   ) : (
-    label
+    displayLabel
   );
   return (
     <Tip
@@ -170,7 +194,7 @@ function RailButtonView({
         type="button"
         disabled={disabled}
         onClick={onClick}
-        aria-label={label}
+        aria-label={displayLabel}
         aria-description={quotaLabel ?? undefined}
         aria-pressed={isActive}
         data-rail-item={itemKey}

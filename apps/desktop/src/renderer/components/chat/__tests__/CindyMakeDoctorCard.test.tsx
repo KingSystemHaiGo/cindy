@@ -20,6 +20,11 @@ vi.mock('@/lib/cindyMakeDoctorStream', () => ({
 }));
 vi.mock('@/lib/cindyMakeDoctor', () => ({ cancelMakeDoctor: vi.fn(async () => {}) }));
 vi.mock('@/features/bots/useRemoteBots', () => ({ useRemoteBots: () => [] }));
+// Partner task cards have their own integration suite; isolate this sibling variant.
+vi.mock('@/features/bots/BotCollaborationCard', () => ({
+  BotSessionTaskCard: () => null,
+  BotSessionTaskMessageTrace: () => null,
+}));
 vi.mock('@/features/learn/LearnStatusCard', () => ({ LearnStatusCard: () => null }));
 vi.mock('@/components/chat/MarkdownRenderer', () => ({ MarkdownRenderer: () => null }));
 vi.mock('@/hooks/useReducedMotion', () => ({ useReducedMotion: () => true }));
@@ -42,6 +47,20 @@ describe('Make upstream step', () => {
     checks: MAKE_DOCTOR_CHECK_IDS.map((id) => ({ id, status: 'passed' })),
     upstream: { status: 'notFound', items: [] },
   };
+  it('hides the numbered environment step when Settings renders the environment alone', () => {
+    render(
+      <MakeDoctorReportCard
+        report={ready}
+        showSteps={false}
+        showSource={false}
+        onStop={vi.fn()}
+        onRecheck={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText('cindyMake.stepEnvironment')).toBeNull();
+    expect(screen.getByRole('button', { name: 'cindyMakeDoctor.details' })).toBeTruthy();
+  });
+
   it('keeps details left-aligned below environment and the three steps in execution order', () => {
     const choose = vi.fn();
     render(

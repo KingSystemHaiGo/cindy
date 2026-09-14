@@ -1,8 +1,10 @@
+import { isManagedBotAvatarUrl } from '../../../shared/botAvatarValue';
+import { isModelEnabled, getModelVisibilityVersion } from '@/state/modelVisibilityPrefs';
 import { botInvitationProgress, type BotInvitationProgress } from '../../../shared/botInvitation';
 import { useSyncExternalStore } from 'react';
 import { getDataOwnerGeneration, isDataOwnerGenerationCurrent } from '@/contexts/dataOwnerGeneration';
 import { getModel } from '@cindy/model-providers';
-import { getDraft, getPersistedVendorModel } from '@/state/newMakerDraft';
+import { getDraft, getDraftForPreferenceSync, getPersistedVendorModel } from '@/state/newMakerDraft';
 import { getDefaultModelForVendor } from '@/lib/modelDefinitions';
 import { pickConnectedModelForAgent } from '@/lib/draftModelCalibration';
 import { refreshLocalCatalogSnapshot } from '@/lib/localCatalogSnapshot';
@@ -16,7 +18,6 @@ import { getBotLastReadAtMap, pruneBotReadState, seedMissingBotReadState } from 
 import type { BotGender } from '../../../shared/botGender';
 import { normalizeBotStyle, type BotCommunicationStyle } from '../../../shared/botStyle';
 import { BOT_FAILURE_REASONS, type BotFailureReason } from '../../../shared/botFailureReason';
-import type { BotTemplatePresetId } from '../../../shared/botTemplatePreset';
 import type { BotCapabilityBaseline } from '../../../shared/botCapabilitySelection';
 import { NEW_BOT_DEFAULT_PERMISSIONS, normalizeBotPermissions } from './botCapabilityDefaults';
 import {
@@ -152,6 +153,7 @@ export interface BotSessionProjection {
 }
 
 export interface BotProfile {
+  templateId?: string;
   invitation?: BotInvitationProgress;
   id: string;
   name: string;
@@ -230,7 +232,10 @@ const BOT_GLOBAL_MODEL_CHAIN_KEY = 'cindy.bots.global-model-chain.v2';
 type BotModelVendor = ReturnType<typeof vendorForHarness>;
 const botModelListeners = new Set<() => void>();
 function getDefaultModelInputs() {
+  const draft = getDraftForPreferenceSync();
   return {
+    visibilityVersion: getModelVisibilityVersion(),
+    preference: JSON.stringify([draft.vendor, draft.lastByVendor[draft.vendor], draft.fastModeByModel]),
     providers: getCachedProvidersSnapshot(),
     availableAgents: getCachedAvailableVendors(),
   };
@@ -322,10 +327,12 @@ export function getBotGlobalModelChain(): BotModelRoute[] | null {
   ensureProfileOwner();
   if (!globalModelChainCache) return null;
   const inputs = globalModelChainCache.defaultInputs;
-  if (inputs && (
-    inputs.providers !== getCachedProvidersSnapshot()
-    || inputs.availableAgents !== getCachedAvailableVendors()
-  )) return null;
+  if (inputs) {
+    const current = getDefaultModelInputs();
+    if (inputs.providers !== current.providers || inputs.availableAgents !== current.availableAgents
+      || inputs.visibilityVersion !== current.visibilityVersion || inputs.preference !== current.preference)
+      return null;
+  }
   return globalModelChainCache.modelChain;
 }
 
@@ -348,7 +355,15 @@ export function getEffectiveBotModelChain(
   if (stored) return stored;
   const providers = getCachedProvidersSnapshot();
   const availableAgents = getCachedAvailableVendors();
+  const draft = getDraftForPreferenceSync();
+  const selected = draft.lastByVendor[draft.vendor];
   return defaultBotModelChain({ providers: providers?.providers ?? [],
+    isModelEnabled,
+    preferredRoute: {
+      harness: draft.vendor === 'cc' || draft.vendor === 'orca' ? 'claude' : draft.vendor,
+      providerId: selected.providerId ?? null, model: selected.model,
+      effort: selected.effort ?? '', fastMode: draft.fastModeByModel[selected.model] === true,
+    },
     providersLoading: !providers, availableAgents: availableAgents ?? new Set(),
     availableAgentsLoaded: availableAgents !== null });
 }
@@ -457,6 +472,7 @@ function defaultCapabilities(
 }
 
 export interface CreateBotProfileInput {
+  creationDraftToken?: string;
   prepareInvitation?: boolean;
   /** Unsaved image bytes, validated and ingested by main on creation only. */
   avatarImageBase64?: string;
@@ -477,8 +493,8 @@ export interface CreateBotProfileInput {
   avatarColor?: string;
   skills?: string[];
   capabilities?: Partial<BotCapabilities>;
-  /** 仅用于 main 按可信内置清单安装初始 Skill；自定义伙伴不传。 */
-  templateId?: BotTemplatePresetId;
+  /** Default Cindy identity marker; retired ids are accepted only for old-client compatibility. */
+  templateId?: string;
   /** Localized first message persisted by main together with the initial canonical task. */
   welcomeMessage?: string;
 }
@@ -487,6 +503,7 @@ export interface CreateBotProfileInput {
 let profiles: BotProfile[] = [];
 const listeners = new Set<() => void>();
 let hydrated = false;
+let profileListLoaded = false;
 let profileOwner = getDataOwnerGeneration();
 let hydrationGeneration = 0;
 const hydrationPromises = new Set<Promise<void>>();
@@ -498,6 +515,7 @@ function ensureProfileOwner(): void {
   if (isDataOwnerGenerationCurrent(profileOwner)) return;
   profileOwner = getDataOwnerGeneration();
   profiles = [];
+  profileListLoaded = false;
   unreadCounts = {};
   globalModelChainCache = null;
   globalModelChainCustomized = null;
@@ -577,6 +595,7 @@ function normalizeDbProfile(value: unknown): BotProfile | null {
     // 落库回读的性别。老档案没有 → 留空 → 界面按名字称呼(与升级前一致)。
     ...(item.gender === 'female' || item.gender === 'male' ? { gender: item.gender } : {}),
     ...(normalizeBotStyle(item.style) ? { style: normalizeBotStyle(item.style) } : {}),
+    templateId: typeof item.templateId === 'string' ? item.templateId : undefined,
     avatar: typeof item.avatar === 'string' ? item.avatar : '🤖',
     avatarColor: typeof item.avatarColor === 'string' ? item.avatarColor : 'violet',
     enabled: item.enabled !== false,
@@ -744,6 +763,7 @@ async function hydrateFromDatabase(): Promise<void> {
     if (!isCurrent()) return;
     const dbProfiles = rows.map(normalizeDbProfile).filter((item): item is BotProfile => !!item);
     profiles = dbProfiles;
+    profileListLoaded = true;
     projectGlobalModelChain();
     applyUnreadCounts(rows);
     // A Bot we have never tracked starts read: shipping unread badges must not
@@ -757,7 +777,7 @@ async function hydrateFromDatabase(): Promise<void> {
     // DB readiness can race the first renderer render during account/bootstrap.
     // The Bots layout explicitly calls refreshBotProfiles when entered, so do
     // not keep polling a signed-out renderer in the background.
-    if (isCurrent()) hydrated = false;
+    if (isCurrent()) { hydrated = false; profileListLoaded = true; emit(); }
   }
 }
 
@@ -811,6 +831,11 @@ export async function runBotLifecycleAction(
   return result;
 }
 
+export function hasLoadedBotProfiles(): boolean {
+  ensureProfileOwner();
+  return profileListLoaded;
+}
+
 export function getBotProfiles(): BotProfile[] {
   ensureProfileOwner();
   return profiles;
@@ -858,6 +883,7 @@ export function addBotProfile(input: CreateBotProfileInput): BotProfile {
   };
   const bot: BotProfile = {
     id: `bot_${now}_${Math.random().toString(36).slice(2, 8)}`,
+    templateId: input.templateId,
     name: input.name.trim() || 'New Bot',
     description: input.description.trim(),
     identitySource: input.identitySource?.trim() || undefined,
@@ -928,14 +954,16 @@ export async function addBotProfileAndWait(input: CreateBotProfileInput): Promis
         ...(bot.gender ? { gender: bot.gender } : {}),
         ...(bot.style ? { style: bot.style } : {}),
         ...(input.templateId ? { templateId: input.templateId } : {}),
+        ...(input.creationDraftToken ? { creationDraftToken: input.creationDraftToken } : {}),
         ...(input.prepareInvitation ? { prepareInvitation: true } : {}),
         ...(input.welcomeMessage ? { welcomeMessage: input.welcomeMessage } : {}),
       }),
     );
     assertCurrentOwner(owner);
     if (!created) throw new Error('Bot profile create returned an invalid profile');
-    profiles = profiles.map((item) => (item.id === bot.id ? created : item));
+    profiles = [...profiles.filter((item) => item.id !== bot.id && item.id !== created.id), created];
     emit();
+    return created;
   } catch (error) {
     assertCurrentOwner(owner);
     // The renderer projection is optimistic, but a failed main/SQLite create
@@ -944,7 +972,6 @@ export async function addBotProfileAndWait(input: CreateBotProfileInput): Promis
     emit();
     throw error;
   }
-  return profiles.find((item) => item.id === bot.id) ?? bot;
 }
 
 export type BotProfileUpdatePatch = Partial<
@@ -1094,6 +1121,14 @@ function duplicateBotName(sourceName: string): string {
 export async function duplicateBotProfile(id: string): Promise<BotProfile> {
   const source = profiles.find((bot) => bot.id === id);
   if (!source) throw new Error('Bot not found');
+  if (source.templateId === 'cindy') return source;
+  const owner = getDataOwnerGeneration();
+  // Copy validated bytes through the existing image ingress, never trust a raw media URL.
+  const avatarImage = isManagedBotAvatarUrl(source.avatar)
+    ? await window.electronAPI.readCachedImageAsBase64({ url: source.avatar })
+    : undefined;
+  assertCurrentOwner(owner);
+  if (avatarImage && !avatarImage.base64) throw new Error('Could not read teammate avatar');
   return addBotProfileAndWait({
     name: duplicateBotName(source.name),
     description: source.description,
@@ -1102,6 +1137,7 @@ export async function duplicateBotProfile(id: string): Promise<BotProfile> {
     ...(source.gender ? { gender: source.gender } : {}),
     ...(source.style ? { style: source.style } : {}),
     avatar: source.avatar,
+    ...(avatarImage ? { avatarImageBase64: avatarImage.base64 } : {}),
     avatarColor: source.avatarColor,
     skills: [...source.skills],
     capabilities: {

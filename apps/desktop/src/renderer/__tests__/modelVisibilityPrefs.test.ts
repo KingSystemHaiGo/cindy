@@ -17,7 +17,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { unifiedModelEntries, type ProviderView } from '@cindy/model-providers';
+import { buildUserProvider, unifiedModelEntries, type ProviderView } from '@cindy/model-providers';
 
 class MemLocalStorage {
   private store = new Map<string, string>();
@@ -1040,6 +1040,20 @@ describe('compact model defaults upgrade', () => {
     expect(restarted.isModelEnabled('pi', 'xd', { id: 'fable-5', defaultEnabled: false })).toBe(false);
   });
 
+  it('resends the effective enabled table on a no-op catalog refresh after Main loses its mirror', async () => {
+    ownerClaim.profileOrigin = 'existing';
+    const prefs = await upgrade();
+    await prefs.setModelVisibility('pi', 'xd', 'gemini', true);
+    await prefs.migrateModelVisibilityDefaults('owner-a', 1, [provider]);
+    const before = memStorage.getItem(scopedKey);
+    syncModelVisibility.mockClear();
+    await prefs.migrateModelVisibilityDefaults('owner-a', 1, [provider]);
+    expect(memStorage.getItem(scopedKey)).toBe(before);
+    expect(syncModelVisibility).toHaveBeenCalledWith('owner-a', 1,
+      expect.objectContaining({ 'pi:xd:gemini': true }),
+      expect.not.objectContaining({ pending: true }));
+  });
+
   it('waits for Main profile creation before writing migration artifacts or consuming defaults', async () => {
     ownerClaim.profileOrigin = 'pending';
     const prefs = await upgrade();
@@ -1257,4 +1271,26 @@ describe('compact model defaults upgrade', () => {
     expect(await prefs.migrateModelVisibilityDefaults('owner-a', 1, [provider])).toBe(true);
     expect(prefs.isModelEnabled('pi', 'xd', { id: 'gemini', defaultEnabled: true })).toBe(false);
   });
+});
+
+
+it('restores imported native defaults while preserving manual overrides until reset', async () => {
+  const prefs = await import('../state/modelVisibilityPrefs');
+  prefs.setModelVisibilityOwner('owner-a', 1, 'cloud');
+  const agents = ['claude-code', 'codex', 'pi'] as const;
+  const p = buildUserProvider({ id: 'imported-native', name: 'Test', runtimes: Object.fromEntries(
+    agents.map(agent => [agent, { baseUrl: 'https://example.com/v1', models: [{
+      id: 'claude-test', name: 'Claude', api: 'anthropic-messages',
+    }] }]),
+  ) }, { modelRegistry: { schemaVersion: 5, updatedAt: '2026-09-13T00:00:00Z', models: [{
+    id: 'claude-test', name: 'Claude', nativeApi: 'anthropic-messages',
+    routes: [{ providerId: 'imported-native', modelId: 'claude-test', agents: ['claude-code', 'codex'] }],
+  }] } });
+  const enabled = () => agents.map(agent => prefs.isModelEnabled(agent, p.id, p.models[agent]![0]!));
+  expect(enabled()).toEqual([true, false, true]);
+  await prefs.setModelVisibility('pi', p.id, 'claude-test', false);
+  await prefs.setModelVisibility('codex', p.id, 'claude-test', true);
+  expect(enabled()).toEqual([true, true, false]);
+  await prefs.resetModelVisibilities(p.id, agents.map(agent => ({ agent, modelId: 'claude-test' })));
+  expect(enabled()).toEqual([true, false, true]);
 });

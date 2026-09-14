@@ -126,7 +126,7 @@ describe('稳定层:能力必须写进提示词', () => {
     expect(all).toContain('不能拿来改 SOUL');
     expect(all).toContain('才用 memory_write 记成 type moment');
     expect(all).not.toContain('bot_memory');
-    expect(all).toContain('save_bot_skill');
+    expect(all).toContain('save_teammate_skill');
     expect(all).toContain('第一次验证完就');
     expect(all).toContain('开后台任务，也可以给伙伴发消息');
     expect(all).toContain('start_session_task');
@@ -144,7 +144,7 @@ describe('稳定层:能力必须写进提示词', () => {
     expect(all).not.toContain('list_tools');
 
     const none = buildBotStableTier(input());
-    expect(none).not.toContain('save_bot_skill');
+    expect(none).not.toContain('save_teammate_skill');
     expect(none).not.toContain('create_teammate');
     expect(none).not.toContain('make_pptx');
   });
