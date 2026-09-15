@@ -119,8 +119,8 @@ import { isIpcError } from '../../shared/ipc-errors.js';
 
 const log = createLogger('mcp/cindy');
 const MAX_FORGE_ICON_SOURCE_BYTES = 25 * 1024 * 1024;
-const GHOST_NO_TOOLS_MESSAGE =
-  '该插件未声明任何可供调用的工具;不要重试,改用其它方式完成。';
+const GHOST_NO_AGENT_SURFACE_MESSAGE =
+  '该插件未声明可供调用的工具或可供读取的手册;不要重试,改用其它方式完成。';
 
 const convertForgeIconToPng = createForgeIconConverter({
   fork: forkForgeIconConversionHost,
@@ -1105,6 +1105,11 @@ function ghostHasTools(ghost: InstalledGhost): boolean {
   return (ghost.manifest.tools?.length ?? 0) > 0;
 }
 
+/** Manual discovery is independent of plugin tools, including Host-backed capabilities. */
+function ghostHasManual(ghost: InstalledGhost): boolean {
+  return (ghost.manifest.manual?.items.length ?? 0) > 0;
+}
+
 /** 工具结果图片描述:视觉桥描述并发上限(worker 审核强制项,不串行等待 N×30s)。 */
 const TOOL_RESULT_DESCRIBE_CONCURRENCY = 2;
 /** 工具结果图片描述:整批总预算(超时丢弃未完成描述,工具结果照常返回)。 */
@@ -1313,7 +1318,7 @@ function visibleChipGhosts(
         ghost.enabled &&
         isGhostAvailableForActiveSession(ghost.manifest.id) &&
         ghost.manifest.kind === 'chip' &&
-        ghostHasTools(ghost) &&
+        (ghostHasTools(ghost) || ghostHasManual(ghost)) &&
         !isGhostDisabledForWorkdir(ghost.manifest.id, workdir),
     );
 }
@@ -1550,7 +1555,7 @@ export function getCindyGhostsMcpDeps(
       return {
         ok: false,
         errorCode: 'GHOST_NOT_FOUND',
-        message: GHOST_NO_TOOLS_MESSAGE,
+        message: GHOST_NO_AGENT_SURFACE_MESSAGE,
       };
     },
     async readGhostManual({ ghostId, path: manualPath }) {
@@ -1565,13 +1570,13 @@ export function getCindyGhostsMcpDeps(
           message: visibility.message,
         };
       }
-      if (!ghostHasTools(visibility.ghost)) {
+      if (!ghostHasManual(visibility.ghost)) {
         return {
           ok: false,
           manual: [],
           content: '',
           errorCode: 'GHOST_NOT_FOUND',
-          message: GHOST_NO_TOOLS_MESSAGE,
+          message: '该插件未声明可供读取的手册;不要重试,改用其它方式完成。',
         };
       }
       return readInstalledGhostManual(visibility.ghost, manualPath);

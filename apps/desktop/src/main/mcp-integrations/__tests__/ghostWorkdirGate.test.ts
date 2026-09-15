@@ -24,6 +24,7 @@ import type {
 } from '../../cindy-brain/ghostSetupCoordinator';
 import { t } from '../../i18n';
 import type { CindyGhostsHostDeps } from '../ghost';
+import type { InstalledGhost } from '../../../shared/ghost';
 
 const tmpUserData = fs.mkdtempSync(path.join(os.tmpdir(), 'ghost-workdir-gate-'));
 const prefsFile = () => path.join(tmpUserData, 'ghost-workdir-prefs.json');
@@ -144,7 +145,7 @@ vi.mock('../../maker-ipc/botAuthorizationService.js', () => ({
 
 const WORKDIR = '/proj/alpha';
 const listMock = vi.fn<() => unknown[]>(() => []);
-const activeSessionAvailableMock = vi.fn((_ghostId: string) => true);
+const activeSessionAvailableMock = vi.fn<(ghostId: string) => boolean>(() => true);
 const dispatchMock = vi.fn(async () => ({ ok: true as const, result: 'done' }));
 const setupAssessmentMock = vi.fn((_ghostId: string) => {
   void _ghostId;
@@ -179,7 +180,7 @@ vi.mock('../../cindy-brain/index.js', () => ({
   ghostForgeForbiddenRootDirs: () => [],
   listAvailableGhostsForAuthorization: () => listMock(),
   findAvailableGhostForAuthorization: (id: string) =>
-    listMock().find((ghost: any) => ghost.manifest?.id === id) ?? null,
+    listMock().find((ghost) => (ghost as InstalledGhost).manifest?.id === id) ?? null,
   captureGhostMutationOwnerForMcp: captureMutationOwnerMock,
   acquireGhostMutationLeaseForMcp: acquireMutationLeaseMock,
   installOrUpdateLocalGhostPackageFromForge: forgeInstallPackageMock,
@@ -274,6 +275,28 @@ function chipGhost(
   };
 }
 
+/** Slot-only plugin fixture: the simulator tools belong to the Host MCP. */
+function manualOnlyGhost(): InstalledGhost {
+  return {
+    enabled: true,
+    dir: path.join(tmpUserData, 'ios-simulator'),
+    approval: { state: 'approved', revision: '00000000-0000-4000-8000-000000000001' },
+    manifest: {
+      schemaVersion: 3,
+      id: 'ios-simulator',
+      name: 'iOS Simulator',
+      version: '1.0.0',
+      kind: 'chip',
+      entry: 'main.js',
+      iosSimulator: true,
+      whenToUse: 'Build and test an iOS app in Cindy',
+      manual: {
+        items: [{ dir: 'docs/workflow', name: 'ios-simulator', description: 'Simulator workflow' }],
+      },
+    },
+  };
+}
+
 type TestAgentKind = 'claude-code' | 'codex' | 'pi';
 
 function makeDeps(
@@ -303,7 +326,7 @@ function makeDeps(
 function clearAllPrefs(): void {
   // 把测试涉及的目录 × id 全部清一遍(幂等;清空后 store 自动删文件)。
   for (const dir of [WORKDIR, `${WORKDIR} `, '/proj/beta', 'E:/Repo']) {
-    for (const id of ['art', 'other', 'missing', 'sleeping', 'account']) {
+    for (const id of ['art', 'other', 'missing', 'sleeping', 'account', 'ios-simulator']) {
       setGhostDisabledForWorkdir(dir, id, false);
     }
   }
@@ -963,7 +986,7 @@ describe('花名册 / ghost_list 过滤', () => {
     await expect(makeDeps().getAwakeGhost('panel')).resolves.toEqual({
       ok: false,
       errorCode: 'GHOST_NOT_FOUND',
-      message: '该插件未声明任何可供调用的工具;不要重试,改用其它方式完成。',
+      message: '该插件未声明可供调用的工具或可供读取的手册;不要重试,改用其它方式完成。',
     });
   });
 
@@ -988,6 +1011,147 @@ describe('花名册 / ghost_list 过滤', () => {
       errorType: 'SyntaxError',
     });
     expect(JSON.stringify({ ghosts, info })).not.toContain('malformed setup storage');
+  });
+});
+
+describe('Manual-only Ghost discovery and read gates', () => {
+  it.each(['claude-code', 'codex', 'pi'] as const)(
+    '%s discovers Manual-only plugins through both rosters, list and info',
+    async (agentKind) => {
+      const ghost = manualOnlyGhost();
+      listMock.mockReturnValue([ghost, chipGhost('art')]);
+      const deps = makeDeps(agentKind);
+      const roster = deps.getRosterItems?.() ?? [];
+      expect(roster.map(({ id }) => id)).toEqual(['ios-simulator', 'art']);
+      expect(roster[0]).toEqual({
+        id: 'ios-simulator', name: 'iOS Simulator', recall: ghost.manifest.whenToUse,
+      });
+      const ghosts = await deps.listAwakeGhosts();
+      expect(ghosts).toHaveLength(2);
+      expect(ghosts[0]).toEqual({
+        ...roster[0],
+        tools: [],
+        manual: [{ name: 'ios-simulator', description: 'Simulator workflow' }],
+        setup: { state: 'ready', revision: 0, groups: [] },
+      });
+      await expect(deps.getAwakeGhost('ios-simulator')).resolves.toEqual({ ok: true, ghost: ghosts[0] });
+      const prompt = getGhostRosterPrompt({ workingDir: WORKDIR });
+      const server = createCindyGhostsMcpServer(deps) as unknown as {
+        _registeredTools: Record<string, { description?: string }>;
+      };
+      const promptItems = prompt.split('\n').filter((line) => line.startsWith('{')).map((line) => JSON.parse(line));
+      expect(promptItems).toContainEqual({ ...roster[0], command: '' });
+      expect(server._registeredTools.ghost_list.description).toContain(prompt);
+      expect(getGhostRosterPrompt({ workingDir: WORKDIR })).toBe(prompt);
+      expect(prompt).not.toContain('Simulator workflow');
+      expect(JSON.stringify(ghosts)).not.toContain('docs/workflow');
+      expect(dispatchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([{ tools: undefined }, { tools: [] }])('reads the root, entry and deep Markdown with %j without runtime dispatch', async ({ tools }) => {
+    const ghost = manualOnlyGhost();
+    if (tools !== undefined) ghost.manifest.tools = tools;
+    const unitDir = path.join(ghost.dir, 'docs', 'workflow');
+    await fs.promises.mkdir(path.join(unitDir, 'references'), { recursive: true });
+    await fs.promises.writeFile(path.join(unitDir, 'MANUAL.md'), '# Simulator workflow');
+    await fs.promises.writeFile(path.join(unitDir, 'references', 'build.md'), '# Build guide');
+    listMock.mockReturnValue([ghost]);
+    const deps = makeDeps();
+    await expect(deps.readGhostManual({ ghostId: 'ios-simulator' })).resolves.toEqual({
+      ok: true, manual: [{ name: 'ios-simulator', description: 'Simulator workflow' }], content: '',
+    });
+    for (const [manualPath, content] of [
+      ['ios-simulator', '# Simulator workflow'],
+      ['ios-simulator/references/build.md', '# Build guide'],
+    ]) {
+      await expect(deps.readGhostManual({ ghostId: 'ios-simulator', path: manualPath })).resolves.toEqual({
+        ok: true, manual: [], content,
+      });
+    }
+    expect(ensureReadyMock).not.toHaveBeenCalled();
+    expect(dispatchMock).not.toHaveBeenCalled();
+    expect(confirmRequestMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { tools: undefined, manual: undefined },
+    { tools: [], manual: { items: [] } },
+  ])('keeps plugins without tools or manual items hidden: %j', async (surface) => {
+    const ghost = manualOnlyGhost();
+    Object.assign(ghost.manifest, surface);
+    listMock.mockReturnValue([ghost]);
+    const deps = makeDeps();
+    expect(deps.getRosterItems?.()).toEqual([]);
+    expect(getGhostRosterPrompt({ workingDir: WORKDIR })).toBe('');
+    await expect(deps.listAwakeGhosts()).resolves.toEqual([]);
+    await expect(deps.getAwakeGhost('ios-simulator')).resolves.toMatchObject({
+      ok: false, errorCode: 'GHOST_NOT_FOUND',
+    });
+    await expect(deps.readGhostManual({ ghostId: 'ios-simulator' })).resolves.toMatchObject({
+      ok: false, errorCode: 'GHOST_NOT_FOUND', manual: [], content: '',
+    });
+    expect(dispatchMock).not.toHaveBeenCalled();
+  });
+
+  it('requires a manual declaration even when plugin tools exist', async () => {
+    await expect(makeDeps().readGhostManual({ ghostId: 'art' })).resolves.toMatchObject({
+      ok: false, errorCode: 'GHOST_NOT_FOUND', manual: [], content: '',
+      message: expect.stringContaining('手册'),
+    });
+  });
+
+  it.each([
+    { exists: false, available: false, disabled: true, enabled: false, errorCode: 'GHOST_NOT_FOUND' },
+    { exists: true, available: false, disabled: true, enabled: false, errorCode: 'GHOST_NOT_FOUND' },
+    { exists: true, available: true, disabled: true, enabled: false, errorCode: 'GHOST_DISABLED_IN_WORKDIR' },
+    { exists: true, available: true, disabled: true, enabled: true, errorCode: 'GHOST_DISABLED_IN_WORKDIR' },
+    { exists: true, available: true, disabled: false, enabled: false, errorCode: 'GHOST_ASLEEP' },
+  ])('rechecks live visibility after discovery in the existing order: %j', async (state) => {
+    const ghost = manualOnlyGhost();
+    listMock.mockReturnValue([ghost]);
+    const deps = makeDeps();
+    await expect(deps.getAwakeGhost('ios-simulator')).resolves.toMatchObject({ ok: true });
+    ghost.enabled = state.enabled;
+    listMock.mockReturnValue(state.exists ? [ghost] : []);
+    activeSessionAvailableMock.mockReturnValue(state.available);
+    setGhostDisabledForWorkdir(WORKDIR, 'ios-simulator', state.disabled);
+    expect(deps.getRosterItems?.()).toEqual([]);
+    expect(getGhostRosterPrompt({ workingDir: WORKDIR })).toBe('');
+    await expect(deps.listAwakeGhosts()).resolves.toEqual([]);
+    await expect(deps.getAwakeGhost('ios-simulator')).resolves.toMatchObject({
+      ok: false, errorCode: state.errorCode,
+    });
+    for (const manualPath of [undefined, 'ios-simulator']) {
+      await expect(deps.readGhostManual({ ghostId: 'ios-simulator', path: manualPath })).resolves.toMatchObject({
+        ok: false, errorCode: state.errorCode, manual: [], content: '',
+      });
+    }
+    await expect(deps.callGhostTool({ ghostId: 'ios-simulator', tool: 'check_environment', args: {} })).resolves.toMatchObject({
+      ok: false, errorCode: state.errorCode,
+    });
+    expect(ensureReadyMock).not.toHaveBeenCalled();
+    expect(dispatchMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps the Manual-only roster empty without a resolved workdir', () => {
+    listMock.mockReturnValue([manualOnlyGhost()]);
+    expect(getCindyGhostsMcpDeps().getRosterItems?.()).toEqual([]);
+    expect(getGhostRosterPrompt({})).toBe('');
+  });
+
+  it.each(['run', 'list_tools', 'check_environment'])('does not grant the Manual-only plugin tool %s or start setup/handoffs', async (tool) => {
+    listMock.mockReturnValue([manualOnlyGhost()]);
+    await expect(makeDeps().callGhostTool({
+      ghostId: 'ios-simulator', tool, args: {},
+      attachments: [path.join(outsideDir, 'input.png')], dir: outsideDir, saveDir: outsideDir,
+    })).resolves.toMatchObject({ ok: false, errorCode: 'TOOL_NOT_FOUND' });
+    expect(ensureReadyMock).not.toHaveBeenCalled();
+    expect(grantAttachmentsMock).not.toHaveBeenCalled();
+    expect(dirDepositMock).not.toHaveBeenCalled();
+    expect(saveDepositMock).not.toHaveBeenCalled();
+    expect(confirmRequestMock).not.toHaveBeenCalled();
+    expect(dispatchMock).not.toHaveBeenCalled();
   });
 });
 

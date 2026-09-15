@@ -2021,6 +2021,11 @@ Manual 的归属不按篇幅长短判断。它对标 Skill 正文与 references,
 都必须是普通 \`.md\` 文件,单文件不超过 64KB。Markdown 不写 frontmatter;二进制、非法
 UTF-8、符号链接和其它扩展名都会在打包与装入两侧拒绝。
 
+**Manual-only 插件**可以只声明非空 \`manual.items\`,不需要声明虚假工具。
+已启用、账号可用且当前工作目录未停用时,它同样进入花名册、\`ghost_list\` 和
+\`ghost_info\`;返回的 \`tools\` 可以为空。\`ghost_manual\` 读取手册不启动插件运行时,
+\`ghost_call\` 仍只能调用实际声明的工具。既无工具也无手册的插件不进入发现清单。
+
 四层信息各司其职:
 
 - \`whenToUse\`:只放系统提示词区插件花名册需要的召回场景;
@@ -2049,6 +2054,8 @@ Cindy 先发布，确认首个支持它的**正式版本号**后，再把 \`minC
 \`skill.items\` 的迁移版本也必须设置上述 \`minCindyVersion\`，并遵守 Cindy 先发、插件
 后发的顺序；服务端还要保留上一份带 Skill 的历史 release，使旧客户端能通过历史版本回退
 继续取得兼容包。
+Manual-only 插件还必须等首个支持 Manual-only 发现与读取的 Cindy 正式版本发布,
+并将 \`minCindyVersion\` 设为不低于该版本;不能只以最早提供 \`ghost_manual\` 的版本为准。
 
 ## 4. main.js 电子脑(沙箱后台逻辑)
 
@@ -4270,8 +4277,11 @@ if (r.ok && r.confirmed) {
 要给插件提供内置 iOS 模拟器的状态入口或工作流面板时,声明 \`"iosSimulator": true\`。
 电子脑只能读取**当前台前任务**的公开状态,并请求主机打开 Cindy 自己的模拟器面板:
 
-标准产品形态只需 \`skill + iosSimulator\`:Host 会在任务右侧栏提供手动入口,
-Agent 通过 Skill 调 Host MCP。不要为了重复同一状态再声明 \`panel\`;插件停靠面板的关闭
+标准产品形态只需 \`manual + iosSimulator\`:Host 会在任务右侧栏提供手动入口,
+Agent 按需读取 \`ghost_manual({ ghost_id: "ios-simulator", path: "ios-simulator" })\`
+获取跨工具工作流,再调用 Host 注册的 \`cindy_ios_simulator\` MCP。插件无需声明 \`tools\`,
+Manual 的发现与读取仍受安装、启用、账号与工作目录门禁约束。
+不要为了重复同一状态再声明 \`panel\`;插件停靠面板的关闭
 语义是停用整份插件,不适合作为模拟器 viewer 的替身。只有确实存在 Host viewer 没有的独立
 工作流 UI 时才额外声明 panel。
 
@@ -4312,13 +4322,13 @@ const opened = await cindy.iosSimulator.request({
   在 Host 面板里选择设备;连续请求会限速;
 - panel.html 保持零桥。面板要使用本能力时,按 §5 先 \`/wake\`,再用同源
   BroadcastChannel 把请求交给 main.js,由 main.js 调 \`cindy.iosSimulator.request\`;
-- 插件 Skill 选择内嵌路线后,Agent 构建、安装、启动与 UI 操作调用 Host 注册的
+- Agent 按 Manual 指引选择内嵌路线后,构建、安装、启动与 UI 操作调用 Host 注册的
   \`cindy_ios_simulator\` MCP,不要重复打包一份 WDA/Sidecar。内嵌能力不存在或不可用时,
-  Skill 可以按用户目标与普通权限规则改走外部 Xcode、Simulator.app、\`simctl\` 或
+  Agent 可以按用户目标与普通权限规则改走外部 Xcode、Simulator.app、\`simctl\` 或
   Computer Use;Host 不会把这些外部操作自动转换为内嵌调用;
 - 本能力仅存在于支持并授权 \`iosSimulator\` 字段的 Cindy Desktop。未知 v3 顶层字段会被
   保留，但不会因此获得 Host 权限；依赖新字段的插件必须用 \`minCindyVersion\` 标明最低版本。
-  Skill 在 MCP 不存在时必须说明内嵌路线不可用;如果用户目标不依赖 Cindy viewer,
+  Agent 在 MCP 不存在时必须说明内嵌路线不可用;如果用户目标不依赖 Cindy viewer,
   可以继续使用正常的外部工具链,否则再引导用户升级 Cindy。
 
 ## 4.20 一级主视图(mainView 能力)

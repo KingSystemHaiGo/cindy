@@ -129,6 +129,7 @@ export interface CindyGhostInfo {
   recall?: string;
   /** 随包手册的轻量一级索引；正文必须另行调用 ghost_manual 按需读取。 */
   manual?: CindyGhostManualIndexItem[];
+  /** Manual-only 插件为空数组；发现或读取手册不授予插件工具能力。 */
   tools: CindyGhostToolInfo[];
   /**
    * Host 现查的配置评估。支持 Setup Runtime 的 Host 应尽量返回，但评估
