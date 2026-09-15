@@ -191,6 +191,10 @@ function renderSettings(overrides: Partial<BotProfile> = {}, initialSearch = 'se
   return { ...view, onBack, onOpenSession };
 }
 
+function openPersonalitySettings() {
+  fireEvent.click(screen.getByRole('button', { name: 'bots.profile.personality' }));
+}
+
 beforeEach(() => {
   mocks.navigate.mockReset();
   mocks.onboarding = false;
@@ -449,8 +453,9 @@ describe('Bot settings profile consolidation', () => {
     expect(screen.queryByRole('button', { name: 'bots.actions.message' })).toBeNull();
   });
 
-  it('shows structured communication-style controls on the same page', () => {
+  it('shows structured communication-style controls on the personality page', () => {
     renderSettings();
+    openPersonalitySettings();
     expect(screen.getByTestId('bot-communication-style')).toBeTruthy();
     expect(screen.getByLabelText('bots.profile.style.tone')).toBeTruthy();
     expect(screen.getByLabelText('bots.profile.style.replyLength')).toBeTruthy();
@@ -458,6 +463,7 @@ describe('Bot settings profile consolidation', () => {
 
   it('associates communication-style hints with their controls', () => {
     renderSettings();
+    openPersonalitySettings();
     const banned = screen.getByLabelText('bots.profile.style.bannedPhrases');
     const bannedHintId = banned.getAttribute('aria-describedby');
     expect(bannedHintId).toBeTruthy();
@@ -576,6 +582,7 @@ describe('Bot settings unified autosave', () => {
   it('autosaves a discrete tone selection with the rest of the profile', async () => {
     vi.useFakeTimers();
     renderSettings();
+    openPersonalitySettings();
     fireEvent.click(screen.getByRole('radio', { name: 'bots.profile.style.tones.warm' }));
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
@@ -588,6 +595,7 @@ describe('Bot settings unified autosave', () => {
   it('keeps trailing spaces while typing style text and trims on blur', async () => {
     vi.useFakeTimers();
     const view = renderSettings();
+    openPersonalitySettings();
     const address = screen.getByLabelText('bots.profile.style.addressUserAs') as HTMLInputElement;
     fireEvent.change(address, { target: { value: 'Chris ' } });
     expect(address.value).toBe('Chris ');
@@ -625,6 +633,7 @@ describe('Bot settings unified autosave', () => {
     renderSettings({
       style: { tone: 'warm', replyLength: 'short', emojiDensity: 'sparse' },
     });
+    openPersonalitySettings();
     fireEvent.click(
       within(screen.getByRole('radiogroup', { name: 'bots.profile.style.tone' })).getByRole('radio', {
         name: 'bots.profile.style.tones.followDefault',
@@ -665,6 +674,7 @@ describe('Bot settings unified autosave', () => {
         languageHabits: '先结论',
       },
     });
+    openPersonalitySettings();
     expect(screen.getByLabelText('bots.profile.style.customTone')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'bots.profile.style.restoreDefault' }));
     expect(screen.queryByLabelText('bots.profile.style.customTone')).toBeNull();
